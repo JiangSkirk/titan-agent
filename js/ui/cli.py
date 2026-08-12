@@ -27,6 +27,7 @@ from js.echo.turn_runtime import run_echo_turn
 from js.tools.registry import ToolResult
 from js.utils.log import configure_logging, get_logger
 from js.web.messages import humanize_error
+from js_work.cli import main as work_main
 
 console = Console()
 
@@ -437,6 +438,18 @@ def _print_skill_detail(detail: dict[str, Any]) -> None:
 def main(ctx: click.Context, config: str | None, verbose: bool) -> None:
     """JS Agent - A stable, secure, and convenient AI agent."""
     configure_logging("DEBUG" if verbose else "INFO")
+    root_object = ctx.ensure_object(dict)
+    root_object["personal_config"] = config
+
+    if ctx.invoked_subcommand == "work":
+        from js.product_storage import StorageRoots
+
+        settings = JSSettings.from_file(config, allow_hermes_merge=False)
+        root_object["personal_roots"] = StorageRoots(
+            config_path=settings.config_source_path,
+            workspace=settings.workspace.expanduser().resolve(strict=False),
+            state_dir=settings.state_dir.expanduser().resolve(strict=False),
+        )
 
     if ctx.invoked_subcommand is None:
         settings = JSSettings.from_file(config)
@@ -468,41 +481,90 @@ def main(ctx: click.Context, config: str | None, verbose: bool) -> None:
 @click.option("--personal-config", type=click.Path(), default=None, help="Personal JS config")
 @click.option("--work-config", type=click.Path(), default=None, help="Work JS config")
 @click.option(
-    "--personal-url",
-    default="http://127.0.0.1:8000",
+    "--host",
+    default="127.0.0.1",
     show_default=True,
-    help="Personal backend base URL",
+    help="Bind host for the single AppShell server",
+)
+@click.option(
+    "--port",
+    default="8000",
+    show_default=True,
+    help="Bind port for the single AppShell server",
+)
+@click.option(
+    "--personal-url",
+    default=None,
+    help="[deprecated] Use --host/--port instead. Ignored if set.",
 )
 @click.option(
     "--work-url",
-    default="http://127.0.0.1:8765",
-    show_default=True,
-    help="Work backend base URL",
+    default=None,
+    help="[deprecated] Use --host/--port instead. Ignored if set.",
+)
+@click.option(
+    "--legacy-dual-host",
+    is_flag=True,
+    hidden=True,
 )
 @click.option("--no-browser", is_flag=True, help="Do not open a browser window")
 def appshell_cmd(
     personal_config: str | None,
     work_config: str | None,
-    personal_url: str,
-    work_url: str,
+    host: str,
+    port: str,
+    personal_url: str | None,
+    work_url: str | None,
+    legacy_dual_host: bool,
     no_browser: bool,
 ) -> None:
-    """Launch Personal + Work backends under one AppShell chrome.
+    """Launch the unified JS Agent AppShell (single host, single port).
 
-    Data planes stay isolated (separate state_dir / ledger / memory). The UI
-    switches products via /api/workspace/switch then navigates to the target host.
+    Personal and Work are routed at root by the parent principal.
+    Data planes stay isolated (separate state_dir / ledger / memory).
+    The legacy flag is accepted as a hidden single-host compatibility shim.
     """
-    from js.appshell.launcher import launch_appshell
+    if legacy_dual_host:
+        from js.appshell.launcher import launch_appshell
 
-    raise SystemExit(
-        launch_appshell(
-            personal_config=personal_config,
-            work_config=work_config,
-            personal_base_url=personal_url,
-            work_base_url=work_url,
-            open_browser=not no_browser,
+        raise SystemExit(
+            launch_appshell(
+                personal_config=personal_config,
+                work_config=work_config,
+                personal_base_url=personal_url or "http://127.0.0.1:8000",
+                work_base_url=work_url or personal_url or "http://127.0.0.1:8000",
+                open_browser=not no_browser,
+            )
         )
+
+    import uvicorn
+
+    from js.appshell.server import create_appshell_app
+    from js_work.tools import WorkToolProfile
+
+    app = create_appshell_app(
+        personal_config=personal_config,
+        work_config=work_config,
+        work_profile=WorkToolProfile.EXECUTE,
+        host=host,
+        port=int(port),
     )
+    url = f"http://{host}:{port}"
+    console.print(f"[green]Starting JS Agent AppShell at {url}[/green]")
+    console.print("[dim]Personal and Work share this root; server mode decides routing.[/dim]")
+
+    if not no_browser:
+        import threading
+        import time
+        import webbrowser
+
+        def _open() -> None:
+            time.sleep(1.5)
+            webbrowser.open(url)
+
+        threading.Thread(target=_open, daemon=True).start()
+
+    uvicorn.run(app, host=host, port=int(port))
 
 
 @main.command()
@@ -1573,6 +1635,9 @@ def rl_list() -> None:
             f"{p.stat().st_size // 1024}KB",
         )
     console.print(table)
+
+
+main.add_command(work_main, "work")
 
 
 if __name__ == "__main__":

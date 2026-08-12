@@ -247,7 +247,11 @@ export async function loadApprovals() {
       const response = await fetch('/api/echo/approvals');
       if (!response.ok) throw new Error(await readApiError(response));
       const data = await response.json();
-      renderApprovals(Array.isArray(data.approvals) ? data.approvals : []);
+      const approvals = Array.isArray(data.approvals) ? data.approvals : [];
+      renderApprovals(approvals);
+      document.dispatchEvent(
+        new CustomEvent('js:approvals-updated', { detail: { count: approvals.length } }),
+      );
     } catch (error) {
       updatePendingCount(0);
       renderLoadError(error instanceof Error ? error.message : String(error));

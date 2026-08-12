@@ -95,6 +95,7 @@ class BehaviorGuard:
         self._hardline_patterns = [re.compile(p) for p in self.HARDLINE_PATTERNS]
         self._protected_pattern = [re.compile(p) for p in config.protected_commands]
         from cachetools import LRUCache
+
         self._loop_counters: LRUCache[str, int] = LRUCache(maxsize=1000)
         self._tool_name_counters: LRUCache[str, int] = LRUCache(maxsize=1000)
         self._failure_counters: LRUCache[str, int] = LRUCache(maxsize=1000)
@@ -146,6 +147,22 @@ class BehaviorGuard:
         hardline = self._check_hardline(normalized_cmd)
         if hardline:
             return hardline
+
+        # Subshell / command-substitution stays denied even when defense is off:
+        # allowlisted wrappers still run via sh -c, so $(...) must not slip through.
+        try:
+            from js.security.parser import has_subshell
+            from js.security.parser import parse as parse_command
+
+            ast = parse_command(normalized_cmd)
+            if ast is not None and has_subshell(ast):
+                return SecurityDecision(
+                    SecurityDecisionType.BLOCK,
+                    "Security rule 'subshell': Command substitution (subshell) "
+                    "detected — may hide malicious payloads",
+                )
+        except Exception:
+            pass
 
         if self.config.defense_mode == DefenseMode.OFF:
             return SecurityDecision(SecurityDecisionType.ALLOW)
@@ -426,7 +443,9 @@ class BehaviorGuard:
             if len(segment) < 20:
                 continue
             try:
-                decoded += " " + base64.b64decode(segment, validate=True).decode("utf-8", errors="ignore")
+                decoded += " " + base64.b64decode(segment, validate=True).decode(
+                    "utf-8", errors="ignore"
+                )
             except (binascii.Error, ValueError):
                 continue
         # Hex
@@ -464,6 +483,7 @@ class BehaviorGuard:
         if tool_args:
             try:
                 import hashlib
+
                 args_hash = hashlib.sha256(
                     json.dumps(tool_args, sort_keys=True, ensure_ascii=False).encode("utf-8")
                 ).hexdigest()[:16]

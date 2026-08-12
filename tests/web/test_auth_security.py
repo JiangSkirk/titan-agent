@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -20,7 +21,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from js.config import JSSettings, SecurityConfig
 from js.web import server as web_server
-from js.web.auth import AuthManager, require_auth
+from js.web.auth import AuthManager, authenticate_credentials
 from js.web.server import create_app
 
 
@@ -70,7 +71,7 @@ class TestAnonymousIsGuest:
         settings = _settings(tmp_path, api_key_required=False)
         monkeypatch.setattr(web_server, "_settings", settings)
 
-        ctx = await require_auth(api_key=None)
+        ctx = await authenticate_credentials(None, None)
 
         assert ctx["role"] == "guest"
         assert ctx["role"] != "admin"
@@ -143,6 +144,55 @@ class TestBootstrapLoopbackOnly:
         resp = client.get("/api/setup/first-start", headers={"X-API-Key": user_key})
         assert resp.status_code == 200
 
+    def test_bootstrap_denied_when_forwarded_headers_present(self, tmp_path: Path) -> None:
+        """Loopback peer behind a reverse proxy must not win the bootstrap window."""
+        settings = self._bootstrap_settings(tmp_path)
+        agent = _agent(settings)
+        from js.web.deps import set_globals
+
+        web_server._agent = agent
+        web_server._settings = settings
+        set_globals(agent, settings)
+        client = TestClient(create_app(), client=("127.0.0.1", 50000))
+
+        resp = client.get(
+            "/api/setup/first-start",
+            headers={"X-Forwarded-For": "203.0.113.50"},
+        )
+        assert resp.status_code == 403
+        assert (
+            "reverse-proxy" in resp.json()["detail"].lower()
+            or "forwarded" in resp.json()["detail"].lower()
+        )
+
+
+# ----------------------------------------------------------------------
+# Setup auth-optional: anonymous is guest (read-only)
+# ----------------------------------------------------------------------
+
+
+class TestSetupAuthOptionalIsGuest:
+    def test_setup_anonymous_is_guest_when_auth_optional(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path, api_key_required=False, first_run_completed=False)
+        client = _wire(settings, _agent(settings))
+
+        # first-start is read-only and remains reachable for guests
+        assert client.get("/api/setup/first-start").status_code == 200
+
+    def test_setup_complete_denied_for_anonymous_guest(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path, api_key_required=False, first_run_completed=False)
+        client = _wire(settings, _agent(settings))
+
+        resp = client.post("/api/setup/complete")
+        assert resp.status_code == 403
+
+    def test_setup_reset_denied_for_anonymous_guest(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path, api_key_required=False, first_run_completed=False)
+        client = _wire(settings, _agent(settings))
+
+        resp = client.post("/api/setup/reset")
+        assert resp.status_code == 403
+
 
 # ----------------------------------------------------------------------
 # F-03/F-04: HttpOnly session cookie login
@@ -164,7 +214,7 @@ class TestSessionCookieLogin:
         set_cookie = resp.headers["set-cookie"]
         assert "HttpOnly" in set_cookie
         assert "SameSite=strict" in set_cookie
-        assert resp.cookies.get("js_session")
+        assert resp.cookies.get("js_session_js-agent")
 
     def test_login_rejects_invalid_key(self, tmp_path: Path) -> None:
         client, _admin_key = self._client_with_admin_key(tmp_path)
@@ -186,7 +236,7 @@ class TestSessionCookieLogin:
     def test_revoked_session_is_rejected(self, tmp_path: Path) -> None:
         client, admin_key = self._client_with_admin_key(tmp_path)
         resp = client.post("/api/auth/session", headers={"X-API-Key": admin_key})
-        token = resp.cookies.get("js_session")
+        token = resp.cookies.get("js_session_js-agent")
         assert token
         assert client.get("/api/audit").status_code == 200
 
@@ -197,7 +247,7 @@ class TestSessionCookieLogin:
         assert logout.status_code == 200
 
         # Re-present the revoked token: the server must fail closed.
-        client.cookies.set("js_session", token)
+        client.cookies.set("js_session_js-agent", token)
         assert client.get("/api/audit").status_code == 401
 
     def test_session_dies_with_underlying_key(self, tmp_path: Path) -> None:
@@ -272,6 +322,103 @@ class TestRevokeKeyExactMatch:
             mgr.verify(key)
 
 
+class TestManagedApiKeyProvenance:
+    _ISSUER = "js-agent-desktop-bootstrap-v1"
+
+    @staticmethod
+    def _database_rows(state_dir: Path) -> dict[str, list[tuple[object, ...]]]:
+        with sqlite3.connect(state_dir / "api_keys.db") as connection:
+            return {
+                "api_keys": connection.execute(
+                    "SELECT key_hash, name, role, created_at, last_used, enabled "
+                    "FROM api_keys ORDER BY key_hash"
+                ).fetchall(),
+                "auth_sessions": connection.execute(
+                    "SELECT token_hash, key_hash, created_at, expires_at "
+                    "FROM auth_sessions ORDER BY token_hash"
+                ).fetchall(),
+            }
+
+    def test_desktop_purge_preserves_unmarked_same_name_key_and_session(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        mgr = AuthManager(tmp_path)
+        ordinary_key = mgr.create_key("desktop-bootstrap-ephemeral", role="admin")
+        mgr.create_session(ordinary_key)
+        before = self._database_rows(tmp_path)
+
+        assert mgr.purge_managed_keys(issuer=self._ISSUER) == []
+
+        assert self._database_rows(tmp_path) == before
+        assert mgr.verify(ordinary_key)["name"] == "desktop-bootstrap-ephemeral"
+
+    def test_managed_key_and_marker_are_one_transaction(self, tmp_path: Path) -> None:
+        tmp_path.mkdir(exist_ok=True)
+        with sqlite3.connect(tmp_path / "api_keys.db") as connection:
+            connection.execute(
+                "CREATE TABLE managed_api_keys ("
+                "key_hash TEXT PRIMARY KEY, issuer TEXT NOT NULL, created_at REAL NOT NULL)"
+            )
+            connection.commit()
+        mgr = AuthManager(tmp_path)
+        with sqlite3.connect(tmp_path / "api_keys.db") as connection:
+            connection.execute(
+                "CREATE TRIGGER reject_managed_marker "
+                "BEFORE INSERT ON managed_api_keys "
+                "BEGIN SELECT RAISE(ABORT, 'marker rejected'); END"
+            )
+            connection.commit()
+
+        key = "js_" + "a" * 43
+        with pytest.raises(sqlite3.IntegrityError, match="marker rejected"):
+            mgr.provision_managed_key(
+                key,
+                name="desktop-bootstrap-ephemeral",
+                role="admin",
+                issuer=self._ISSUER,
+            )
+
+        with sqlite3.connect(tmp_path / "api_keys.db") as connection:
+            assert connection.execute("SELECT * FROM api_keys").fetchall() == []
+            assert connection.execute("SELECT * FROM managed_api_keys").fetchall() == []
+
+    def test_managed_revoke_removes_marker_sessions_and_cached_identity(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from js.exceptions import AuthRequiredError
+
+        mgr = AuthManager(tmp_path)
+        key = "js_" + "b" * 43
+        identity = mgr.provision_managed_key(
+            key,
+            name="desktop-bootstrap-ephemeral",
+            role="admin",
+            issuer=self._ISSUER,
+        )
+        mgr.create_session(key)
+        assert mgr.verify(key)["key_hash"] == identity["key_hash"]
+
+        assert mgr.revoke_key(str(identity["key_hash"])[:16])
+
+        with sqlite3.connect(tmp_path / "api_keys.db") as connection:
+            assert connection.execute("SELECT * FROM api_keys").fetchall() == []
+            assert connection.execute("SELECT * FROM auth_sessions").fetchall() == []
+            assert connection.execute("SELECT * FROM managed_api_keys").fetchall() == []
+        with pytest.raises(AuthRequiredError):
+            mgr.verify(key)
+
+    def test_malformed_managed_provenance_schema_fails_closed(self, tmp_path: Path) -> None:
+        tmp_path.mkdir(exist_ok=True)
+        with sqlite3.connect(tmp_path / "api_keys.db") as connection:
+            connection.execute("CREATE TABLE managed_api_keys (key_hash TEXT PRIMARY KEY)")
+            connection.commit()
+
+        with pytest.raises(RuntimeError, match="managed API key provenance schema"):
+            AuthManager(tmp_path)
+
+
 # ----------------------------------------------------------------------
 # F-07: WebSocket auth failure must not downgrade to anonymous
 # ----------------------------------------------------------------------
@@ -295,8 +442,15 @@ class TestWebSocketAuthFailClosed:
         settings = _settings(tmp_path, api_key_required=False)
         client = _wire(settings, _agent(settings))
 
-        with client.websocket_connect("/ws", headers=self._WS_ORIGIN):
-            pass  # accepted: no credentials presented, local convenience mode
+        with client.websocket_connect("/ws", headers=self._WS_ORIGIN) as ws:
+            # Connection may stay open for browsing, but chat turns are rejected.
+            ws.send_json({"type": "message", "content": "hello"})
+            reply = ws.receive_json()
+            assert reply["type"] == "error"
+            assert (
+                "read-only" in reply["content"].lower()
+                or "authenticate" in reply["content"].lower()
+            )
 
     def test_ws_accepts_session_cookie(self, tmp_path: Path) -> None:
         settings = _settings(tmp_path, api_key_required=True, first_run_completed=True)
@@ -314,7 +468,7 @@ class TestWebSocketAuthFailClosed:
         admin_key = auth_mgr.create_key("admin", role="admin")
         client = _wire(settings, _agent(settings))
         resp = client.post("/api/auth/session", headers={"X-API-Key": admin_key})
-        token = resp.cookies.get("js_session")
+        token = resp.cookies.get("js_session_js-agent")
         assert token
         auth_mgr.revoke_session(token)
 

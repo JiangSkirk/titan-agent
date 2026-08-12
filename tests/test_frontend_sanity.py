@@ -106,11 +106,37 @@ class TestStaticAssets:
     def test_stream_errors_clear_transient_ui_state(self, client: TestClient) -> None:
         app_js = client.get("/static/app.js").text
 
-        assert "function abortStream()" in app_js
+        assert "function abortStream(terminalState = 'cancelled')" in app_js
         assert "data.type === 'stream_diagnostic'" in app_js
         assert "abortStream();\n      appendMessage('system', '流式通道错误:" not in app_js
         assert "data.type === 'error'" in app_js
-        assert "abortStream();\n      appendMessage('system', '错误:" in app_js
+        assert "abortStream('failed');\n      appendMessage('system', '错误:" in app_js
+        assert "socket.onclose = () => {" in app_js
+        assert "state.streamGeneration += 1;" in app_js
+        assert "state.activeStream = null;\n    abortStream('failed');" in app_js
+
+    def test_fleet_history_uses_selected_session_and_accessible_controls(
+        self, client: TestClient
+    ) -> None:
+        app_js = client.get("/static/app.js").text
+
+        history_start = app_js.index("async function loadFleetSessionToChat(sessionId)")
+        history_end = app_js.index("// ===== Fleet UI Helpers =====", history_start)
+        history_js = app_js[history_start:history_end]
+
+        assert "encodeURIComponent(state.sessionId)" not in history_js
+        assert "state.currentFleetSessionId = state.sessionId" not in history_js
+        assert "deleteFleetSession(state.sessionId)" not in history_js
+        assert "loadFleetSessionToChat(state.sessionId)" not in history_js
+        assert 'class="fleet-open-btn' in history_js
+        assert 'type="button"' in history_js
+        assert 'aria-label="打开协作历史：' in history_js
+        assert 'aria-label="删除协作历史：' in history_js
+        assert "deleteFleetSession(sessionId)" in history_js
+        assert "loadFleetSessionToChat(sessionId)" in history_js
+        assert "div.dataset.messageRole = 'assistant';" in history_js
+        assert "div.setAttribute('role', 'article');" in history_js
+        assert "div.setAttribute('aria-label', 'JS Agent 协作历史结果');" in history_js
 
     def test_echo_approval_ui_uses_safe_rendering_and_validates_decisions(
         self, client: TestClient
@@ -249,12 +275,12 @@ class TestIndexHtml:
     def test_sidebar_toggle_present(self, client: TestClient) -> None:
         res = client.get("/")
         assert res.status_code == 200
-        assert 'onclick="toggleSidebar()"' in res.text
+        assert 'id="btn-toggle-session-column"' in res.text
 
     def test_app_js_loaded_as_module(self, client: TestClient) -> None:
         res = client.get("/")
         assert res.status_code == 200
-        assert '<script type="module" src="/static/app.js?v=4"></script>' in res.text
+        assert '<script type="module" src="/static/app.js?v=' in res.text
 
     def test_browser_assets_are_local_and_csp_disallows_public_cdns(
         self, client: TestClient
@@ -274,10 +300,14 @@ class TestIndexHtml:
         html = client.get("/").text
         app_js = client.get("/static/app.js").text
 
-        assert 'id="nav-approvals"' in html
-        assert "switchTab('approvals')" in html
-        assert 'id="approvals-pending-count"' in html
+        # Approvals entry is generated into the more menu by shell.js; the
+        # badge lives inside it, and the tab container stays server-rendered.
+        assert 'id="more-menu"' in html
+        assert 'id="approvals-pending-count"' not in html  # built client-side
         assert 'id="tab-approvals"' in html
         assert 'id="approvals-list"' in html
+        shell_js = client.get("/static/js/shell.js").text
+        assert "nav-${entry.id}" in shell_js
+        assert "'approvals'" in shell_js
         assert "from './tabs/approvals.js'" in app_js
         assert "if (tab === 'approvals') loadApprovals();" in app_js

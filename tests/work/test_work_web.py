@@ -73,7 +73,7 @@ def test_create_work_web_app_bootstraps_work_agent_without_skills(tmp_path: Path
         page = client.get("/")
         assert page.status_code == 200
         assert "<title>JS Agent Work</title>" in page.text
-        assert '<h1 class="font-bold text-lg">JS Agent Work</h1>' in page.text
+        assert 'class="rail-brand"' in page.text
 
 
 @pytest.mark.parametrize("fleet_timeout", [False, True], ids=["success", "timeout"])
@@ -668,12 +668,14 @@ def test_js_work_web_cli_builds_work_web_app(monkeypatch: Any, tmp_path: Path) -
         *,
         config: str | None,
         home: Path | None,
+        personal_roots: Any,
         profile: WorkToolProfile,
         host: str,
         port: int,
     ) -> MagicMock:
         captured["config"] = config or ""
         captured["home"] = str(home)
+        captured["personal_roots"] = personal_roots
         captured["profile"] = profile.value
         captured["host"] = host
         captured["port"] = port
@@ -707,6 +709,7 @@ def test_js_work_web_cli_builds_work_web_app(monkeypatch: Any, tmp_path: Path) -
     assert captured == {
         "config": "",
         "home": str(tmp_path),
+        "personal_roots": None,
         "profile": "office",
         "host": "127.0.0.1",
         "port": 8765,

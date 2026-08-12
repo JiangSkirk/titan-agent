@@ -85,7 +85,7 @@ dev = [
 ]
 [project.scripts]
 js = "js.__main__:main"
-js-work = "js_work.cli:main"
+js-work = "js_work.cli:compat_main"
 
 [build-system]
 requires = ["hatchling"]
@@ -117,6 +117,9 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "TCH"]
 ignore = ["E501", "TC001", "TC003", "SIM105", "SIM108", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_r6_memory_persistent.py" = ["N802"]
 
 [tool.mypy]
 python_version = "3.12"

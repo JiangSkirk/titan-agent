@@ -750,3 +750,71 @@ _Dreams are processed memories. Each entry represents a consolidation cycle._
         path = self._memory_file_path(name, owner_key_hash)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+    # ── R6 compression pipeline (lazy, production-owned) ──
+
+    @property
+    def compression_pipeline(self) -> Any:
+        """Lazy R6 CompressionPipeline bound to memory_enhanced.db."""
+        cached = getattr(self, "_compression_pipeline", None)
+        if cached is not None:
+            return cached
+        from js.memory.compression import CompressionPipeline
+
+        cached = CompressionPipeline(self.enhanced.db_path)
+        self._compression_pipeline = cached
+        return cached
+
+    def create_compression_proposal(
+        self,
+        *,
+        authority: Any,
+        source_refs: tuple[Any, ...],
+        proposed_summary: str,
+    ) -> Any:
+        return self.compression_pipeline.create_proposal(
+            authority=authority,
+            source_refs=source_refs,
+            proposed_summary=proposed_summary,
+        )
+
+    def approve_compression_proposal(
+        self,
+        proposal_id: str,
+        *,
+        authority: Any,
+    ) -> Any:
+        return self.compression_pipeline.approve_proposal(
+            proposal_id, authority=authority,
+        )
+
+    def reject_compression_proposal(
+        self,
+        proposal_id: str,
+        *,
+        authority: Any,
+    ) -> Any:
+        return self.compression_pipeline.reject_proposal(
+            proposal_id, authority=authority,
+        )
+
+    def list_compression_proposals(
+        self,
+        *,
+        scope: Any,
+        status: str = "pending",
+        limit: int = 50,
+    ) -> Any:
+        return self.compression_pipeline.list_proposals(
+            scope=scope, status=status, limit=limit,
+        )
+
+    def rehydrate_compression_capsule(
+        self,
+        capsule_id: str,
+        *,
+        authority: Any,
+    ) -> Any:
+        return self.compression_pipeline.rehydrate_capsule(
+            capsule_id, authority=authority,
+        )
