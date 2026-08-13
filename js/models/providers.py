@@ -34,10 +34,9 @@ except Exception:
     pass
 
 
-def _redact_key(key: str | None) -> str:
-    from js.models.capability import redact_api_key
-
-    return redact_api_key(key)
+def _credential_log_status(key: str | None) -> str:
+    """Return a non-identifying credential marker for operational logs."""
+    return "<configured>" if key else "<not-configured>"
 
 
 def _sanitize_provider_exc(
@@ -332,12 +331,13 @@ class OpenAICompatibleProvider(ModelProvider):
                         config.name,
                         ttype,
                     )
-                except Exception as e:
+                except Exception as exc:
                     logger.warning(
-                        "Transport %s failed for %s, falling back to chat_completions: %s",
+                        "Transport %s failed for %s; falling back "
+                        "to chat_completions (exception=%s)",
                         ttype,
                         config.name,
-                        e,
+                        type(exc).__name__,
                     )
                     self._transport = ChatCompletionsTransport()
             else:
@@ -347,7 +347,7 @@ class OpenAICompatibleProvider(ModelProvider):
             "Provider %s initialised (local=%s, key=%s, http2=%s)",
             config.name,
             self._is_local,
-            _redact_key(config.api_key),
+            _credential_log_status(config.api_key),
             _http2,
         )
 

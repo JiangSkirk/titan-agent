@@ -31,6 +31,8 @@ from js.appshell.principal import (
     APPSHELL_SESSION_TTL_SECONDS,
     AppShellPrincipalV1,
 )
+from js.security.provider_credential_migration import MigrationError
+from js.security.provider_credentials import CredentialError
 from js.web.auth import AuthManager, _generate_key, check_origin, request_is_direct_loopback
 
 READY_SCHEMA = "JSAgentHostReadyV1"
@@ -282,10 +284,20 @@ def create_desktop_host_app(
     token: str,
     ttl_seconds: int,
     port: int,
+    credential_store: Any | None = None,
 ) -> tuple[FastAPI, EphemeralDesktopIdentity]:
     from js.appshell.server import create_appshell_app
 
-    app = create_appshell_app(host="127.0.0.1", port=port)
+    if credential_store is None:
+        from js.security.provider_credentials import required_macos_keychain_store
+
+        credential_store = required_macos_keychain_store("js-agent")
+
+    app = create_appshell_app(
+        host="127.0.0.1",
+        port=port,
+        credential_store=credential_store,
+    )
     bootstrap = OneTimeBootstrapToken(token, ttl_seconds=ttl_seconds)
     identity = EphemeralDesktopIdentity(app)
     child_lifespan = app.router.lifespan_context
@@ -475,7 +487,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    credential_store: Any | None = None,
+) -> int:
     args = _parser().parse_args(argv)
     # The Rust supervisor passes the digest it was compiled with. The sidecar
     # must NOT simply echo it back; compare against its own embedded value.
@@ -505,10 +521,17 @@ def main(argv: list[str] | None = None) -> int:
             token=token,
             ttl_seconds=args.bootstrap_ttl_seconds,
             port=port,
+            credential_store=credential_store,
         )
     except (ValueError, OSError):
         print("invalid desktop host startup input", file=sys.stderr)
         return 64
+    except CredentialError:
+        print("desktop credential backend unavailable", file=sys.stderr)
+        return 78
+    except MigrationError:
+        print("desktop credential migration failed", file=sys.stderr)
+        return 78
 
     token = "0" * 64
     try:

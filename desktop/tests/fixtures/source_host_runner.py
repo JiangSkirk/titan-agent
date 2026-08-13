@@ -23,6 +23,9 @@ def main(argv: list[str] | None = None) -> int:
     sys.path.insert(0, str(REPO_ROOT))
     from desktop import source_digest
     from desktop.sidecar.host import main as host_main
+    from js.security.provider_credentials import fake_keychain_store
+
+    credential_store, _ = fake_keychain_store()
 
     if os.environ.get("JS_AGENT_TEST_UNSAFE_EMBEDDED_LOADER") == "1":
         source_digest._EMBEDDED_DIGEST_FILE = embedded_path
@@ -31,11 +34,11 @@ def main(argv: list[str] | None = None) -> int:
             return embedded_path.read_text(encoding="ascii")
 
         source_digest.load_embedded_sidecar_digest = unsafe_loader
-        return host_main(arguments)
+        return host_main(arguments, credential_store=credential_store)
 
     if embedded_path != DEFAULT_EMBEDDED_DIGEST:
         source_digest._EMBEDDED_DIGEST_FILE = embedded_path
-        return host_main(arguments)
+        return host_main(arguments, credential_store=credential_store)
 
     # apply_patch-managed text fixtures have a final newline. Stage the exact
     # 64-byte build resource so production parsing remains strict.
@@ -43,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
         staged = Path(temporary) / ".embedded_source_digest"
         staged.write_bytes(DEFAULT_EMBEDDED_DIGEST.read_text(encoding="ascii").strip().encode())
         source_digest._EMBEDDED_DIGEST_FILE = staged
-        return host_main(arguments)
+        return host_main(arguments, credential_store=credential_store)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +22,7 @@ import pytest
 from fastapi import FastAPI
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+PYTHON = Path(os.environ.get("JS_AGENT_TEST_PYTHON", sys.executable)).resolve()
 SOURCE_DIGEST = "ab" * 32
 SOURCE_HOST_RUNNER = Path(__file__).with_name("fixtures") / "source_host_runner.py"
 EMBEDDED_DIGEST_FIXTURE = (
@@ -920,6 +921,276 @@ def test_matching_host_passes_validated_embedded_digest_to_ready_serve(
 
     assert host.main(["--source-digest", SOURCE_DIGEST]) == 0
     assert observed["source_digest"] is embedded
+
+
+def test_keychain_backend_failure_is_closed_without_traceback_or_ready_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from desktop import source_digest
+    from desktop.sidecar import host
+    from js.security.provider_credentials import CredentialBackendUnavailable
+
+    class Listener:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43127)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(source_digest, "load_embedded_sidecar_digest", lambda: SOURCE_DIGEST)
+    monkeypatch.setattr(host, "_read_bootstrap_token", lambda: "01" * 32)
+    monkeypatch.setattr(host, "_bind_loopback_socket", Listener)
+
+    def fail_keychain(**_kwargs: object) -> object:
+        raise CredentialBackendUnavailable("synthetic private detail")
+
+    monkeypatch.setattr(host, "create_desktop_host_app", fail_keychain)
+
+    assert host.main(["--source-digest", SOURCE_DIGEST]) == 78
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "desktop credential backend unavailable\n"
+    assert "Traceback" not in captured.err
+    assert "synthetic" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("locked", id="locked"),
+        pytest.param("denied", id="denied"),
+        pytest.param("unavailable", id="unavailable"),
+    ],
+)
+def test_uninjected_host_calls_required_macos_store_and_fails_before_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    from desktop import source_digest
+    from desktop.sidecar import host
+    from js.security import provider_credentials
+    from js.security.provider_credentials import (
+        CredentialAccessDenied,
+        CredentialBackendUnavailable,
+        CredentialLocked,
+    )
+
+    class Listener:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43127)
+
+        def close(self) -> None:
+            return None
+
+    failures = {
+        "locked": CredentialLocked("private locked detail"),
+        "denied": CredentialAccessDenied("private denied detail"),
+        "unavailable": CredentialBackendUnavailable("private unavailable detail"),
+    }
+    products: list[str] = []
+
+    def required_store(product_id: str) -> object:
+        products.append(product_id)
+        raise failures[failure]
+
+    monkeypatch.setattr(source_digest, "load_embedded_sidecar_digest", lambda: SOURCE_DIGEST)
+    monkeypatch.setattr(host, "_read_bootstrap_token", lambda: "01" * 32)
+    monkeypatch.setattr(host, "_bind_loopback_socket", Listener)
+    monkeypatch.setattr(
+        provider_credentials,
+        "required_macos_keychain_store",
+        required_store,
+    )
+
+    assert host.main(["--source-digest", SOURCE_DIGEST]) == 78
+    captured = capsys.readouterr()
+    assert products == ["js-agent"]
+    assert captured.out == ""
+    assert captured.err == "desktop credential backend unavailable\n"
+    assert "Traceback" not in captured.err
+    assert "private" not in captured.err
+
+
+def test_provider_migration_failure_is_closed_without_traceback_or_ready_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from desktop import source_digest
+    from desktop.sidecar import host
+    from js.security.provider_credential_migration import CredentialMigrationFailed
+
+    class Listener:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43127)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(source_digest, "load_embedded_sidecar_digest", lambda: SOURCE_DIGEST)
+    monkeypatch.setattr(host, "_read_bootstrap_token", lambda: "01" * 32)
+    monkeypatch.setattr(host, "_bind_loopback_socket", Listener)
+
+    def fail_migration(**_kwargs: object) -> object:
+        raise CredentialMigrationFailed("synthetic private path and secret")
+
+    monkeypatch.setattr(host, "create_desktop_host_app", fail_migration)
+
+    assert host.main(["--source-digest", SOURCE_DIGEST]) == 78
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "desktop credential migration failed\n"
+    assert "Traceback" not in captured.err
+    assert "synthetic" not in captured.err
+
+
+def test_real_appshell_migration_failure_exits_78_before_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    import yaml
+
+    from desktop import source_digest
+    from desktop.sidecar import host
+    from js.security.provider_credentials import fake_keychain_store
+
+    config = tmp_path / "unsafe-config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "workspace": str(tmp_path / "workspace"),
+                "state_dir": str(tmp_path / "state"),
+                "providers": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(config, 0o644)
+
+    class Listener:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43127)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JS_CONFIG_PATH", str(config))
+    monkeypatch.delenv("JS_WORK_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(source_digest, "load_embedded_sidecar_digest", lambda: SOURCE_DIGEST)
+    monkeypatch.setattr(host, "_read_bootstrap_token", lambda: "01" * 32)
+    monkeypatch.setattr(host, "_bind_loopback_socket", Listener)
+    store, _backend = fake_keychain_store()
+
+    assert host.main(["--source-digest", SOURCE_DIGEST], credential_store=store) == 78
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "desktop credential migration failed\n"
+    assert "Traceback" not in captured.err
+
+
+def test_desktop_existing_search_ref_missing_from_keychain_exits_78(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    import yaml
+
+    from desktop import source_digest
+    from desktop.sidecar import host
+    from js.security.provider_credentials import fake_keychain_store
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "workspace": str(tmp_path / "workspace"),
+                "state_dir": str(tmp_path / "state"),
+                "providers": [],
+                "search_credential_ref": {
+                    "ref_id": "f" * 32,
+                    "product_id": "js-agent",
+                    "kind": "search_provider",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(config, 0o600)
+
+    class Listener:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43127)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JS_CONFIG_PATH", str(config))
+    monkeypatch.delenv("JS_WORK_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(source_digest, "load_embedded_sidecar_digest", lambda: SOURCE_DIGEST)
+    monkeypatch.setattr(host, "_read_bootstrap_token", lambda: "01" * 32)
+    monkeypatch.setattr(host, "_bind_loopback_socket", Listener)
+    store, backend = fake_keychain_store()
+
+    assert host.main(["--source-digest", SOURCE_DIGEST], credential_store=store) == 78
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "desktop credential migration failed\n"
+    assert "Traceback" not in captured.err
+    assert backend._store == {}  # noqa: SLF001 - no fallback credential created
+
+
+def test_corrupt_legacy_secret_database_exits_78_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    import yaml
+
+    from desktop import source_digest
+    from desktop.sidecar import host
+    from js.security.provider_credentials import fake_keychain_store
+
+    config = tmp_path / "config.yaml"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    (state / "secrets.db").write_bytes(b"not a sqlite database")
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "workspace": str(tmp_path / "workspace"),
+                "state_dir": str(state),
+                "providers": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(config, 0o600)
+
+    class Listener:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 43127)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("JS_CONFIG_PATH", str(config))
+    monkeypatch.delenv("JS_WORK_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(source_digest, "load_embedded_sidecar_digest", lambda: SOURCE_DIGEST)
+    monkeypatch.setattr(host, "_read_bootstrap_token", lambda: "01" * 32)
+    monkeypatch.setattr(host, "_bind_loopback_socket", Listener)
+    store, _backend = fake_keychain_store()
+
+    assert host.main(["--source-digest", SOURCE_DIGEST], credential_store=store) == 78
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "desktop credential migration failed\n"
+    assert "Traceback" not in captured.err
+    assert "sqlite" not in captured.err.lower()
 
 
 def test_bootstrap_token_exchanges_once_for_httponly_parent_session(

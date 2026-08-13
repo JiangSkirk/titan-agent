@@ -1667,15 +1667,7 @@ def create_app(
             raise HTTPException(404, f"Unknown preset: {preset_id}")
 
         if not api_key:
-            # Try to load from environment
-            import os
-
-            api_key = os.getenv(preset.api_key_env, "")
-            if not api_key:
-                raise HTTPException(
-                    400,
-                    f"API key required. Set {preset.api_key_env} environment variable or pass api_key in payload.",
-                )
+            raise HTTPException(400, "API key is required")
 
         cfg = build_provider_config(preset, api_key)
 

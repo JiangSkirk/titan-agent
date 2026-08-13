@@ -20,11 +20,20 @@ DIGEST = "ab" * 32
 OTHER_DIGEST = "cd" * 32
 BUILD_NUMBER = "2026081101"
 _BUILD_INPUT_RELATIVES = (
+    "uv.lock",
     "desktop/src-tauri/Cargo.lock",
     "desktop/pnpm-lock.yaml",
     "desktop/requirements-build.txt",
     "desktop/build_driver.py",
 )
+_DESKTOP_RUNTIME_PACKAGES = {
+    "pyobjc-core": "12.2.2",
+    "pyobjc-framework-cocoa": "12.2.2",
+    "pyobjc-framework-quartz": "12.2.2",
+    "pyobjc-framework-security": "12.2.2",
+    "tomli-w": "1.2.0",
+}
+_DESKTOP_RUNTIME_MODULES = ("Cocoa", "Quartz", "Security", "objc", "tomli_w")
 
 
 def _sha256(path: Path) -> str:
@@ -89,6 +98,14 @@ def _zip_member(name: str, *, file_type: int, mode: int) -> zipfile.ZipInfo:
 
 def _write_release_inputs(repo_root: Path) -> None:
     files = {
+        "uv.lock": "\n".join(
+            ["version = 1", "revision = 1"]
+            + [
+                f'[[package]]\nname = "{name}"\nversion = "{version}"'
+                for name, version in _DESKTOP_RUNTIME_PACKAGES.items()
+            ]
+        )
+        + "\n",
         "desktop/build_driver.py": "BUILD_DRIVER_VERSION = 2\n",
         "desktop/package.json": '{"private":true}\n',
         "desktop/pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
@@ -105,6 +122,38 @@ def _write_release_inputs(repo_root: Path) -> None:
         path = repo_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+
+def _runtime_probe_payload(
+    python: Path,
+    *,
+    packages: dict[str, str] | None = None,
+    modules: dict[str, bool] | None = None,
+    isolated: bool = True,
+) -> str:
+    return json.dumps(
+        {
+            "schema": "JSAgentDesktopPythonRuntimeProbeV1",
+            "executable": str(python.resolve()),
+            "prefix": "/private/tmp/js-agent-runtime",
+            "base_prefix": (
+                "/Library/Frameworks/Python.framework" if isolated else "/private/tmp/js-agent-runtime"
+            ),
+            "user_site_enabled": False,
+            "packages": packages or _DESKTOP_RUNTIME_PACKAGES,
+            "modules": modules
+            or dict.fromkeys(_DESKTOP_RUNTIME_MODULES, True),
+        }
+    )
+
+
+def _fake_runtime_binding(repo_root: Path) -> dict[str, Any]:
+    return {
+        "schema": "JSAgentDesktopPythonRuntimeV1",
+        "uv_lock_sha256": _sha256(repo_root / "uv.lock"),
+        "packages": dict(_DESKTOP_RUNTIME_PACKAGES),
+        "modules": list(_DESKTOP_RUNTIME_MODULES),
+    }
 
 
 def _write_zip_from_app(app_path: Path, zip_path: Path) -> None:
@@ -124,10 +173,19 @@ def _write_zip_from_app(app_path: Path, zip_path: Path) -> None:
 
 
 @pytest.fixture
-def manifest_tree(tmp_path: Path) -> dict[str, Any]:
+def manifest_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
     repo_root = tmp_path / "repo"
     output_dir = tmp_path / "output"
     _write_release_inputs(repo_root)
+    monkeypatch.setattr(
+        build_driver,
+        "verify_desktop_python_runtime",
+        lambda *_args, **_kwargs: _fake_runtime_binding(repo_root),
+        raising=False,
+    )
     run = build_driver.prepare_build_run(output_dir=output_dir, repo_root=repo_root)
     inputs = _offline_build_inputs(tmp_path / "manifest-inputs")
     artifacts = run.root / "artifacts"
@@ -267,8 +325,18 @@ def test_stage_and_build_commands_are_source_stable_locked_and_offline(
     assert pnpm_call["env"]["UV_OFFLINE"] == "1"
     assert pyinstaller_call["env"]["PIP_NO_INDEX"] == "1"
     assert pyinstaller_call["env"]["UV_OFFLINE"] == "1"
-    assert pyinstaller_call["env"]["PYTHONPATH"] == str(stage_root)
+    assert "PYTHONPATH" not in pyinstaller_call["env"]
+    assert pyinstaller_call["cmd"][1:3] == ["-I", "-s"]
     assert str(repo_root / "desktop/.embedded_source_digest") not in pyinstaller_call["cmd"]
+    for module in _DESKTOP_RUNTIME_MODULES:
+        assert ["--hidden-import", module] in [
+            pyinstaller_call["cmd"][index : index + 2]
+            for index in range(len(pyinstaller_call["cmd"]) - 1)
+        ]
+    assert ["--paths", str(stage_root)] in [
+        pyinstaller_call["cmd"][index : index + 2]
+        for index in range(len(pyinstaller_call["cmd"]) - 1)
+    ]
     assert tauri_call["cmd"] == [
         str(tauri.resolve()),
         "build",
@@ -310,6 +378,163 @@ def test_python_build_versions_must_match_exact_offline_pins(tmp_path: Path) -> 
         build_driver.verify_python_build_requirements(
             requirements,
             version_resolver=installed.__getitem__,
+        )
+
+
+def test_desktop_python_runtime_preflight_accepts_only_isolated_locked_closure(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    _write_release_inputs(repo_root)
+    python = tmp_path / "runtime/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"isolated-python")
+    python.chmod(0o700)
+    calls: list[dict[str, Any]] = []
+
+    def probe_runner(
+        cmd: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        timeout: int = 600,
+    ) -> tuple[int, str, str]:
+        calls.append({"cmd": cmd, "cwd": cwd, "env": env, "timeout": timeout})
+        return 0, _runtime_probe_payload(python), ""
+
+    binding = build_driver.verify_desktop_python_runtime(
+        repo_root / "uv.lock",
+        python_executable=python,
+        runner=probe_runner,
+        ambient_environment={},
+    )
+
+    assert binding == _fake_runtime_binding(repo_root)
+    assert calls[0]["cmd"][:4] == [str(python.resolve()), "-I", "-s", "-c"]
+    assert calls[0]["cwd"] == repo_root.resolve()
+    assert calls[0]["env"]["PYTHONNOUSERSITE"] == "1"
+    assert "PYTHONPATH" not in calls[0]["env"]
+    assert "PYTHONHOME" not in calls[0]["env"]
+
+
+def test_desktop_python_runtime_launch_preserves_verified_venv_symlink(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    _write_release_inputs(repo_root)
+    base_python = tmp_path / "base/python3.12"
+    base_python.parent.mkdir(parents=True)
+    base_python.write_bytes(b"base-python")
+    base_python.chmod(0o700)
+    python = tmp_path / "runtime/bin/python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(base_python)
+    calls: list[list[str]] = []
+
+    def probe_runner(
+        cmd: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        timeout: int = 600,
+    ) -> tuple[int, str, str]:
+        del cwd, env, timeout
+        calls.append(cmd)
+        return 0, _runtime_probe_payload(python), ""
+
+    build_driver.verify_desktop_python_runtime(
+        repo_root / "uv.lock",
+        python_executable=python,
+        runner=probe_runner,
+        ambient_environment={},
+    )
+
+    assert calls[0][0] == str(python.absolute())
+
+
+@pytest.mark.parametrize("case", ["ambient", "unisolated", "missing_module"])
+def test_desktop_python_runtime_preflight_fails_closed_on_ambient_or_missing_bridge(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    repo_root = tmp_path / "repo"
+    _write_release_inputs(repo_root)
+    python = tmp_path / "runtime/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    python.chmod(0o700)
+    modules = dict.fromkeys(_DESKTOP_RUNTIME_MODULES, True)
+    if case == "missing_module":
+        modules["Security"] = False
+
+    def probe_runner(
+        _cmd: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        timeout: int = 600,
+    ) -> tuple[int, str, str]:
+        del cwd, env, timeout
+        return 0, _runtime_probe_payload(
+            python,
+            modules=modules,
+            isolated=case != "unisolated",
+        ), ""
+
+    ambient = {"PYTHONPATH": "/tmp/injected"} if case == "ambient" else {}
+    with pytest.raises(RuntimeError, match="Python runtime"):
+        build_driver.verify_desktop_python_runtime(
+            repo_root / "uv.lock",
+            python_executable=python,
+            runner=probe_runner,
+            ambient_environment=ambient,
+        )
+
+
+def test_desktop_python_runtime_preflight_rejects_installed_or_lock_version_drift(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    _write_release_inputs(repo_root)
+    python = tmp_path / "runtime/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    python.chmod(0o700)
+    packages = dict(_DESKTOP_RUNTIME_PACKAGES)
+    packages["pyobjc-core"] = "12.2.1"
+
+    def probe_runner(
+        _cmd: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        timeout: int = 600,
+    ) -> tuple[int, str, str]:
+        del cwd, env, timeout
+        return 0, _runtime_probe_payload(python, packages=packages), ""
+
+    with pytest.raises(RuntimeError, match="version mismatch"):
+        build_driver.verify_desktop_python_runtime(
+            repo_root / "uv.lock",
+            python_executable=python,
+            runner=probe_runner,
+            ambient_environment={},
+        )
+
+    lock = repo_root / "uv.lock"
+    lock.write_text(
+        lock.read_text(encoding="utf-8").replace(
+            'name = "tomli-w"\nversion = "1.2.0"',
+            'name = "tomli-w"\nversion = "1.1.0"',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="uv.lock"):
+        build_driver.verify_desktop_python_runtime(
+            lock,
+            python_executable=python,
+            runner=probe_runner,
+            ambient_environment={},
         )
 
 
@@ -379,6 +604,11 @@ def test_digest_drift_retains_failed_run_and_marks_manifest_invalid(
     monkeypatch.setattr(build_driver, "compute_source_digest", lambda *_args: next(digests))
     monkeypatch.setattr(build_driver, "stage_release_sources", stage)
     monkeypatch.setattr(build_driver, "verify_python_build_requirements", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        build_driver,
+        "verify_desktop_python_runtime",
+        lambda *_a, **_k: _fake_runtime_binding(build_driver.REPO_ROOT),
+    )
     monkeypatch.setattr(build_driver, "install_desktop_dependencies", lambda *_a, **_k: None)
     monkeypatch.setattr(build_driver, "build_sidecar", sidecar)
     monkeypatch.setattr(build_driver, "build_tauri_app", app)
@@ -635,6 +865,7 @@ def test_zip_rejects_unclosed_or_invalid_directory_metadata(
 @pytest.mark.parametrize(
     "relative",
     [
+        "uv.lock",
         "desktop/src-tauri/Cargo.lock",
         "desktop/pnpm-lock.yaml",
         "desktop/requirements-build.txt",
@@ -651,6 +882,26 @@ def test_manifest_rejects_every_build_input_mutation(
     assert build_driver.verify_manifest(
         manifest_tree["manifest_path"], repo_root=manifest_tree["repo_root"]
     )
+
+
+def test_manifest_binds_uv_lock_and_closed_python_runtime(
+    manifest_tree: dict[str, Any],
+) -> None:
+    payload = json.loads(manifest_tree["manifest_path"].read_text(encoding="utf-8"))
+    assert payload["build_inputs"]["uv_lock"] == {
+        "path": "uv.lock",
+        "sha256": _sha256(manifest_tree["repo_root"] / "uv.lock"),
+    }
+    assert payload["build_environment"]["python_runtime"] == _fake_runtime_binding(
+        manifest_tree["repo_root"]
+    )
+
+    payload["build_environment"]["python_runtime"]["packages"]["tomli-w"] = "9.9.9"
+    manifest_tree["manifest_path"].write_text(json.dumps(payload), encoding="utf-8")
+    errors = build_driver.verify_manifest(
+        manifest_tree["manifest_path"], repo_root=manifest_tree["repo_root"]
+    )
+    assert any("Python runtime" in error for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -1089,6 +1340,9 @@ def test_controlled_subprocess_environment_drops_ambient_build_injection(
     for key, value in poison.items():
         if key not in {"HOME", "CARGO_HOME", "PYINSTALLER_CONFIG_DIR"}:
             assert env.get(key) != value
+    assert env["PYTHONNOUSERSITE"] == "1"
+    assert "PYTHONPATH" not in env
+    assert "PYTHONHOME" not in env
 
 
 @pytest.mark.parametrize(
@@ -1223,6 +1477,11 @@ def test_each_build_command_failure_has_no_retry_and_retains_invalid_run(
     inputs = _offline_build_inputs(tmp_path / f"inputs-{fail_at}")
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(build_driver, "verify_python_build_requirements", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        build_driver,
+        "verify_desktop_python_runtime",
+        lambda *_a, **_k: _fake_runtime_binding(repo_root),
+    )
 
     with pytest.raises(RuntimeError, match=f"fixture failure {fail_at}"):
         build_driver.build_desktop(
@@ -1271,6 +1530,11 @@ def test_fake_successful_build_binds_controlled_tools_caches_and_owner_marker(
     for key, value in ambient_poison.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(build_driver, "verify_python_build_requirements", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        build_driver,
+        "verify_desktop_python_runtime",
+        lambda *_a, **_k: _fake_runtime_binding(repo_root),
+    )
 
     manifest_path = build_driver.build_desktop(
         output_dir=output,
@@ -1331,6 +1595,11 @@ def test_failed_final_verification_retains_only_an_invalid_manifest(
         build_driver,
         "verify_python_build_requirements",
         lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        build_driver,
+        "verify_desktop_python_runtime",
+        lambda *_a, **_k: _fake_runtime_binding(repo_root),
     )
     monkeypatch.setattr(
         build_driver,

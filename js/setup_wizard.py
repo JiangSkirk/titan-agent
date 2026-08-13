@@ -24,9 +24,41 @@ logger = get_logger("js.setup")
 class SetupWizard:
     """Interactive setup wizard that auto-configures everything."""
 
-    def __init__(self) -> None:
-        self.settings = JSSettings()
-        self.config_path = Path(os.getenv("JS_CONFIG_PATH", "~/.config/js/config.yaml")).expanduser()
+    def __init__(
+        self,
+        *,
+        settings: JSSettings | None = None,
+        config_path: Path | None = None,
+        credential_store: Any | None = None,
+    ) -> None:
+        self.settings = settings or JSSettings()
+        self.config_path = config_path or Path(
+            os.getenv("JS_CONFIG_PATH", "~/.config/js/config.yaml")
+        ).expanduser()
+        self._credential_store = None
+        self._credential_migrator: Any | None = None
+        self._pending_search_secret: str | None = None
+        if credential_store is not None:
+            from js.security.provider_credential_migration import (
+                ProviderCredentialMigrator,
+            )
+
+            self._credential_store = credential_store.for_product("js-agent")
+            object.__setattr__(
+                self.settings,
+                "_credential_store",
+                self._credential_store,
+            )
+            self._credential_migrator = ProviderCredentialMigrator(
+                self.settings.state_dir,
+                self._credential_store,
+                product_id="js-agent",
+            )
+            if self.config_path.exists():
+                recovered = self._credential_migrator.recover_search_credential(
+                    self.config_path
+                )
+                self.settings.search_credential_ref = recovered
 
     async def run(self, non_interactive: bool = False) -> None:
         """Run the complete setup flow."""
@@ -223,9 +255,9 @@ class SetupWizard:
         search_manager = SearchManager()
         search_manager.register(DuckDuckGoEngine(), default=True)
 
-        # Check for Tavily API key
-        tavily_key = os.getenv("TAVILY_API_KEY", "")
-        if not tavily_key and not non_interactive:
+        # Environment variables are not a Provider credential authority.
+        tavily_key = ""
+        if not non_interactive:
             tavily_key = click.prompt(
                 "Tavily API key (optional, press Enter to skip)",
                 default="",
@@ -234,14 +266,40 @@ class SetupWizard:
 
         if tavily_key:
             search_manager.register(TavilyEngine(tavily_key))
-            # Store in secrets
-            from js.security.secrets import SecretManager
-            secrets = SecretManager(self.settings.state_dir)
-            secrets.store("tavily_api_key", tavily_key)
+            if self._credential_migrator is None:
+                raise RuntimeError("Provider credential store is required")
+            if self.settings.search_credential_ref is not None:
+                raise RuntimeError("Search provider credential is already configured")
+            # The baseline must exist before the atomic search transaction.
+            if not self.config_path.exists():
+                self.settings.save(self.config_path)
+            self._pending_search_secret = tavily_key
 
         self.settings.search_configured = True
 
     async def _save_config(self, **_kwargs: Any) -> None:
+        pending_secret = self._pending_search_secret
+        if pending_secret is not None:
+            if self._credential_migrator is None:
+                raise RuntimeError("Provider credential store is required")
+            previous_ref = self.settings.search_credential_ref
+
+            def save_ref(ref: Any) -> None:
+                self.settings.search_credential_ref = ref
+                try:
+                    self.settings.save(self.config_path)
+                except Exception:
+                    self.settings.search_credential_ref = previous_ref
+                    raise
+
+            committed_ref = self._credential_migrator.configure_search_credential(
+                pending_secret,
+                config_path=self.config_path,
+                save_config=save_ref,
+            )
+            self.settings.search_credential_ref = committed_ref
+            self._pending_search_secret = None
+            return
         self.settings.save(self.config_path)
 
     async def _health_checks(self, **_kwargs: Any) -> None:
@@ -268,5 +326,9 @@ class SetupWizard:
 
 
 async def run_setup(non_interactive: bool = False) -> None:
-    wizard = SetupWizard()
+    from js.security.provider_credentials import required_macos_keychain_store
+
+    wizard = SetupWizard(
+        credential_store=required_macos_keychain_store("js-agent"),
+    )
     await wizard.run(non_interactive=non_interactive)

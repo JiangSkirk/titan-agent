@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 
 from js.agent.tool_executor import ToolExecutorMixin
-from js.config import ModelConfig, ModelProviderConfig, ToolLimits
+from js.config import JSSettings, ModelConfig, ModelProviderConfig, ToolLimits
 from js.echo.attachment_gate import SecureUploadWriter
 from js.echo.durable_thread import EchoDurableExecutor
 from js.echo.ledger.service import EchoSafetyService
 from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runtime_context
+from js.models.provider_manager import ProviderManager, ProviderManagerError
+from js.provider_credential_types import ProviderCredentialRefV1
 from js.search.engines import SearchResult
+from js.security.provider_credentials import fake_keychain_store
 from js.security.secrets import SecretManager
 from js.tools.registry import ToolRegistry, ToolResult, ToolSpec, required_network_hosts
 
@@ -100,6 +105,7 @@ class _ControlExecutor(ToolExecutorMixin):
         _TEST_SAFETY_SERVICES.append(self.echo_safety_service)
         self.logger = MagicMock()
         self._role = None
+        self._static_provider_names: frozenset[str] = frozenset()
         self._current_allowed_tools: set[str] = set()
         self.search = SimpleNamespace(search=AsyncMock())
         installed = SimpleNamespace(
@@ -1489,6 +1495,12 @@ async def test_provider_mutation_runs_inside_echo_and_consumes_opaque_key_once(
     tmp_path: Path,
 ) -> None:
     executor = _ControlExecutor(tmp_path)
+    store, _backend = fake_keychain_store()
+    executor.provider_manager = ProviderManager(
+        executor.settings.state_dir,
+        store,
+        product_id="js-agent",
+    )
     executor._register_control_plane_tools()
     key_ref = executor.stage_provider_discovery_key(
         "super-secret-key",
@@ -1536,10 +1548,16 @@ async def test_provider_mutation_runs_inside_echo_and_consumes_opaque_key_once(
         reset_runtime_context(token)
 
     assert result.success is True
-    saved = executor.provider_manager.add.call_args.args[0]
+    saved = executor.provider_manager.get("custom")
+    assert saved is not None
     assert saved.name == "custom"
     assert saved.api_key == "super-secret-key"
-    assert executor.settings.providers == [saved]
+    assert executor.settings.providers[0].name == saved.name
+    assert executor.settings.providers[0].credential_ref == saved.credential_ref
+    serialized = (executor.settings.state_dir / "providers.json").read_text(
+        encoding="utf-8"
+    )
+    assert "super-secret-key" not in serialized
     executor.router.add_provider.assert_called_once()
     assert (
         executor.take_provider_discovery_key(
@@ -1553,15 +1571,156 @@ async def test_provider_mutation_runs_inside_echo_and_consumes_opaque_key_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["upsert", "update_key", "delete"])
+async def test_provider_mutation_rejects_static_dynamic_name_shadow_without_side_effects(
+    action: str,
+    tmp_path: Path,
+) -> None:
+    executor = _ControlExecutor(tmp_path)
+    store, _backend = fake_keychain_store()
+    static_ref = store.put_verified(
+        "js-agent",
+        "model_provider",
+        "static-authority-secret",
+    )
+    static_provider = ModelProviderConfig(
+        name="shadowed-provider",
+        base_url="https://static-authority.example/v1",
+        api_key="static-authority-secret",
+        credential_ref=static_ref,
+        default_model="static-model",
+        models=[
+            ModelConfig(
+                id="static-model",
+                name="Static Model",
+                provider="shadowed-provider",
+            )
+        ],
+    )
+    config_path = tmp_path / "config.yaml"
+    executor.settings = JSSettings(
+        workspace=executor.settings.workspace,
+        state_dir=executor.settings.state_dir,
+        providers=[static_provider],
+    )
+    executor.settings._config_path = config_path  # type: ignore[attr-defined]
+    executor.settings.save(path=config_path, fields=["providers"])
+    executor._static_provider_names = frozenset({static_provider.name})
+
+    legacy_dynamic_manager = ProviderManager(
+        executor.settings.state_dir,
+        store,
+        product_id="js-agent",
+    )
+    legacy_dynamic_manager.add(
+        ModelProviderConfig(
+            name=static_provider.name,
+            base_url="https://legacy-shadow.example/v1",
+            api_key="legacy-shadow-secret",
+            default_model="legacy-model",
+            models=[
+                ModelConfig(
+                    id="legacy-model",
+                    name="Legacy Model",
+                    provider=static_provider.name,
+                )
+            ],
+        )
+    )
+    executor.provider_manager = legacy_dynamic_manager
+    executor._register_control_plane_tools()
+    opaque_secret = "opaque-key-must-remain-unconsumed"
+    key_ref = executor.stage_provider_discovery_key(
+        opaque_secret,
+        owner_key_hash="admin-owner",
+        product_id="js-agent",
+        session_id="admin-control-plane",
+    )
+    if action == "upsert":
+        arguments: dict[str, Any] = {
+            "action": action,
+            "provider": {
+                "name": static_provider.name,
+                "base_url": "https://attempted-shadow.example/v1",
+                "default_model": "attempted-model",
+                "models": [
+                    {
+                        "id": "attempted-model",
+                        "name": "Attempted Model",
+                        "provider": static_provider.name,
+                    }
+                ],
+            },
+            "api_key_ref": key_ref,
+        }
+    else:
+        arguments = {
+            "action": action,
+            "name": static_provider.name,
+            "api_key_ref": key_ref,
+        }
+    before_config = config_path.read_bytes()
+    before_manager = (executor.settings.state_dir / "providers.json").read_bytes()
+    before_settings = executor.settings.model_dump(mode="json")
+    run_id = f"provider-shadow-conflict-{action}"
+    token = set_runtime_context(
+        _network_runtime_context(
+            executor,
+            tool_name="control_provider_mutate",
+            arguments=arguments,
+            run_id=run_id,
+        )
+    )
+    try:
+        _message, result = await executor._execute_tool_call(
+            {
+                "id": f"provider-shadow-conflict-{action}-call",
+                "function": {
+                    "name": "control_provider_mutate",
+                    "arguments": json.dumps(arguments),
+                },
+            },
+            session_id="admin-control-plane",
+            run_id=run_id,
+            user_input=f"Attempt conflicting provider {action}",
+            allowed_tools={"control_provider_mutate"},
+            owner_key_hash="admin-owner",
+        )
+    finally:
+        reset_runtime_context(token)
+
+    assert result.success is False
+    assert result.metadata == {"status_code": 409}
+    assert config_path.read_bytes() == before_config
+    assert (executor.settings.state_dir / "providers.json").read_bytes() == before_manager
+    assert executor.settings.model_dump(mode="json") == before_settings
+    executor.router.add_provider.assert_not_called()
+    executor.router.remove_provider.assert_not_called()
+    assert (
+        executor.take_provider_discovery_key(
+            key_ref,
+            owner_key_hash="admin-owner",
+            product_id="js-agent",
+            session_id="admin-control-plane",
+        )
+        == opaque_secret
+    )
+
+
+@pytest.mark.asyncio
 async def test_static_provider_key_is_encrypted_and_restart_hydratable(
     tmp_path: Path,
 ) -> None:
     from js.models.provider_manager import hydrate_static_provider_api_keys
 
     executor = _ControlExecutor(tmp_path)
+    store, _backend = fake_keychain_store()
+    old_ref = store.put_verified("js-agent", "model_provider", "old-static-secret")
     static_provider = ModelProviderConfig(
         name="static-provider",
         base_url="https://static.example/v1",
+        api_key="old-static-secret",
+        credential_ref=old_ref,
         default_model="model-a",
         models=[
             ModelConfig(
@@ -1571,7 +1730,20 @@ async def test_static_provider_key_is_encrypted_and_restart_hydratable(
             )
         ],
     )
-    executor.settings.providers = [static_provider]
+    config_path = tmp_path / "config.yaml"
+    executor.settings = JSSettings(
+        workspace=executor.settings.workspace,
+        state_dir=executor.settings.state_dir,
+        providers=[static_provider],
+    )
+    executor.settings._config_path = config_path  # type: ignore[attr-defined]
+    executor._static_provider_names = frozenset({static_provider.name})
+    executor.provider_manager = ProviderManager(
+        executor.settings.state_dir,
+        store,
+        product_id="js-agent",
+        protected_refs=[old_ref],
+    )
     executor._register_control_plane_tools()
     key_ref = executor.stage_provider_discovery_key(
         "static-super-secret",
@@ -1612,9 +1784,271 @@ async def test_static_provider_key_is_encrypted_and_restart_hydratable(
         reset_runtime_context(token)
 
     assert result.success is True
-    restarted = [static_provider.model_copy(update={"api_key": None})]
-    hydrate_static_provider_api_keys(restarted, SecretManager(executor.settings.state_dir))
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    serialized = config_path.read_text(encoding="utf-8")
+    assert "static-super-secret" not in serialized
+    new_ref = ProviderCredentialRefV1.model_validate(
+        persisted["providers"][0]["credential_ref"]
+    )
+    assert new_ref != old_ref
+    assert store.get(old_ref, expected_kind="model_provider") is None
+    restarted = [ModelProviderConfig(**persisted["providers"][0])]
+    hydrate_static_provider_api_keys(restarted, store)
     assert restarted[0].api_key == "static-super-secret"
+
+
+@pytest.mark.asyncio
+async def test_static_provider_router_failure_and_config_rollback_failure_blocks_mutation(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executor = _ControlExecutor(tmp_path)
+    secret = "B1AT-new-static-secret-tail"
+    test_logger = logging.getLogger("test.b1a.provider-mutation")
+    executor.logger = test_logger
+    store, _backend = fake_keychain_store()
+    old_ref = store.put_verified("js-agent", "model_provider", "old-static-secret")
+    static_provider = ModelProviderConfig(
+        name="static-provider",
+        base_url="https://static.example/v1",
+        api_key="old-static-secret",
+        credential_ref=old_ref,
+        default_model="model-a",
+        models=[
+            ModelConfig(
+                id="model-a",
+                name="Model A",
+                provider="static-provider",
+            )
+        ],
+    )
+    config_path = tmp_path / "config.yaml"
+    executor.settings = JSSettings(
+        workspace=executor.settings.workspace,
+        state_dir=executor.settings.state_dir,
+        providers=[static_provider],
+    )
+    executor.settings._config_path = config_path  # type: ignore[attr-defined]
+    executor.settings.save(path=config_path, fields=["providers"])
+    executor._static_provider_names = frozenset({static_provider.name})
+    executor.provider_manager = ProviderManager(
+        executor.settings.state_dir,
+        store,
+        product_id="js-agent",
+        protected_refs=[old_ref],
+    )
+    executor.router.add_provider.side_effect = RuntimeError(
+        f"injected router failure with {secret}"
+    )
+    original_save = JSSettings.save
+    save_calls = 0
+
+    def fail_rollback_save(self: JSSettings, *args: Any, **kwargs: Any) -> None:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise OSError(f"injected rollback publication failure with {secret}")
+        original_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(JSSettings, "save", fail_rollback_save)
+    executor._register_control_plane_tools()
+    key_ref = executor.stage_provider_discovery_key(
+        secret,
+        owner_key_hash="admin-owner",
+        product_id="js-agent",
+        session_id="admin-control-plane",
+    )
+    arguments = {
+        "action": "update_key",
+        "name": "static-provider",
+        "api_key_ref": key_ref,
+    }
+    run_id = "static-provider-uncertain-rollback"
+    token = set_runtime_context(
+        _network_runtime_context(
+            executor,
+            tool_name="control_provider_mutate",
+            arguments=arguments,
+            run_id=run_id,
+        )
+    )
+    with caplog.at_level(logging.ERROR, logger=test_logger.name):
+        try:
+            _message, result = await executor._execute_tool_call(
+                {
+                    "id": "static-provider-uncertain-rollback-call",
+                    "function": {
+                        "name": "control_provider_mutate",
+                        "arguments": json.dumps(arguments),
+                    },
+                },
+                session_id="admin-control-plane",
+                run_id=run_id,
+                user_input="Admin approved static provider credential rotation",
+                allowed_tools={"control_provider_mutate"},
+                owner_key_hash="admin-owner",
+            )
+        finally:
+            reset_runtime_context(token)
+
+    assert result.success is False
+    published = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    published_ref = ProviderCredentialRefV1.model_validate(
+        published["providers"][0]["credential_ref"]
+    )
+    assert published_ref != old_ref
+    assert store.require(old_ref, expected_kind="model_provider") == "old-static-secret"
+    assert store.require(published_ref, expected_kind="model_provider") == secret
+    journal = json.loads(
+        (executor.settings.state_dir / "providers.json").read_text(encoding="utf-8")
+    )
+    assert journal["pending_delete"] == [old_ref.model_dump(mode="json")]
+    assert journal["staging_refs"] == [published_ref.model_dump(mode="json")]
+    assert secret not in caplog.text
+    assert secret[:4] not in caplog.text
+    assert secret[-4:] not in caplog.text
+    with pytest.raises(ProviderManagerError, match="restart"):
+        executor.provider_manager.begin_static_credential_transition(
+            old_ref=old_ref,
+            new_secret="must-not-be-written",
+        )
+
+    before_blocked_retry = config_path.read_bytes()
+    router_remove_calls = executor.router.remove_provider.call_count
+    blocked_arguments = {"action": "delete", "name": "static-provider"}
+    blocked_run_id = "static-provider-blocked-until-restart"
+    token = set_runtime_context(
+        _network_runtime_context(
+            executor,
+            tool_name="control_provider_mutate",
+            arguments=blocked_arguments,
+            run_id=blocked_run_id,
+        )
+    )
+    try:
+        _message, blocked_result = await executor._execute_tool_call(
+            {
+                "id": "static-provider-blocked-until-restart-call",
+                "function": {
+                    "name": "control_provider_mutate",
+                    "arguments": json.dumps(blocked_arguments),
+                },
+            },
+            session_id="admin-control-plane",
+            run_id=blocked_run_id,
+            user_input="Delete the provider before restarting",
+            allowed_tools={"control_provider_mutate"},
+            owner_key_hash="admin-owner",
+        )
+    finally:
+        reset_runtime_context(token)
+
+    assert blocked_result.success is False
+    assert blocked_result.error == "Provider state requires restart before further changes"
+    assert config_path.read_bytes() == before_blocked_retry
+    assert save_calls == 2
+    assert executor.router.remove_provider.call_count == router_remove_calls
+
+    restarted = ProviderManager(
+        executor.settings.state_dir,
+        store,
+        product_id="js-agent",
+        protected_refs=[published_ref],
+    )
+    assert restarted.get_all() == []
+    assert store.get(old_ref, expected_kind="model_provider") is None
+    assert store.require(published_ref, expected_kind="model_provider") == secret
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["upsert", "delete"])
+async def test_provider_mutation_error_logs_never_include_sdk_secret(
+    action: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executor = _ControlExecutor(tmp_path)
+    secret = "ZXCV-sdk-exception-payload-QWER"
+    test_logger = logging.getLogger(f"test.b1a.provider-{action}")
+    executor.logger = test_logger
+    target = ModelProviderConfig(
+        name="secret-log-provider",
+        base_url="https://secret-log.example/v1",
+        api_key=secret,
+        default_model="model-a",
+        models=[
+            ModelConfig(
+                id="model-a",
+                name="Model A",
+                provider="secret-log-provider",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "js.models.providers.OpenAICompatibleProvider",
+        lambda _config: object(),
+    )
+    if action == "upsert":
+        executor.provider_manager.add.side_effect = RuntimeError(
+            f"SDK rejected credential {secret}"
+        )
+        key_ref = executor.stage_provider_discovery_key(
+            secret,
+            owner_key_hash="admin-owner",
+            product_id="js-agent",
+            session_id="admin-control-plane",
+        )
+        arguments: dict[str, Any] = {
+            "action": "upsert",
+            "provider": target.model_dump(
+                mode="json",
+                exclude={"api_key", "api_key_env", "credential_ref"},
+            ),
+            "api_key_ref": key_ref,
+        }
+    else:
+        executor.settings.providers = [target]
+        executor.provider_manager.get.return_value = target
+        executor.provider_manager.remove.side_effect = RuntimeError(
+            f"SDK delete rejected credential {secret}"
+        )
+        arguments = {"action": "delete", "name": target.name}
+    executor._register_control_plane_tools()
+    run_id = f"provider-{action}-safe-error-log"
+    token = set_runtime_context(
+        _network_runtime_context(
+            executor,
+            tool_name="control_provider_mutate",
+            arguments=arguments,
+            run_id=run_id,
+        )
+    )
+    with caplog.at_level(logging.ERROR, logger=test_logger.name):
+        try:
+            _message, result = await executor._execute_tool_call(
+                {
+                    "id": f"provider-{action}-safe-error-log-call",
+                    "function": {
+                        "name": "control_provider_mutate",
+                        "arguments": json.dumps(arguments),
+                    },
+                },
+                session_id="admin-control-plane",
+                run_id=run_id,
+                user_input=f"Exercise {action} failure logging",
+                allowed_tools={"control_provider_mutate"},
+                owner_key_hash="admin-owner",
+            )
+        finally:
+            reset_runtime_context(token)
+
+    assert result.success is False
+    assert "exception=RuntimeError" in caplog.text
+    assert secret not in caplog.text
+    assert secret[:4] not in caplog.text
+    assert secret[-4:] not in caplog.text
 
 
 @pytest.mark.asyncio

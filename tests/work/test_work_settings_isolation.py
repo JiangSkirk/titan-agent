@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import sys
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from js.config import JSSettings
+from js.config import JSSettings, ModelConfig, ModelProviderConfig
 from js.product_storage import (
     StorageOverlapError,
     StorageRoots,
@@ -246,6 +247,46 @@ def test_work_settings_use_independent_product_and_environment_namespace(
     assert settings.state_dir.is_relative_to(tmp_path / ".js-work")
 
 
+def test_work_provider_and_search_refs_cannot_be_injected_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    work_home = tmp_path / ".js-work"
+    monkeypatch.setenv(
+        "JS_WORK_PROVIDERS",
+        json.dumps(
+            [
+                {
+                    "name": "env-provider",
+                    "base_url": "https://provider.example/v1",
+                    "api_key": "environment-secret",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setenv(
+        "JS_WORK_SEARCH_CREDENTIAL_REF",
+        json.dumps(
+            {
+                "ref_id": "a" * 32,
+                "product_id": "js-work",
+                "kind": "search_provider",
+            }
+        ),
+    )
+    monkeypatch.setenv("JS_WORK_MAX_TURNS", "18")
+
+    settings = WorkSettings(
+        work_home=work_home,
+        workspace=work_home / "workspace",
+        state_dir=work_home / "state",
+    )
+
+    assert settings.providers == []
+    assert settings.search_credential_ref is None
+    assert settings.max_turns == 18
+
+
 def test_work_save_never_uses_main_agent_config_path(
     tmp_path: Path,
     monkeypatch,
@@ -261,6 +302,99 @@ def test_work_save_never_uses_main_agent_config_path(
 
     assert yaml.safe_load(main_config.read_text(encoding="utf-8")) == {"max_turns": 99}
     assert yaml.safe_load(work_config.read_text(encoding="utf-8"))["max_turns"] == 7
+
+
+def test_bound_work_config_save_ignores_later_work_environment_redirect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bound = tmp_path / "bound-work.yaml"
+    redirected = tmp_path / "redirected-work.yaml"
+    settings = load_work_settings(config_path=bound, home=tmp_path)
+    monkeypatch.setenv("JS_WORK_CONFIG_PATH", str(redirected))
+    settings.max_turns = 13
+
+    settings.save()
+
+    assert yaml.safe_load(bound.read_text(encoding="utf-8"))["max_turns"] == 13
+    assert not redirected.exists()
+
+
+@pytest.mark.parametrize("suffix", (".YAML", ".YML", ".TOML"))
+def test_work_loader_accepts_uppercase_supported_suffix(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    work_home = tmp_path / ".js-work"
+    config = tmp_path / f"work{suffix}"
+    payload = {
+        "work_home": str(work_home),
+        "workspace": str(work_home / "workspace"),
+        "state_dir": str(work_home / "state"),
+        "max_turns": 17,
+        "providers": [],
+    }
+    if suffix.lower() == ".toml":
+        import tomli_w
+
+        config.write_text(tomli_w.dumps(payload), encoding="utf-8")
+    else:
+        config.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    os.chmod(config, 0o600)
+
+    loaded = load_work_settings(config, home=tmp_path)
+
+    assert loaded.max_turns == 17
+
+
+def test_work_save_never_persists_provider_secret_or_env_authority(
+    tmp_path: Path,
+) -> None:
+    work_config = tmp_path / "work-agent.yaml"
+    settings = load_work_settings(config_path=work_config, home=tmp_path)
+    settings.providers = [
+        ModelProviderConfig(
+            name="remote",
+            base_url="https://provider.example/v1",
+            api_key="runtime-only-secret",
+            api_key_env="MUST_NOT_PERSIST",
+            models=[ModelConfig(id="model-a", provider="remote")],
+        )
+    ]
+
+    settings.save()
+
+    provider = yaml.safe_load(work_config.read_text(encoding="utf-8"))["providers"][0]
+    assert "api_key" not in provider
+    assert "api_key_env" not in provider
+
+
+def test_work_load_rejects_persisted_provider_secret_before_runtime_authority(
+    tmp_path: Path,
+) -> None:
+    work_home = tmp_path / ".js-work"
+    work_config = tmp_path / "work-agent.yaml"
+    work_config.write_text(
+        yaml.safe_dump(
+            {
+                "work_home": str(work_home),
+                "workspace": str(work_home / "workspace"),
+                "state_dir": str(work_home / "state"),
+                "providers": [
+                    {
+                        "name": "legacy",
+                        "base_url": "https://provider.example/v1",
+                        "api_key": "must-not-load",
+                        "models": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="migration is required"):
+        load_work_settings(work_config, home=tmp_path)
 
 
 def test_work_home_cannot_overlap_main_agent_home(tmp_path: Path) -> None:

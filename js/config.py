@@ -7,12 +7,36 @@ import ipaddress
 import os
 import re
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
+
+from js.provider_credential_types import ProviderCredentialRefV1
+
+_READ_ONLY_SETTINGS_VALIDATION: ContextVar[bool] = ContextVar(
+    "js_read_only_settings_validation",
+    default=False,
+)
+
+
+@contextmanager
+def settings_read_only_validation() -> Iterator[None]:
+    """Validate settings paths without creating or chmodding directories."""
+    token = _READ_ONLY_SETTINGS_VALIDATION.set(True)
+    try:
+        yield
+    finally:
+        _READ_ONLY_SETTINGS_VALIDATION.reset(token)
 
 
 class LogLevel(StrEnum):
@@ -30,13 +54,26 @@ class DefenseMode(StrEnum):
 
 
 class ModelProviderConfig(BaseModel):
-    """Configuration for a single model provider."""
+    """Configuration for a single model provider.
+
+    Credentials are stored exclusively in the Keychain via
+    ``ProviderCredentialRefV1``.  The ``api_key`` field is runtime-only
+    (never persisted to disk) and is hydrated from the Keychain at startup.
+    The ``api_key_env`` field is no longer resolved; it is retained only for
+    backward-compatible deserialization and migration.
+    """
 
     name: str = Field(description="Provider identifier")
     base_url: str = Field(description="API base URL")
-    api_key: str | None = Field(default=None, description="API key (prefer env var)", repr=False)
+    api_key: str | None = Field(default=None, description="API key (runtime-only, never persisted)", repr=False)
     api_key_env: str | None = Field(
-        default=None, description="Environment variable name for API key"
+        default=None,
+        description="Deprecated: environment variable name for API key (no longer resolved)",
+    )
+    credential_ref: ProviderCredentialRefV1 | None = Field(
+        default=None,
+        description="Keychain credential reference (ref_id, product_id, kind)",
+        repr=False,
     )
     timeout: float = Field(default=120.0, ge=1.0)
     max_retries: int = Field(default=3, ge=0)
@@ -70,8 +107,9 @@ class ModelProviderConfig(BaseModel):
 
     @model_validator(mode="after")
     def resolve_api_key(self) -> ModelProviderConfig:
-        if self.api_key_env and not self.api_key:
-            self.api_key = os.getenv(self.api_key_env, "")
+        # B1A: api_key_env is no longer resolved into api_key.
+        # Credentials must come from the Keychain via credential_ref.
+        # The api_key field is populated at runtime by hydrate_from_keychain().
         return self
 
 
@@ -452,6 +490,29 @@ _MACOS_TRUSTED_PRIVATE_ALIASES = {
 }
 
 
+class _CredentialFilteringSettingsSource(PydanticBaseSettingsSource):
+    """Remove credential-bearing fields from non-init settings sources."""
+
+    _BLOCKED_FIELDS = frozenset({"providers", "search_credential_ref"})
+
+    def __init__(self, wrapped: PydanticBaseSettingsSource) -> None:
+        super().__init__(wrapped.settings_cls)
+        self._wrapped = wrapped
+
+    def get_field_value(
+        self,
+        field: Any,
+        field_name: str,
+    ) -> tuple[Any, str, bool]:
+        return self._wrapped.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = dict(self._wrapped())
+        for field_name in self._BLOCKED_FIELDS:
+            values.pop(field_name, None)
+        return values
+
+
 def _absolute_without_resolving(path: Path) -> Path:
     """Return an absolute lexical path without following user-controlled links.
 
@@ -528,6 +589,44 @@ def _ensure_private_directory(path: Path, *, label: str) -> None:
         os.close(current_fd)
 
 
+def _preflight_private_directory(path: Path, *, label: str) -> None:
+    """Descriptor-walk existing components without changing the filesystem."""
+    absolute = _absolute_without_resolving(path)
+    if absolute == Path(absolute.anchor):
+        raise ValueError(f"{label} must be a private directory below the filesystem root")
+
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", 0)
+    if not directory_flag or not no_follow_flag:
+        raise RuntimeError("private directory validation requires O_DIRECTORY and O_NOFOLLOW")
+
+    current_fd = os.open(absolute.anchor, os.O_RDONLY | directory_flag)
+    try:
+        for index, component in enumerate(absolute.parts[1:], start=1):
+            try:
+                child_fd = os.open(
+                    component,
+                    os.O_RDONLY | directory_flag | no_follow_flag,
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ValueError(
+                        f"{label} must be a private directory, not a symlink or non-directory"
+                    ) from exc
+                raise
+            os.close(current_fd)
+            current_fd = child_fd
+            if index == len(absolute.parts) - 1:
+                metadata = os.fstat(current_fd)
+                if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+                    raise ValueError(f"{label} must be owned by the user with mode 0700")
+    finally:
+        os.close(current_fd)
+
+
 def _personal_storage_roots(*paths: Path) -> tuple[Path, ...]:
     """Return lexical ``.js`` ancestors that are managed Personal roots."""
     roots: set[Path] = set()
@@ -558,6 +657,29 @@ class JSSettings(BaseSettings):
         extra="ignore",
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Keep Provider credentials out of env, dotenv, and secret-dir sources.
+
+        Config-file loading remains an explicit init source so persisted opaque
+        references continue to work. Ordinary non-secret environment fields
+        retain their existing behavior.
+        """
+        del cls, settings_cls
+        return (
+            init_settings,
+            _CredentialFilteringSettingsSource(env_settings),
+            _CredentialFilteringSettingsSource(dotenv_settings),
+            _CredentialFilteringSettingsSource(file_secret_settings),
+        )
+
     # Core
     version: str = "0.1.5"
     workspace: Path = Field(default_factory=lambda: Path.home() / ".js" / "workspace")
@@ -582,6 +704,11 @@ class JSSettings(BaseSettings):
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
     features: AgentFeatureConfig = Field(default_factory=AgentFeatureConfig)
     search_configured: bool = False
+    search_credential_ref: ProviderCredentialRefV1 | None = Field(
+        default=None,
+        repr=False,
+        description="Keychain reference for the optional search provider",
+    )
     first_run_completed: bool = False
     # Server-authoritative first-run wizard state. ``first_run_completed`` remains
     # for backward compatibility and is kept in sync:
@@ -667,6 +794,12 @@ class JSSettings(BaseSettings):
 
     @model_validator(mode="after")
     def ensure_directories(self) -> JSSettings:
+        if _READ_ONLY_SETTINGS_VALIDATION.get():
+            for root in _personal_storage_roots(self.workspace, self.state_dir):
+                _preflight_private_directory(root, label="Personal storage root")
+            _preflight_private_directory(self.workspace, label="Personal workspace")
+            _preflight_private_directory(self.state_dir, label="Personal state directory")
+            return self
         for root in _personal_storage_roots(self.workspace, self.state_dir):
             _ensure_private_directory(root, label="Personal storage root")
         _ensure_private_directory(self.workspace, label="Personal workspace")
@@ -767,7 +900,7 @@ class JSSettings(BaseSettings):
             if not p.exists():
                 instance = cls()
                 config_path = p
-            elif p.suffix in (".yaml", ".yml"):
+            elif p.suffix.lower() in (".yaml", ".yml"):
                 # Check cache first
                 if p in _settings_file_cache:
                     mtime, cached = _settings_file_cache[p]
@@ -780,9 +913,10 @@ class JSSettings(BaseSettings):
 
                 with open(p) as f:
                     data = yaml.safe_load(f) or {}
+                cls._prepare_persisted_provider_credentials(data)
                 instance = cls(**data)
                 config_path = p
-            elif p.suffix == ".toml":
+            elif p.suffix.lower() == ".toml":
                 if p in _settings_file_cache:
                     mtime, cached = _settings_file_cache[p]
                     try:
@@ -794,6 +928,7 @@ class JSSettings(BaseSettings):
 
                 with open(p, "rb") as f:
                     data = tomllib.load(f)
+                cls._prepare_persisted_provider_credentials(data)
                 instance = cls(**data)
                 config_path = p
 
@@ -821,6 +956,28 @@ class JSSettings(BaseSettings):
                 pass
 
         return instance.with_runtime_engine_env()
+
+    @staticmethod
+    def _prepare_persisted_provider_credentials(data: Any) -> None:
+        """Reject plaintext keys and retire environment-backed authority.
+
+        A caller that supports legacy migration must migrate the file before
+        calling :meth:`from_file`.  Environment variable names contain no
+        secret, so they are removed in-memory and will disappear on the next
+        atomic save; they are never resolved.
+        """
+        if not isinstance(data, dict):
+            return
+        providers = data.get("providers", [])
+        if not isinstance(providers, list):
+            return
+        for item in providers:
+            if not isinstance(item, dict):
+                continue
+            if item.get("api_key") not in {None, ""}:
+                raise ValueError("provider credential migration is required")
+            item.pop("api_key", None)
+            item.pop("api_key_env", None)
 
     @property
     def config_source_path(self) -> Path:
@@ -923,8 +1080,8 @@ class JSSettings(BaseSettings):
 
         Resolution order for target path:
         1. Explicit *path* argument
-        2. JS_CONFIG_PATH environment variable
-        3. _config_path attribute (set by from_file)
+        2. _config_path attribute (set by from_file)
+        3. JS_CONFIG_PATH environment variable
         4. Default ~/.config/js/config.yaml
 
         If *fields* is provided, only those top-level fields are updated in
@@ -934,10 +1091,10 @@ class JSSettings(BaseSettings):
         """
         if path:
             target = Path(path)
+        elif hasattr(self, "_config_path") and self._config_path is not None:
+            target = Path(self._config_path)
         elif env_path := os.getenv("JS_CONFIG_PATH"):
             target = Path(env_path)
-        elif hasattr(self, "_config_path"):
-            target = Path(self._config_path)
         else:
             target = Path.home() / ".config" / "js" / "config.yaml"
 
@@ -945,14 +1102,22 @@ class JSSettings(BaseSettings):
 
         assert_personal_path_not_in_work_namespace(target)
 
-        # Build the new data dict
-        new_data = self.model_dump(mode="json", exclude={"providers": {"__all__": {"api_key"}}})
+        # B1A: persist credential_ref but never api_key or api_key_env.
+        # api_key is runtime-only; api_key_env is deprecated and must not be
+        # re-resolved on reload.  Both are stripped here for safety.
+        new_data = self.model_dump(
+            mode="json",
+            exclude={"providers": {"__all__": {"api_key", "api_key_env"}}},
+        )
 
-        # Defensive: strip any lingering api_key values from providers before writing
+        # Defensive: strip any lingering api_key/api_key_env values from providers
         for provider in new_data.get("providers", []):
             if isinstance(provider, dict):
                 provider.pop("api_key", None)
+                provider.pop("api_key_env", None)
 
+        from js.security.provider_credential_migration import provider_config_lease
         from js.utils.atomic_config import save_yaml_config
 
-        save_yaml_config(target, new_data, fields=fields)
+        with provider_config_lease(target):
+            save_yaml_config(target, new_data, fields=fields)

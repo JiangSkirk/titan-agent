@@ -1430,14 +1430,53 @@ class ToolExecutorMixin(AgentBase):
                 metadata={"status_code": status_code},
             )
 
+        def log_provider_mutation_failure(
+            level: Literal["error", "critical"],
+            code: str,
+            exc: BaseException,
+        ) -> None:
+            """Log only a closed event code and exception class, never traceback text."""
+            log_method = getattr(self.logger, level)
+            log_method(
+                "Provider mutation failed (code=%s, exception=%s)",
+                code,
+                type(exc).__name__,
+            )
+
+        def static_provider_names() -> frozenset[str]:
+            """Return the explicit startup authority for file-configured names."""
+            names = getattr(self, "_static_provider_names", None)
+            if names is None:
+                names = getattr(self.provider_manager, "reserved_names", ())
+            if names is None:
+                names = ()
+            return frozenset(name for name in names if isinstance(name, str))
+
+        def provider_mutation_guard_failure() -> ToolResult | None:
+            mutation_guard = getattr(
+                self.provider_manager,
+                "assert_mutations_allowed",
+                None,
+            )
+            if not callable(mutation_guard):
+                return None
+            try:
+                mutation_guard()
+            except Exception:  # noqa: BLE001 - fail closed at tool boundary
+                return failure(
+                    "Provider state requires restart before further changes",
+                    503,
+                )
+            return None
+
         def persist_static_provider_settings() -> None:
             """Persist only file-configured providers, never runtime dynamics."""
-            dynamic_names = {item.name for item in self.provider_manager.get_all()}
+            configured_static_names = static_provider_names()
             snapshot = self.settings.model_copy(deep=True)
             snapshot.providers = [
                 item.model_copy(deep=True)
                 for item in self.settings.providers
-                if item.name not in dynamic_names
+                if item.name in configured_static_names
             ]
             config_path = getattr(self.settings, "_config_path", None)
             snapshot.save(
@@ -1574,21 +1613,16 @@ class ToolExecutorMixin(AgentBase):
             }.intersection(provider):
                 return failure("Provider credentials must use an opaque reference", 400)
 
-            api_key: str | None = None
-            if api_key_ref:
-                api_key = self.take_provider_discovery_key(api_key_ref)
-                if api_key is None:
-                    return failure("Provider credential reference is invalid or expired", 401)
-
             from js.config import ModelProviderConfig
             from js.models.providers import OpenAICompatibleProvider
 
+            api_key: str | None = None
             async with provider_mutation_lock:
                 if action == "upsert":
                     if not provider:
                         return failure("provider is required", 400)
                     try:
-                        cfg = ModelProviderConfig(**provider, api_key=api_key)
+                        cfg = ModelProviderConfig(**provider, api_key=None)
                     except Exception:
                         return failure("Provider configuration is invalid", 400)
                     parsed = urlsplit(cfg.base_url)
@@ -1606,26 +1640,39 @@ class ToolExecutorMixin(AgentBase):
                     ):
                         return failure("Provider configuration is invalid", 400)
 
-                    static_names = {item.name for item in self.settings.providers}
-                    dynamic_names = {item.name for item in self.provider_manager.get_all()}
-                    if cfg.name in static_names - dynamic_names:
+                    configured_static_names = static_provider_names()
+                    if cfg.name in configured_static_names:
                         return failure("Provider name conflicts with static config", 409)
+                    blocked = provider_mutation_guard_failure()
+                    if blocked is not None:
+                        return blocked
+                    if api_key_ref:
+                        api_key = self.take_provider_discovery_key(api_key_ref)
+                        if api_key is None:
+                            return failure(
+                                "Provider credential reference is invalid or expired",
+                                401,
+                            )
+                        cfg.api_key = api_key
 
                     previous_settings = list(self.settings.providers)
                     previous_dynamic = self.provider_manager.get(cfg.name)
                     try:
                         self.provider_manager.add(cfg)
+                        canonical = self.provider_manager.get(cfg.name)
+                        if canonical is None:
+                            raise RuntimeError("provider publication was not observable")
                         self.settings.providers = [
                             item for item in self.settings.providers if item.name != cfg.name
                         ]
-                        self.settings.providers.append(cfg)
+                        self.settings.providers.append(canonical)
                         self.router.add_provider(
-                            cfg.name,
-                            OpenAICompatibleProvider(cfg),
-                            list(cfg.models),
+                            canonical.name,
+                            OpenAICompatibleProvider(canonical),
+                            list(canonical.models),
                         )
-                    except Exception:  # noqa: BLE001 - rollback at the effect boundary
-                        self.logger.error("Provider upsert failed", exc_info=True)
+                    except Exception as exc:  # noqa: BLE001 - effect boundary
+                        log_provider_mutation_failure("error", "upsert", exc)
                         self.settings.providers = previous_settings
                         try:
                             self.router.remove_provider(cfg.name)
@@ -1638,8 +1685,12 @@ class ToolExecutorMixin(AgentBase):
                                     OpenAICompatibleProvider(previous_dynamic),
                                     list(previous_dynamic.models),
                                 )
-                        except Exception:
-                            self.logger.error("Provider upsert rollback failed", exc_info=True)
+                        except Exception as rollback_exc:
+                            log_provider_mutation_failure(
+                                "critical",
+                                "upsert_rollback",
+                                rollback_exc,
+                            )
                         return failure("Provider could not be saved safely", 500)
 
                     payload = {
@@ -1655,60 +1706,106 @@ class ToolExecutorMixin(AgentBase):
                 normalized_name = name.strip()
                 if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", normalized_name):
                     return failure("Invalid provider name", 400)
-                target = next(
-                    (item for item in self.settings.providers if item.name == normalized_name),
-                    None,
-                )
+                configured_static_names = static_provider_names()
+                is_static = normalized_name in configured_static_names
+                dynamic_target = self.provider_manager.get(normalized_name)
+                if is_static and dynamic_target is not None:
+                    return failure("Provider name conflicts with static config", 409)
+                if is_static:
+                    target = next(
+                        (
+                            item
+                            for item in self.settings.providers
+                            if item.name == normalized_name
+                        ),
+                        None,
+                    )
+                else:
+                    target = dynamic_target
                 if target is None:
                     return failure("Provider not found", 404)
+                blocked = provider_mutation_guard_failure()
+                if blocked is not None:
+                    return blocked
+
+                api_key = None
+                if api_key_ref:
+                    api_key = self.take_provider_discovery_key(api_key_ref)
+                    if api_key is None:
+                        return failure(
+                            "Provider credential reference is invalid or expired",
+                            401,
+                        )
 
                 if action == "update_key":
                     previous_key = target.api_key
-                    previous_dynamic = self.provider_manager.get(normalized_name)
-                    from js.models.provider_manager import (
-                        static_provider_secret_key_name,
-                    )
-
-                    static_secret_name = static_provider_secret_key_name(normalized_name)
+                    previous_ref = target.credential_ref
+                    previous_dynamic = None if is_static else dynamic_target
+                    new_ref = None
+                    transition_started = False
                     try:
-                        target.api_key = api_key
-                        if previous_dynamic is None:
-                            if api_key:
-                                self.secrets.store(
-                                    static_secret_name,
-                                    api_key,
-                                    category="provider",
-                                )
-                            else:
-                                self.secrets.delete(static_secret_name)
-                        else:
+                        if previous_dynamic is not None:
                             self.provider_manager.update_api_key(
                                 normalized_name,
                                 api_key or "",
                             )
+                            canonical = self.provider_manager.get(normalized_name)
+                            if canonical is None:
+                                raise RuntimeError("provider update was not observable")
+                            target.api_key = canonical.api_key
+                            target.credential_ref = canonical.credential_ref
+                        else:
+                            transition_started = previous_ref is not None or bool(api_key)
+                            if transition_started:
+                                new_ref = (
+                                    self.provider_manager.begin_static_credential_transition(
+                                        old_ref=previous_ref,
+                                        new_secret=api_key,
+                                    )
+                                )
+                            target.api_key = api_key
+                            target.credential_ref = new_ref
+                            persist_static_provider_settings()
                         self.router.remove_provider(normalized_name)
                         self.router.add_provider(
                             normalized_name,
                             OpenAICompatibleProvider(target),
                             list(target.models),
                         )
-                    except Exception:  # noqa: BLE001 - rollback at the effect boundary
-                        self.logger.error("Provider key update failed", exc_info=True)
-                        target.api_key = previous_key
+                    except Exception as exc:  # noqa: BLE001 - effect boundary
+                        log_provider_mutation_failure("error", "update_key", exc)
+                        rollback_published = previous_dynamic is not None
+                        rollback_requires_restart = False
+                        if previous_dynamic is None:
+                            target.api_key = previous_key
+                            target.credential_ref = previous_ref
+                            try:
+                                persist_static_provider_settings()
+                                rollback_published = True
+                            except Exception as rollback_publish_exc:
+                                self.provider_manager.require_restart_before_mutation()
+                                rollback_requires_restart = True
+                                log_provider_mutation_failure(
+                                    "critical",
+                                    "update_key_config_rollback",
+                                    rollback_publish_exc,
+                                )
+                        if rollback_requires_restart:
+                            return failure(
+                                "Provider state requires restart before further changes",
+                                500,
+                            )
                         try:
-                            if previous_dynamic is None:
-                                if previous_key:
-                                    self.secrets.store(
-                                        static_secret_name,
-                                        previous_key,
-                                        category="provider",
-                                    )
-                                else:
-                                    self.secrets.delete(static_secret_name)
-                            else:
+                            if previous_dynamic is not None:
                                 self.provider_manager.update_api_key(
                                     normalized_name,
                                     previous_key or "",
+                                )
+                            elif rollback_published and transition_started:
+                                self.provider_manager.resolve_static_credential_transition(
+                                    old_ref=previous_ref,
+                                    new_ref=new_ref,
+                                    published_ref=previous_ref,
                                 )
                             self.router.remove_provider(normalized_name)
                             self.router.add_provider(
@@ -1716,12 +1813,33 @@ class ToolExecutorMixin(AgentBase):
                                 OpenAICompatibleProvider(target),
                                 list(target.models),
                             )
-                        except Exception:
-                            self.logger.critical(
-                                "Provider key rollback failed",
-                                exc_info=True,
+                        except Exception as rollback_exc:
+                            if previous_dynamic is None:
+                                self.provider_manager.require_restart_before_mutation()
+                            log_provider_mutation_failure(
+                                "critical",
+                                "update_key_rollback",
+                                rollback_exc,
                             )
                         return failure("Provider credential could not be updated safely", 500)
+                    if previous_dynamic is None and transition_started:
+                        try:
+                            self.provider_manager.resolve_static_credential_transition(
+                                old_ref=previous_ref,
+                                new_ref=new_ref,
+                                published_ref=new_ref,
+                            )
+                        except Exception as convergence_exc:
+                            self.provider_manager.require_restart_before_mutation()
+                            log_provider_mutation_failure(
+                                "error",
+                                "update_key_convergence",
+                                convergence_exc,
+                            )
+                            return failure(
+                                "Provider credential cleanup requires recovery",
+                                500,
+                            )
                     payload = {"provider": normalized_name}
                     return ToolResult(
                         success=True,
@@ -1730,46 +1848,76 @@ class ToolExecutorMixin(AgentBase):
                     )
 
                 previous_settings = list(self.settings.providers)
-                previous_dynamic = self.provider_manager.get(normalized_name)
-                from js.models.provider_manager import static_provider_secret_key_name
-
-                static_secret_name = static_provider_secret_key_name(normalized_name)
+                previous_dynamic = None if is_static else dynamic_target
+                previous_ref = target.credential_ref
+                transition_started = False
                 try:
-                    if previous_dynamic is None:
-                        self.secrets.delete(static_secret_name)
-                    else:
+                    if previous_dynamic is not None:
                         self.provider_manager.remove(normalized_name)
+                    elif previous_ref is not None:
+                        self.provider_manager.begin_static_credential_transition(
+                            old_ref=previous_ref,
+                            new_secret=None,
+                        )
+                        transition_started = True
                     self.settings.providers = [
                         item for item in self.settings.providers if item.name != normalized_name
                     ]
                     if previous_dynamic is None:
                         persist_static_provider_settings()
                     self.router.remove_provider(normalized_name)
-                except Exception:  # noqa: BLE001 - rollback at the effect boundary
-                    self.logger.error("Provider delete failed", exc_info=True)
+                except Exception as exc:  # noqa: BLE001 - effect boundary
+                    log_provider_mutation_failure("error", "delete", exc)
                     self.settings.providers = previous_settings
+                    rollback_published = previous_dynamic is not None
+                    rollback_requires_restart = False
                     try:
                         if previous_dynamic is None:
-                            if target.api_key:
-                                self.secrets.store(
-                                    static_secret_name,
-                                    target.api_key,
-                                    category="provider",
-                                )
                             persist_static_provider_settings()
+                            rollback_published = True
                         else:
                             self.provider_manager.add(previous_dynamic)
+                        if rollback_published and transition_started:
+                            self.provider_manager.resolve_static_credential_transition(
+                                old_ref=previous_ref,
+                                new_ref=None,
+                                published_ref=previous_ref,
+                            )
                         self.router.add_provider(
                             normalized_name,
                             OpenAICompatibleProvider(target),
                             list(target.models),
                         )
-                    except Exception:
-                        self.logger.critical(
-                            "Provider delete rollback failed",
-                            exc_info=True,
+                    except Exception as rollback_exc:
+                        if previous_dynamic is None:
+                            self.provider_manager.require_restart_before_mutation()
+                            rollback_requires_restart = True
+                        log_provider_mutation_failure(
+                            "critical",
+                            "delete_rollback",
+                            rollback_exc,
+                        )
+                    if rollback_requires_restart:
+                        return failure(
+                            "Provider state requires restart before further changes",
+                            500,
                         )
                     return failure("Provider could not be removed safely", 500)
+                if previous_dynamic is None and transition_started:
+                    try:
+                        self.provider_manager.resolve_static_credential_transition(
+                            old_ref=previous_ref,
+                            new_ref=None,
+                            published_ref=None,
+                        )
+                    except Exception as convergence_exc:
+                        self.provider_manager.require_restart_before_mutation()
+                        log_provider_mutation_failure(
+                            "error",
+                            "delete_convergence",
+                            convergence_exc,
+                        )
+                        return failure("Provider credential cleanup requires recovery", 500)
                 payload = {"provider": normalized_name}
                 return ToolResult(
                     success=True,

@@ -19,14 +19,16 @@ import plistlib
 import re
 import secrets
 import shutil
+import site
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unicodedata
 import zipfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
@@ -37,7 +39,9 @@ TARGET_TRIPLE = "aarch64-apple-darwin"
 SIDECAR_NAME = f"js-agent-host-{TARGET_TRIPLE}"
 PRODUCT_VERSION = "0.1.0"
 MANIFEST_SCHEMA = "JSAgentDesktopProvenanceV4"
-BUILD_ENVIRONMENT_SCHEMA = "JSAgentDesktopBuildEnvironmentV1"
+BUILD_ENVIRONMENT_SCHEMA = "JSAgentDesktopBuildEnvironmentV2"
+PYTHON_RUNTIME_SCHEMA = "JSAgentDesktopPythonRuntimeV1"
+PYTHON_RUNTIME_PROBE_SCHEMA = "JSAgentDesktopPythonRuntimeProbeV1"
 OWNER_MARKER_NAME = ".js-agent-build-owner"
 INVALID_RUN_MARKER_NAME = ".js-agent-build-invalid-manual-cleanup"
 _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -59,10 +63,20 @@ _FAT_MACH_O_MAGICS = {
 }
 _NON_EXECUTABLE_RESOURCE_SUFFIXES = frozenset({".class", ".jar", ".zip"})
 _PYTHON_BUILD_REQUIREMENTS = frozenset({"pyinstaller", "pyinstaller-hooks-contrib"})
+_DESKTOP_RUNTIME_PACKAGES = {
+    "pyobjc-core": "12.2.2",
+    "pyobjc-framework-cocoa": "12.2.2",
+    "pyobjc-framework-quartz": "12.2.2",
+    "pyobjc-framework-security": "12.2.2",
+    "tomli-w": "1.2.0",
+}
+_DESKTOP_RUNTIME_MODULES = ("Cocoa", "Quartz", "Security", "objc", "tomli_w")
+_PYTHON_AMBIENT_INJECTION_KEYS = ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE")
 _ARTIFACT_KEYS = frozenset(
     {"rust_main", "sidecar", "sidecar_standalone", "app_tree", "zip"}
 )
 _BUILD_INPUT_PATHS = {
+    "uv_lock": "uv.lock",
     "cargo_lock": "desktop/src-tauri/Cargo.lock",
     "pnpm_lock": "desktop/pnpm-lock.yaml",
     "python_build_reqs": "desktop/requirements-build.txt",
@@ -263,6 +277,51 @@ def _resolved_executable(path: Path, label: str) -> Path:
     if not os.access(resolved, os.X_OK):
         raise RuntimeError(f"{label} executable is not executable")
     return resolved
+
+
+def _python_runtime_launch_executable(
+    path: Path,
+) -> tuple[Path, Path, tuple[int, int, int, int]]:
+    """Validate a venv launcher while preserving its lexical path for Python."""
+    launch = _absolute_lexical(path)
+    if _has_symlink_component(launch.parent):
+        # A launcher below a linked parent cannot safely retain venv identity.
+        # Canonicalize it; the isolated-runtime probe will then reject it if
+        # doing so loses the virtual-environment prefix.
+        try:
+            launch = launch.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError("Python runtime executable is unavailable") from exc
+    try:
+        before = launch.lstat()
+        resolved = launch.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("Python runtime executable is unavailable") from exc
+    if not (stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)):
+        raise RuntimeError("Python runtime executable has an invalid file type")
+    _single_link_file_stat(resolved, "Python runtime executable target")
+    if not os.access(launch, os.X_OK):
+        raise RuntimeError("Python runtime executable is not executable")
+    identity = (before.st_dev, before.st_ino, before.st_ctime_ns, before.st_mtime_ns)
+    return launch, resolved, identity
+
+
+def _python_runtime_launcher_unchanged(
+    launch: Path,
+    resolved: Path,
+    identity: tuple[int, int, int, int],
+) -> bool:
+    try:
+        current = launch.lstat()
+        current_identity = (
+            current.st_dev,
+            current.st_ino,
+            current.st_ctime_ns,
+            current.st_mtime_ns,
+        )
+        return current_identity == identity and launch.resolve(strict=True) == resolved
+    except OSError:
+        return False
 
 
 def _owner_marker_digest(secret: bytes) -> bytes:
@@ -696,6 +755,7 @@ def controlled_build_environment(
         "TMPDIR": str(temporary),
         "XDG_CACHE_HOME": str(cache),
         "PYINSTALLER_CONFIG_DIR": str(pyinstaller_cache),
+        "PYTHONNOUSERSITE": "1",
         "PIP_NO_INDEX": "1",
         "UV_OFFLINE": "1",
         "CARGO_HOME": str(inputs.cargo_home),
@@ -781,6 +841,164 @@ def verify_python_build_requirements(
             )
 
 
+def _locked_desktop_runtime_versions(lock_path: Path) -> dict[str, str]:
+    try:
+        document = tomllib.loads(
+            _read_single_link_file(lock_path, "uv.lock").decode("utf-8")
+        )
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError("Python runtime uv.lock is invalid") from exc
+    packages = document.get("package") if isinstance(document, dict) else None
+    if not isinstance(packages, list):
+        raise RuntimeError("Python runtime uv.lock package closure is missing")
+    found: dict[str, set[str]] = {name: set() for name in _DESKTOP_RUNTIME_PACKAGES}
+    for package in packages:
+        if not isinstance(package, dict):
+            raise RuntimeError("Python runtime uv.lock package entry is invalid")
+        raw_name = package.get("name")
+        raw_version = package.get("version")
+        if not isinstance(raw_name, str) or not isinstance(raw_version, str):
+            raise RuntimeError("Python runtime uv.lock package entry is invalid")
+        name = raw_name.lower().replace("_", "-")
+        if name in found:
+            found[name].add(raw_version)
+    for name, expected in _DESKTOP_RUNTIME_PACKAGES.items():
+        if found[name] != {expected}:
+            raise RuntimeError(
+                f"Python runtime uv.lock mismatch: {name} must resolve to {expected}"
+            )
+    return dict(_DESKTOP_RUNTIME_PACKAGES)
+
+
+_PYTHON_RUNTIME_PROBE = """
+import importlib.metadata
+import importlib.util
+import json
+import os
+import site
+import sys
+
+packages = json.loads(sys.argv[1])
+modules = json.loads(sys.argv[2])
+versions = {}
+for name in packages:
+    try:
+        versions[name] = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        versions[name] = None
+print(json.dumps({
+    "schema": "JSAgentDesktopPythonRuntimeProbeV1",
+    "executable": os.path.realpath(sys.executable),
+    "prefix": os.path.realpath(sys.prefix),
+    "base_prefix": os.path.realpath(sys.base_prefix),
+    "user_site_enabled": site.ENABLE_USER_SITE,
+    "packages": versions,
+    "modules": {name: importlib.util.find_spec(name) is not None for name in modules},
+}, sort_keys=True))
+""".strip()
+
+
+def verify_desktop_python_runtime(
+    lock_path: Path,
+    *,
+    python_executable: Path | None = None,
+    runner: Runner = _run,
+    ambient_environment: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Verify the isolated, lock-matched Python used to freeze the sidecar."""
+    ambient = os.environ if ambient_environment is None else ambient_environment
+    injected = [key for key in _PYTHON_AMBIENT_INJECTION_KEYS if ambient.get(key)]
+    if injected:
+        raise RuntimeError("Python runtime ambient injection is forbidden")
+    if python_executable is None and (
+        Path(sys.prefix).resolve() == Path(sys.base_prefix).resolve()
+        or site.ENABLE_USER_SITE is not False
+    ):
+        raise RuntimeError("Python runtime build process is not isolated")
+    expected_packages = _locked_desktop_runtime_versions(lock_path)
+    requested_python = Path(sys.executable) if python_executable is None else python_executable
+    launch_python, resolved_python, launcher_identity = (
+        _python_runtime_launch_executable(requested_python)
+    )
+    probe_environment = {
+        "PATH": os.pathsep.join((str(launch_python.parent), "/usr/bin", "/bin")),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PIP_NO_INDEX": "1",
+        "UV_OFFLINE": "1",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+    }
+    code, stdout, _stderr = runner(
+        [
+            str(launch_python),
+            "-I",
+            "-s",
+            "-c",
+            _PYTHON_RUNTIME_PROBE,
+            json.dumps(list(expected_packages), separators=(",", ":")),
+            json.dumps(list(_DESKTOP_RUNTIME_MODULES), separators=(",", ":")),
+        ],
+        cwd=_safe_directory(lock_path.parent, "Python runtime lock root"),
+        env=probe_environment,
+        timeout=30,
+    )
+    if not _python_runtime_launcher_unchanged(
+        launch_python, resolved_python, launcher_identity
+    ):
+        raise RuntimeError("Python runtime executable changed during isolated probe")
+    if code != 0 or len(stdout.encode("utf-8")) > 65536:
+        raise RuntimeError("Python runtime isolated probe failed")
+    try:
+        probe = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Python runtime isolated probe returned invalid data") from exc
+    expected_probe_keys = {
+        "schema",
+        "executable",
+        "prefix",
+        "base_prefix",
+        "user_site_enabled",
+        "packages",
+        "modules",
+    }
+    if not isinstance(probe, dict) or set(probe) != expected_probe_keys:
+        raise RuntimeError("Python runtime isolated probe schema is not closed")
+    if (
+        probe.get("schema") != PYTHON_RUNTIME_PROBE_SCHEMA
+        or probe.get("executable") != str(resolved_python)
+        or not isinstance(probe.get("prefix"), str)
+        or not Path(probe["prefix"]).is_absolute()
+        or not isinstance(probe.get("base_prefix"), str)
+        or not Path(probe["base_prefix"]).is_absolute()
+        or probe["prefix"] == probe["base_prefix"]
+        or probe.get("user_site_enabled") is not False
+    ):
+        raise RuntimeError("Python runtime is not an isolated virtual environment")
+    packages = probe.get("packages")
+    if not isinstance(packages, dict) or set(packages) != set(expected_packages):
+        raise RuntimeError("Python runtime package closure is not exact")
+    for name, expected in expected_packages.items():
+        if packages.get(name) != expected:
+            raise RuntimeError(
+                f"Python runtime version mismatch: {name} expected {expected}"
+            )
+    modules = probe.get("modules")
+    if (
+        not isinstance(modules, dict)
+        or set(modules) != set(_DESKTOP_RUNTIME_MODULES)
+        or any(modules[name] is not True for name in _DESKTOP_RUNTIME_MODULES)
+    ):
+        raise RuntimeError("Python runtime required module is unavailable")
+    return {
+        "schema": PYTHON_RUNTIME_SCHEMA,
+        "uv_lock_sha256": _sha256_file(lock_path, "uv.lock"),
+        "packages": dict(expected_packages),
+        "modules": list(_DESKTOP_RUNTIME_MODULES),
+    }
+
+
 def install_desktop_dependencies(
     stage_root: Path,
     *,
@@ -847,9 +1065,13 @@ def build_sidecar(
     artifacts.mkdir(parents=True, exist_ok=True)
     work_dir = run.root / "stage/pyinstaller-work"
     spec_dir = run.root / "stage/pyinstaller-spec"
-    python = _resolved_executable(Path(sys.executable).resolve(strict=True), "Python")
+    python, resolved_python, launcher_identity = _python_runtime_launch_executable(
+        Path(sys.executable)
+    )
     command = [
         str(python),
+        "-I",
+        "-s",
         "-m",
         "PyInstaller",
         "--onefile",
@@ -879,6 +1101,18 @@ def build_sidecar(
         "js_work.web",
         "--hidden-import",
         "js.appshell.server",
+        # Provider credentials use dynamically imported PyObjC bridges.  They
+        # must be explicit so the frozen Host cannot silently omit Keychain.
+        "--hidden-import",
+        "objc",
+        "--hidden-import",
+        "Cocoa",
+        "--hidden-import",
+        "Quartz",
+        "--hidden-import",
+        "Security",
+        "--hidden-import",
+        "tomli_w",
         "--hidden-import",
         "uvicorn",
         # Work Office stack is imported via appshell → js_work.cli on cold start.
@@ -910,13 +1144,16 @@ def build_sidecar(
         "tiktoken",
         "--collect-submodules",
         "tiktoken_ext",
-        "-p",
+        "--paths",
         str(stage_root),
         str(stage_root / "desktop/sidecar/host.py"),
     ]
     env = controlled_build_environment(run, offline_inputs)
-    env["PYTHONPATH"] = str(stage_root)
     code, _stdout, stderr = runner(command, cwd=stage_root, env=env, timeout=900)
+    if not _python_runtime_launcher_unchanged(
+        python, resolved_python, launcher_identity
+    ):
+        raise RuntimeError("Python runtime executable changed during PyInstaller")
     if code != 0:
         raise RuntimeError(f"PyInstaller failed: {stderr}")
     binary = artifacts / SIDECAR_NAME
@@ -1562,6 +1799,8 @@ def _file_binding(path: Path, label: str) -> dict[str, str]:
 def build_environment_binding(
     run: BuildRun,
     offline_inputs: OfflineBuildInputs,
+    *,
+    repo_root: Path = REPO_ROOT,
 ) -> dict[str, object]:
     if not _run_is_owned(run):
         raise RuntimeError("build run owner marker is invalid")
@@ -1572,6 +1811,7 @@ def build_environment_binding(
             run.root / OWNER_MARKER_NAME, "build owner marker"
         ),
         "python": _file_binding(Path(sys.executable).resolve(strict=True), "Python"),
+        "python_runtime": verify_desktop_python_runtime(repo_root.resolve() / "uv.lock"),
         "pnpm": _file_binding(inputs.pnpm_executable, "pnpm"),
         "cargo": _file_binding(inputs.cargo_executable, "Cargo"),
         "node": _file_binding(inputs.node_executable, "Node"),
@@ -1650,7 +1890,9 @@ def generate_manifest(
         "build_number": validated_build_number,
         "artifacts": artifacts,
         "build_inputs": _collect_build_inputs(repo_root),
-        "build_environment": build_environment_binding(run, offline_inputs),
+        "build_environment": build_environment_binding(
+            run, offline_inputs, repo_root=repo_root
+        ),
     }
     manifest_path = run.root / "manifest.json"
     manifest_path.write_text(
@@ -1689,6 +1931,7 @@ def _verify_build_environment(output_root: Path, value: object) -> list[str]:
     expected_keys = {
         "schema",
         "run_owner_marker_sha256",
+        "python_runtime",
         *_ENVIRONMENT_FILE_KEYS,
         *_ENVIRONMENT_TREE_KEYS,
     }
@@ -1707,6 +1950,23 @@ def _verify_build_environment(output_root: Path, value: object) -> list[str]:
             errors.append("build owner marker digest mismatch")
     except RuntimeError as exc:
         errors.append(str(exc))
+
+    runtime = value.get("python_runtime")
+    expected_runtime_keys = {"schema", "uv_lock_sha256", "packages", "modules"}
+    if not isinstance(runtime, dict) or set(runtime) != expected_runtime_keys:
+        errors.append("Python runtime manifest binding is not closed")
+    else:
+        lock_digest = runtime.get("uv_lock_sha256")
+        packages = runtime.get("packages")
+        modules = runtime.get("modules")
+        if (
+            runtime.get("schema") != PYTHON_RUNTIME_SCHEMA
+            or not isinstance(lock_digest, str)
+            or _LOWER_SHA256.fullmatch(lock_digest) is None
+            or packages != _DESKTOP_RUNTIME_PACKAGES
+            or modules != list(_DESKTOP_RUNTIME_MODULES)
+        ):
+            errors.append("Python runtime manifest binding is invalid")
 
     for name in _ENVIRONMENT_FILE_KEYS:
         entry = value.get(name)
@@ -1781,7 +2041,9 @@ def verify_manifest(
         "build_environment",
     }:
         return ["manifest top-level schema is not closed"]
-    errors = _verify_build_environment(manifest_path.parent.resolve(), manifest["build_environment"])
+    errors = _verify_build_environment(
+        manifest_path.parent.resolve(), manifest["build_environment"]
+    )
     source_digest = manifest.get("source_digest")
     build_number = manifest.get("build_number")
     try:
@@ -1834,6 +2096,20 @@ def verify_manifest(
                 errors.append(f"artifact digest mismatch: {name}")
         except RuntimeError as exc:
             errors.append(str(exc))
+
+    build_environment = manifest.get("build_environment")
+    runtime = (
+        build_environment.get("python_runtime")
+        if isinstance(build_environment, dict)
+        else None
+    )
+    if isinstance(runtime, dict) and isinstance(build_inputs, dict):
+        uv_lock = build_inputs.get("uv_lock")
+        if (
+            not isinstance(uv_lock, dict)
+            or runtime.get("uv_lock_sha256") != uv_lock.get("sha256")
+        ):
+            errors.append("Python runtime uv.lock binding mismatch")
 
     for name, expected_path in _BUILD_INPUT_PATHS.items():
         full_path = _contained_path(repo_root.resolve(), expected_path)
@@ -1911,6 +2187,7 @@ def build_desktop(
         stage_root = stage_release_sources(
             source_digest, run=run, repo_root=repo_root
         )
+        verify_desktop_python_runtime(stage_root / "uv.lock")
         verify_python_build_requirements(stage_root / "desktop/requirements-build.txt")
         install_desktop_dependencies(
             stage_root,
@@ -1918,7 +2195,9 @@ def build_desktop(
             offline_inputs=inputs,
             runner=runner,
         )
-        environment_before = build_environment_binding(run, inputs)
+        environment_before = build_environment_binding(
+            run, inputs, repo_root=repo_root
+        )
         build_inputs_before = _collect_build_inputs(repo_root)
         with _preserve_cargo_home_caches(inputs.cargo_home):
             sidecar_path = build_sidecar(
@@ -1954,7 +2233,10 @@ def build_desktop(
             raise RuntimeError("source digest drift during desktop build")
         if _collect_build_inputs(repo_root) != build_inputs_before:
             raise RuntimeError("build input drift during desktop build")
-        if build_environment_binding(run, inputs) != environment_before:
+        if (
+            build_environment_binding(run, inputs, repo_root=repo_root)
+            != environment_before
+        ):
             raise RuntimeError("offline tool or cache drift during desktop build")
         # Ad-hoc sign the .app for local testing (not a Developer ID signature).
         _adhoc_sign_app(app_path, runner=runner)

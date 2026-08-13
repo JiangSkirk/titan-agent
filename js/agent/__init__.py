@@ -58,12 +58,17 @@ from js.memory.embeddings import Embedder, HybridEmbedder, KeywordEmbedder, LLME
 from js.memory.scheduler import DreamScheduler
 from js.memory.store import MemoryStore
 from js.models.permit import ModelPermitIssuer
-from js.models.provider_manager import ProviderManager, hydrate_static_provider_api_keys
+from js.models.provider_manager import (
+    ProviderManager,
+    hydrate_provider_credentials,
+)
 from js.models.providers import ChatMessage, ChatResponse
 from js.models.router import ModelRouter
+from js.provider_credential_types import ProductId
 from js.security.approvals import ApprovalMode, ApprovalQueue
 from js.security.audit import AuditEventType, AuditLogger
 from js.security.guard import BehaviorGuard
+from js.security.provider_credentials import CredentialError
 from js.security.sandbox import SandboxExecutor
 from js.security.secrets import SecretManager
 from js.security.strategies import build_default_strategies
@@ -121,12 +126,32 @@ class JSAgent(
         settings = self.settings
         features = settings.features
 
-        # Core infrastructure
-        static_provider_secrets = SecretManager(settings.state_dir)
-        hydrate_static_provider_api_keys(
-            self.settings.providers,
-            static_provider_secrets,
+        # B1A: Provider credentials are stored in the Keychain.
+        # The credential store is injected by the caller (Desktop/AppShell
+        # uses required_macos_keychain_store; tests use fake_keychain_store).
+        credential_store = getattr(settings, "_credential_store", None)
+        raw_product_id = getattr(settings, "product_id", "js-agent")
+        if raw_product_id not in {"js-agent", "js-work"}:
+            raise ValueError("unsupported product credential scope")
+        product_id = cast("ProductId", raw_product_id)
+        static_provider_names = frozenset(
+            provider.name for provider in self.settings.providers
         )
+        self._static_provider_names = static_provider_names
+        if any(provider.api_key not in {None, ""} for provider in settings.providers):
+            raise CredentialError("provider_runtime_plaintext_rejected")
+        # SecretManager is always needed for secret detection/redaction
+        # (not for provider credential storage in B1A mode).
+        static_provider_secrets = SecretManager(settings.state_dir)
+        self.secrets = static_provider_secrets
+        if credential_store is not None:
+            hydrate_provider_credentials(
+                self.settings.providers,
+                credential_store,
+                product_id=product_id,
+            )
+        elif any(provider.credential_ref is not None for provider in settings.providers):
+            raise CredentialError("provider_credential_store_required")
         # Unforgeable model-call permit issuer owned by this Echo runtime.
         # The router receives it as a verifier at construction time; there is
         # no public way to rebind authorization callbacks afterwards.
@@ -135,15 +160,19 @@ class JSAgent(
         from js.echo.ledger.service import EchoSafetyService
 
         self.echo_safety_service = EchoSafetyService.from_settings(settings)
-        # Load dynamically-added providers (skip if same name exists in static config)
-        self.provider_manager = ProviderManager(settings.state_dir)
-        static_names = {p.name for p in self.settings.providers}
+        # Static names are reserved before any dynamic provider is loaded.
+        self.provider_manager = ProviderManager(
+            settings.state_dir,
+            credential_store,
+            product_id=product_id,
+            protected_refs=(
+                provider.credential_ref
+                for provider in self.settings.providers
+                if provider.credential_ref is not None
+            ),
+            reserved_names=static_provider_names,
+        )
         for dyn_cfg in self.provider_manager.get_all():
-            if dyn_cfg.name in static_names:
-                self.logger.warning(
-                    f"Dynamic provider '{dyn_cfg.name}' skipped: name conflicts with static config"
-                )
-                continue
             from js.models.providers import OpenAICompatibleProvider
 
             self.settings.providers.append(dyn_cfg)
@@ -154,7 +183,6 @@ class JSAgent(
             )
         self.guard = BehaviorGuard(settings.security, settings.workspace)
         self.audit = AuditLogger(settings.state_dir, settings.security.audit_retention_days)
-        self.secrets = static_provider_secrets
         self.memory = MemoryStore(settings.state_dir, settings.memory, self._setup_embedder())
         self._dream_scheduler = DreamScheduler(self)
         # Structured memory extraction (facts/people/plans → proposal queue).
@@ -943,9 +971,15 @@ class JSAgent(
         # Bing is more reliable in China-region networks (DDG often times out)
         manager.register(BingEngine(timeout=10.0), default=True)
         manager.register(DuckDuckGoEngine(timeout=8.0))
-        # Try to load Tavily key from secrets
-        tavily_key = self.secrets.retrieve("tavily_api_key")
-        if tavily_key:
+        search_ref = self.settings.search_credential_ref
+        if search_ref is not None:
+            credential_store = getattr(self.settings, "_credential_store", None)
+            if credential_store is None:
+                raise CredentialError("provider_credential_store_required")
+            tavily_key = credential_store.require(
+                search_ref,
+                expected_kind="search_provider",
+            )
             manager.register(TavilyEngine(tavily_key))
         return manager
 

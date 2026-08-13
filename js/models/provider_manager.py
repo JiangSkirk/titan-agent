@@ -9,40 +9,79 @@ import stat
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from js.config import ModelProviderConfig
-from js.security.secrets import SecretManager
+from js.provider_credential_types import ProductId, ProviderCredentialRefV1
+from js.security.provider_credentials import (
+    CredentialError,
+    ProviderCredentialStore,
+)
 from js.utils.log import get_logger
 
 logger = get_logger("js.models.provider_manager")
 
 
 def _secret_key_name(provider_name: str) -> str:
-    """Generate a SecretManager key name for a provider's API key."""
+    """Generate the legacy SecretManager key name for a provider's API key.
+
+    Used only during B1A migration; new credentials go through the Keychain.
+    """
     return f"provider_apikey_{provider_name}"
 
 
 def static_provider_secret_key_name(provider_name: str) -> str:
-    """Return the separate secret name used by file-configured providers."""
+    """Return the legacy secret name used by file-configured providers.
+
+    Used only during B1A migration.
+    """
     return f"static_provider_apikey_{provider_name}"
+
+
+def hydrate_provider_credentials(
+    providers: list[ModelProviderConfig],
+    credential_store: ProviderCredentialStore,
+    product_id: ProductId = "js-agent",
+) -> None:
+    """Restore API keys from the Keychain before router construction.
+
+    B1A: replaces the old ``hydrate_static_provider_api_keys`` which used
+    SecretManager.  Providers with a ``credential_ref`` are hydrated from
+    the Keychain; providers without a ref are left unchanged.
+    """
+    if credential_store.product_id != product_id:
+        raise CredentialError("credential_store_product_mismatch")
+    for provider in providers:
+        if provider.api_key:
+            raise CredentialError("plaintext_provider_credential_not_allowed")
+        if provider.credential_ref is None:
+            continue
+        try:
+            ref = ProviderCredentialRefV1.model_validate(provider.credential_ref)
+            secret = credential_store.require(ref, expected_kind="model_provider")
+        except CredentialError:
+            raise
+        except Exception:
+            raise CredentialError("credential_reference_invalid") from None
+        provider.api_key = secret
 
 
 def hydrate_static_provider_api_keys(
     providers: list[ModelProviderConfig],
-    secret_manager: SecretManager,
+    credential_store: ProviderCredentialStore | Any,
 ) -> None:
-    """Restore locally encrypted UI credentials before router construction."""
-    for provider in providers:
-        if provider.api_key:
-            continue
-        stored = secret_manager.retrieve(static_provider_secret_key_name(provider.name))
-        if stored:
-            provider.api_key = stored
+    """Compatibility name for the Keychain-only hydration path."""
+    if not isinstance(credential_store, ProviderCredentialStore):
+        raise CredentialError("provider_credential_store_required")
+    hydrate_provider_credentials(
+        providers,
+        credential_store,
+        product_id=credential_store.product_id,
+    )
 
 
 class ProviderManagerError(Exception):
@@ -50,12 +89,26 @@ class ProviderManagerError(Exception):
 
 
 class ProviderManager:
-    """Manages dynamically-added model providers persisted to disk."""
+    """Manages dynamically-added model providers persisted to disk.
+
+    B1A credentials are stored in the Keychain via
+    ``ProviderCredentialStore``.  Non-empty legacy stores are never interpreted
+    as credentialless providers; B5 must migrate them explicitly first.
+    """
 
     _MAX_PROVIDER_FILE_BYTES = 10 * 1024 * 1024
     _MAX_PROVIDERS = 1000
+    _STORE_SCHEMA = "ProviderStoreV2"
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(
+        self,
+        state_dir: Path,
+        credential_store: ProviderCredentialStore | None = None,
+        *,
+        product_id: ProductId = "js-agent",
+        protected_refs: Iterable[ProviderCredentialRefV1] = (),
+        reserved_names: Iterable[str] = (),
+    ) -> None:
         unresolved_state = Path(state_dir).expanduser()
         unresolved_state.mkdir(parents=True, exist_ok=True)
         self.state_dir = unresolved_state.resolve(strict=True)
@@ -63,15 +116,41 @@ class ProviderManager:
         self._path = self.state_dir / "providers.json"
         self._lock_path = self.state_dir / "providers.lock"
         self._thread_lock = threading.RLock()
+        self._credential_store = credential_store
+        self._product_id = product_id
+        self._mutations_require_restart = False
+        try:
+            resolved_reserved_names = frozenset(reserved_names)
+        except TypeError:
+            raise ProviderManagerError("Provider reserved names are invalid") from None
+        if any(
+            not isinstance(name, str) or not name
+            for name in resolved_reserved_names
+        ):
+            raise ProviderManagerError("Provider reserved names are invalid")
+        self._reserved_names = resolved_reserved_names
+        if credential_store is not None and credential_store.product_id != product_id:
+            raise ProviderManagerError("Provider credential store product mismatch")
+        self._protected_refs = {
+            self._validated_model_ref(ref) for ref in protected_refs
+        }
         self._load()
 
     def _load(self) -> None:
         try:
             with self._locked():
-                self._providers = self._read_unlocked()
-        except ProviderManagerError:
-            logger.error("Failed to load providers safely", exc_info=True)
-            self._providers = []
+                providers, pending_delete, staging_refs = self._read_document_unlocked()
+                self._reject_reserved_providers(providers)
+                self._recover_credential_intents_unlocked(
+                    providers,
+                    pending_delete,
+                    staging_refs,
+                )
+                for provider in providers:
+                    self._hydrate_single(provider)
+                self._providers = providers
+        except CredentialError as exc:
+            raise ProviderManagerError("Provider credential hydration failed") from exc
 
     def _save(self) -> None:
         snapshot = self.get_all()
@@ -128,20 +207,42 @@ class ProviderManager:
         fcntl: Any = importlib.import_module("fcntl")
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
-    def _read_unlocked(self) -> list[ModelProviderConfig]:
+    def _read_document_unlocked(
+        self,
+    ) -> tuple[
+        list[ModelProviderConfig],
+        list[ProviderCredentialRefV1],
+        list[ProviderCredentialRefV1],
+    ]:
         raw = self._read_provider_bytes_unlocked()
         if raw is None:
-            return []
+            return [], [], []
         try:
             data = json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("provider store schema is invalid")
+            allowed_keys = {
+                "schema",
+                "product_id",
+                "providers",
+                "pending_delete",
+                "staging_refs",
+            }
+            if set(data) - allowed_keys:
+                raise ValueError("provider store schema is invalid")
+            schema = data.get("schema")
             provider_data = data.get("providers")
+            if schema is None and isinstance(provider_data, list) and provider_data:
+                raise ProviderManagerError("Provider store migration is required")
+            if schema not in {None, self._STORE_SCHEMA}:
+                raise ValueError("provider store schema is invalid")
+            stored_product = data.get("product_id", self._product_id)
+            if stored_product != self._product_id:
+                raise ValueError("provider store product mismatch")
             if not isinstance(provider_data, list):
                 raise ValueError("provider store schema is invalid")
             if len(provider_data) > self._MAX_PROVIDERS:
                 raise ValueError("provider store exceeds the provider limit")
-            secret_manager = SecretManager(self.state_dir)
             loaded: list[ModelProviderConfig] = []
             seen: set[str] = set()
             for item in provider_data:
@@ -152,14 +253,61 @@ class ProviderManager:
                 if not isinstance(name, str) or not name or name in seen:
                     raise ValueError("provider name is invalid or duplicated")
                 seen.add(name)
+                # B1A: never deserialize api_key from disk; hydrate from Keychain
                 payload.pop("api_key", None)
-                payload["api_key"] = secret_manager.retrieve(_secret_key_name(name)) or ""
-                loaded.append(ModelProviderConfig(**payload))
-            return loaded
+                payload.pop("api_key_env", None)
+                config = ModelProviderConfig(**payload)
+                loaded.append(config)
+            pending_raw = data.get("pending_delete", [])
+            if not isinstance(pending_raw, list) or len(pending_raw) > self._MAX_PROVIDERS:
+                raise ValueError("provider pending-delete schema is invalid")
+            pending = [ProviderCredentialRefV1.model_validate(item) for item in pending_raw]
+            for ref in pending:
+                if ref.product_id != self._product_id or ref.kind != "model_provider":
+                    raise ValueError("provider pending-delete scope is invalid")
+            staging_raw = data.get("staging_refs", [])
+            if not isinstance(staging_raw, list) or len(staging_raw) > self._MAX_PROVIDERS:
+                raise ValueError("provider staging schema is invalid")
+            staging = [ProviderCredentialRefV1.model_validate(item) for item in staging_raw]
+            for ref in staging:
+                if ref.product_id != self._product_id or ref.kind != "model_provider":
+                    raise ValueError("provider staging scope is invalid")
+            if len(set(pending)) != len(pending) or len(set(staging)) != len(staging):
+                raise ValueError("provider credential intents are duplicated")
+            return loaded, pending, staging
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             self._quarantine_corrupt_unlocked()
             logger.error("Corrupt provider store quarantined", exc_info=True)
-            return []
+            return [], [], []
+
+    def _read_unlocked(self) -> list[ModelProviderConfig]:
+        providers, pending_delete, staging_refs = self._read_document_unlocked()
+        self._reject_reserved_providers(providers)
+        self._recover_credential_intents_unlocked(
+            providers,
+            pending_delete,
+            staging_refs,
+        )
+        for provider in providers:
+            self._hydrate_single(provider)
+        return providers
+
+    def _hydrate_single(self, config: ModelProviderConfig) -> None:
+        """Hydrate one exact product/model reference, failing closed."""
+        if config.credential_ref is None:
+            return
+        if self._credential_store is None:
+            raise CredentialError("provider_credential_store_required")
+        try:
+            ref = ProviderCredentialRefV1.model_validate(config.credential_ref)
+            config.api_key = self._credential_store.require(
+                ref,
+                expected_kind="model_provider",
+            )
+        except CredentialError:
+            raise
+        except Exception:
+            raise CredentialError("credential_reference_invalid") from None
 
     def _read_provider_bytes_unlocked(self) -> bytes | None:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -224,29 +372,29 @@ class ProviderManager:
         except OSError:
             logger.error("Could not quarantine corrupt provider store", exc_info=True)
 
-    def _sync_secrets_unlocked(
+    def _atomic_write_unlocked(
         self,
         providers: list[ModelProviderConfig],
-        names: set[str],
+        pending_delete: list[ProviderCredentialRefV1] | None = None,
+        staging_refs: list[ProviderCredentialRefV1] | None = None,
     ) -> None:
-        desired = {provider.name: provider.api_key for provider in providers}
-        secret_manager = SecretManager(self.state_dir)
-        for name in names:
-            value = desired.get(name)
-            if value:
-                secret_manager.store(
-                    _secret_key_name(name),
-                    value,
-                    category="provider",
-                )
-            else:
-                secret_manager.delete(_secret_key_name(name))
-
-    def _atomic_write_unlocked(self, providers: list[ModelProviderConfig]) -> None:
+        # B1A: persist credential_ref but never api_key or api_key_env
         data = {
+            "schema": self._STORE_SCHEMA,
+            "product_id": self._product_id,
             "providers": [
-                provider.model_dump(mode="json", exclude={"api_key"}) for provider in providers
-            ]
+                provider.model_dump(
+                    mode="json",
+                    exclude={"api_key", "api_key_env"},
+                )
+                for provider in providers
+            ],
+            "pending_delete": [
+                ref.model_dump(mode="json") for ref in (pending_delete or [])
+            ],
+            "staging_refs": [
+                ref.model_dump(mode="json") for ref in (staging_refs or [])
+            ],
         }
         payload = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8")
         temp_path: Path | None = None
@@ -283,6 +431,57 @@ class ProviderManager:
         finally:
             os.close(directory_fd)
 
+    def _validated_model_ref(
+        self,
+        value: ProviderCredentialRefV1 | dict[str, Any],
+    ) -> ProviderCredentialRefV1:
+        try:
+            ref = ProviderCredentialRefV1.model_validate(value)
+        except Exception:
+            raise ProviderManagerError("Provider credential reference is invalid") from None
+        if ref.product_id != self._product_id or ref.kind != "model_provider":
+            raise ProviderManagerError("Provider credential reference scope is invalid")
+        return ref
+
+    def _referenced_refs(
+        self,
+        providers: list[ModelProviderConfig],
+    ) -> set[ProviderCredentialRefV1]:
+        referenced = set(self._protected_refs)
+        for provider in providers:
+            if provider.credential_ref is not None:
+                referenced.add(self._validated_model_ref(provider.credential_ref))
+        return referenced
+
+    def _recover_credential_intents_unlocked(
+        self,
+        providers: list[ModelProviderConfig],
+        pending_delete: list[ProviderCredentialRefV1],
+        staging_refs: list[ProviderCredentialRefV1],
+    ) -> None:
+        """Converge crash intents without deleting any referenced credential."""
+        if not pending_delete and not staging_refs:
+            return
+        referenced = self._referenced_refs(providers)
+        if self._credential_store is None:
+            raise ProviderManagerError("Provider credential cleanup requires a store")
+        try:
+            for ref in set(staging_refs + pending_delete):
+                if ref in referenced:
+                    self._credential_store.require(
+                        ref,
+                        expected_kind="model_provider",
+                    )
+            for ref in staging_refs:
+                if ref not in referenced:
+                    self._credential_store.delete(ref, expected_kind="model_provider")
+            for ref in pending_delete:
+                if ref not in referenced:
+                    self._credential_store.delete(ref, expected_kind="model_provider")
+            self._atomic_write_unlocked(providers, [], [])
+        except (CredentialError, ProviderManagerError) as exc:
+            raise ProviderManagerError("Provider credential cleanup requires recovery") from exc
+
     def _transaction(
         self,
         mutation: Callable[
@@ -291,27 +490,89 @@ class ProviderManager:
         ],
     ) -> bool:
         with self._locked():
+            self._ensure_mutations_allowed()
             current = self._read_unlocked()
             working = [provider.model_copy(deep=True) for provider in current]
             updated, result = mutation(working)
             if len(updated) > self._MAX_PROVIDERS:
                 raise ProviderManagerError("Provider limit exceeded")
-            touched_names = {provider.name for provider in current} | {
-                provider.name for provider in updated
-            }
+            self._reject_reserved_providers(updated)
+            current_by_name = {provider.name: provider for provider in current}
+            updated_by_name = {provider.name: provider for provider in updated}
+            if len(updated_by_name) != len(updated):
+                raise ProviderManagerError("Provider names must be unique")
+            staged_values: list[tuple[ProviderCredentialRefV1, str]] = []
+            pending_delete: list[ProviderCredentialRefV1] = []
+            for provider in updated:
+                previous = current_by_name.get(provider.name)
+                previous_ref = self._model_ref(previous) if previous is not None else None
+                unchanged = (
+                    previous is not None
+                    and previous_ref is not None
+                    and provider.api_key == previous.api_key
+                    and provider.credential_ref == previous.credential_ref
+                )
+                if unchanged:
+                    continue
+                if provider.api_key:
+                    if self._credential_store is None:
+                        raise ProviderManagerError("Provider credential store is required")
+                    new_ref = self._credential_store.allocate_ref("model_provider")
+                    staged_values.append((new_ref, provider.api_key))
+                    provider.credential_ref = new_ref
+                else:
+                    provider.credential_ref = None
+                if previous_ref is not None:
+                    pending_delete.append(previous_ref)
+
+            for name, previous in current_by_name.items():
+                if name not in updated_by_name:
+                    previous_ref = self._model_ref(previous)
+                    if previous_ref is not None:
+                        pending_delete.append(previous_ref)
+
+            pending_delete = list(dict.fromkeys(pending_delete))
             try:
-                self._sync_secrets_unlocked(updated, touched_names)
-                self._atomic_write_unlocked(updated)
-            except Exception as exc:
-                try:
-                    self._sync_secrets_unlocked(current, touched_names)
-                except Exception:
-                    logger.critical("Provider secret rollback failed", exc_info=True)
-                if isinstance(exc, ProviderManagerError):
-                    raise
+                if staged_values:
+                    self._atomic_write_unlocked(
+                        current,
+                        [],
+                        [ref for ref, _secret in staged_values],
+                    )
+                    assert self._credential_store is not None
+                    for ref, secret in staged_values:
+                        self._credential_store.put_ref_verified(ref, secret)
+                self._atomic_write_unlocked(updated, pending_delete, [])
+            except (CredentialError, ProviderManagerError) as exc:
                 raise ProviderManagerError("Provider transaction failed") from exc
+            try:
+                self._delete_pending_unlocked(pending_delete)
+                self._atomic_write_unlocked(updated, [], [])
+            except Exception as exc:
+                raise ProviderManagerError(
+                    "Provider credential cleanup requires recovery"
+                ) from exc
             self._providers = [provider.model_copy(deep=True) for provider in updated]
             return result
+
+    def _model_ref(
+        self,
+        provider: ModelProviderConfig | None,
+    ) -> ProviderCredentialRefV1 | None:
+        if provider is None or provider.credential_ref is None:
+            return None
+        return self._validated_model_ref(provider.credential_ref)
+
+    def _delete_pending_unlocked(
+        self,
+        refs: list[ProviderCredentialRefV1],
+    ) -> None:
+        if not refs:
+            return
+        if self._credential_store is None:
+            raise ProviderManagerError("Provider credential store is required")
+        for ref in refs:
+            self._credential_store.delete(ref, expected_kind="model_provider")
 
     def get_all(self) -> list[ModelProviderConfig]:
         with self._thread_lock:
@@ -324,10 +585,24 @@ class ProviderManager:
                     return provider.model_copy(deep=True)
         return None
 
+    @property
+    def reserved_names(self) -> frozenset[str]:
+        """Names owned by static config and unavailable to dynamic providers."""
+        return self._reserved_names
+
+    def _reject_reserved_providers(
+        self,
+        providers: Iterable[ModelProviderConfig],
+    ) -> None:
+        if any(provider.name in self._reserved_names for provider in providers):
+            raise ProviderManagerError("Dynamic provider name is reserved")
+
     def add(self, config: ModelProviderConfig) -> None:
         if not isinstance(config, ModelProviderConfig):
             raise TypeError("config must be a ModelProviderConfig")
         candidate = config.model_copy(deep=True)
+        if candidate.name in self._reserved_names:
+            raise ProviderManagerError("Dynamic provider name is reserved")
 
         def add_provider(
             current: list[ModelProviderConfig],
@@ -360,6 +635,177 @@ class ProviderManager:
             return current, False
 
         return self._transaction(update_provider)
+
+    def _ensure_mutations_allowed(self) -> None:
+        if self._mutations_require_restart:
+            raise ProviderManagerError("Provider mutations require restart")
+
+    def assert_mutations_allowed(self) -> None:
+        """Public fail-closed guard for mutations with external side effects."""
+        with self._thread_lock:
+            self._ensure_mutations_allowed()
+
+    def require_restart_before_mutation(self) -> None:
+        """Fail closed after an external-config publication becomes ambiguous."""
+        with self._thread_lock:
+            self._mutations_require_restart = True
+
+    def begin_static_credential_transition(
+        self,
+        *,
+        old_ref: ProviderCredentialRefV1 | None,
+        new_secret: str | None,
+    ) -> ProviderCredentialRefV1 | None:
+        """Journal one external static-config transition under the store lock.
+
+        Both sides of a rotation are recorded before the new Keychain item is
+        written.  A restart can therefore use the external config's protected
+        reference as the sole authority and converge without guessing.
+        """
+        if self._credential_store is None:
+            raise ProviderManagerError("Provider credential store is required")
+        resolved_old = self._validated_model_ref(old_ref) if old_ref is not None else None
+        resolved_secret = new_secret if new_secret else None
+        if resolved_old is None and resolved_secret is None:
+            raise ProviderManagerError("Static credential transition is empty")
+        with self._locked():
+            self._ensure_mutations_allowed()
+            providers, pending, staging = self._read_document_unlocked()
+            if pending or staging:
+                self._mutations_require_restart = True
+                raise ProviderManagerError("Provider mutations require restart")
+            if resolved_old is not None:
+                if resolved_old not in self._protected_refs:
+                    raise ProviderManagerError(
+                        "Static credential is not protected by external config"
+                    )
+                self._credential_store.require(
+                    resolved_old,
+                    expected_kind="model_provider",
+                )
+            new_ref = (
+                self._credential_store.allocate_ref("model_provider")
+                if resolved_secret is not None
+                else None
+            )
+            pending_refs = [resolved_old] if resolved_old is not None else []
+            staging_refs = [new_ref] if new_ref is not None else []
+            self._atomic_write_unlocked(providers, pending_refs, staging_refs)
+            if new_ref is not None:
+                assert resolved_secret is not None
+                try:
+                    self._credential_store.put_ref_verified(new_ref, resolved_secret)
+                except CredentialError as exc:
+                    raise ProviderManagerError(
+                        "Provider credential staging failed"
+                    ) from exc
+            return new_ref
+
+    def resolve_static_credential_transition(
+        self,
+        *,
+        old_ref: ProviderCredentialRefV1 | None,
+        new_ref: ProviderCredentialRefV1 | None,
+        published_ref: ProviderCredentialRefV1 | None,
+    ) -> None:
+        """Converge an exact transition to the external config's published ref."""
+        resolved_old = self._validated_model_ref(old_ref) if old_ref is not None else None
+        resolved_new = self._validated_model_ref(new_ref) if new_ref is not None else None
+        resolved_published = (
+            self._validated_model_ref(published_ref)
+            if published_ref is not None
+            else None
+        )
+        expected_pending = {resolved_old} if resolved_old is not None else set()
+        expected_staging = {resolved_new} if resolved_new is not None else set()
+        if not expected_pending and not expected_staging:
+            raise ProviderManagerError("Static credential transition is empty")
+        if resolved_published not in {None, resolved_old, resolved_new}:
+            raise ProviderManagerError("Published credential is outside the transition")
+        with self._locked():
+            self._ensure_mutations_allowed()
+            providers, pending, staging = self._read_document_unlocked()
+            if set(pending) != expected_pending or len(pending) != len(expected_pending):
+                raise ProviderManagerError(
+                    "Provider credential retirement intent does not match"
+                )
+            if set(staging) != expected_staging or len(staging) != len(expected_staging):
+                raise ProviderManagerError("Provider credential staging intent does not match")
+            if self._credential_store is None:
+                raise ProviderManagerError("Provider credential store is required")
+            if resolved_published is not None:
+                self._credential_store.require(
+                    resolved_published,
+                    expected_kind="model_provider",
+                )
+            if resolved_old is not None:
+                self._protected_refs.discard(resolved_old)
+            if resolved_new is not None:
+                self._protected_refs.discard(resolved_new)
+            if resolved_published is not None:
+                self._protected_refs.add(resolved_published)
+            self._recover_credential_intents_unlocked(providers, pending, staging)
+
+    def stage_credential(self, api_key: str) -> ProviderCredentialRefV1:
+        """Journal and create a credential for an external atomic publish."""
+        ref = self.begin_static_credential_transition(
+            old_ref=None,
+            new_secret=api_key,
+        )
+        if ref is None:  # pragma: no cover - guarded by non-empty api_key validation
+            raise ProviderManagerError("Provider credential staging failed")
+        return ref
+
+    def commit_staged_credential(self, ref: ProviderCredentialRefV1) -> None:
+        """Mark a staged reference as protected by a published static config."""
+        self.resolve_static_credential_transition(
+            old_ref=None,
+            new_ref=ref,
+            published_ref=ref,
+        )
+
+    def discard_staged_credential(self, ref: ProviderCredentialRefV1) -> None:
+        """Delete an unpublished staging reference."""
+        if self._credential_store is None:
+            raise ProviderManagerError("Provider credential store is required")
+        resolved = self._validated_model_ref(ref)
+        with self._locked():
+            self._ensure_mutations_allowed()
+            providers, pending, staging = self._read_document_unlocked()
+            if pending or staging != [resolved]:
+                raise ProviderManagerError("Provider credential staging intent is missing")
+            if resolved in self._referenced_refs(providers):
+                raise ProviderManagerError("Provider credential staging ref is protected")
+            try:
+                self._credential_store.delete(resolved, expected_kind="model_provider")
+                self._atomic_write_unlocked(providers, [], [])
+            except CredentialError as exc:
+                raise ProviderManagerError("Provider credential staging cleanup failed") from exc
+
+    def prepare_retire_credential(self, ref: ProviderCredentialRefV1) -> None:
+        """Journal retirement before an external config removes its reference."""
+        self.begin_static_credential_transition(old_ref=ref, new_secret=None)
+
+    def cancel_retire_credential(self, ref: ProviderCredentialRefV1) -> None:
+        """Cancel retirement after an external publication rollback."""
+        self.resolve_static_credential_transition(
+            old_ref=ref,
+            new_ref=None,
+            published_ref=ref,
+        )
+
+    def finalize_retire_credential(self, ref: ProviderCredentialRefV1) -> None:
+        """Delete a journaled ref after the external config publication."""
+        self.resolve_static_credential_transition(
+            old_ref=ref,
+            new_ref=None,
+            published_ref=None,
+        )
+
+    def retire_credential(self, ref: ProviderCredentialRefV1) -> None:
+        """Compatibility wrapper for callers without a two-phase publication."""
+        self.prepare_retire_credential(ref)
+        self.finalize_retire_credential(ref)
 
     @staticmethod
     async def discover_models(

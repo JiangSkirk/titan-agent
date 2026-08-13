@@ -11,12 +11,14 @@ from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 
 from js.config import (
+    _READ_ONLY_SETTINGS_VALIDATION,
     AgentFeatureConfig,
     JSSettings,
     PipelineConfig,
     SecurityConfig,
     _ensure_private_directory,
     _normalise_echo_engine,
+    _preflight_private_directory,
 )
 from js.product_storage import (
     StorageRoots,
@@ -147,6 +149,11 @@ class WorkSettings(JSSettings):
         never created on disk.
         """
         self._validate_work_isolation()
+        if _READ_ONLY_SETTINGS_VALIDATION.get():
+            _preflight_private_directory(self.work_home, label="Work storage root")
+            _preflight_private_directory(self.workspace, label="Work workspace")
+            _preflight_private_directory(self.state_dir, label="Work state directory")
+            return self
         _ensure_private_directory(self.work_home, label="Work storage root")
         _ensure_private_directory(self.workspace, label="Work workspace")
         _ensure_private_directory(self.state_dir, label="Work state directory")
@@ -183,16 +190,16 @@ class WorkSettings(JSSettings):
 
         Resolution order:
         1. Explicit *path* argument
-        2. ``JS_WORK_CONFIG_PATH`` environment variable
-        3. ``_config_path`` attribute (set by :func:`load_work_settings`)
+        2. ``_config_path`` attribute (set by :func:`load_work_settings`)
+        3. ``JS_WORK_CONFIG_PATH`` environment variable
         4. Default ``~/.config/js-work/config.yaml``
         """
         if path:
             target = Path(path)
-        elif env_path := os.getenv("JS_WORK_CONFIG_PATH"):
-            target = Path(env_path)
         elif hasattr(self, "_config_path") and self._config_path is not None:
             target = Path(self._config_path)
+        elif env_path := os.getenv("JS_WORK_CONFIG_PATH"):
+            target = Path(env_path)
         else:
             target = default_work_config_path()
 
@@ -207,15 +214,21 @@ class WorkSettings(JSSettings):
                 ),
             )
 
-        new_data = self.model_dump(mode="json", exclude={"providers": {"__all__": {"api_key"}}})
+        new_data = self.model_dump(
+            mode="json",
+            exclude={"providers": {"__all__": {"api_key", "api_key_env"}}},
+        )
 
         for provider in new_data.get("providers", []):
             if isinstance(provider, dict):
                 provider.pop("api_key", None)
+                provider.pop("api_key_env", None)
 
+        from js.security.provider_credential_migration import provider_config_lease
         from js.utils.atomic_config import save_yaml_config
 
-        save_yaml_config(target, new_data, fields=fields)
+        with provider_config_lease(target):
+            save_yaml_config(target, new_data, fields=fields)
 
 
 def load_work_settings(
@@ -255,14 +268,18 @@ def load_work_settings(
 
     if resolved_config.exists():
         data: dict[str, Any] = {}
-        if resolved_config.suffix in (".yaml", ".yml"):
+        if resolved_config.suffix.lower() in (".yaml", ".yml"):
             import yaml
 
             with open(resolved_config, encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
-        elif resolved_config.suffix == ".toml":
+        elif resolved_config.suffix.lower() == ".toml":
             with open(resolved_config, "rb") as f:
                 data = tomllib.load(f)
+        # Work must enforce the same persisted-provider boundary as Personal.
+        # A desktop caller that owns a Keychain authority migrates the file
+        # before entering this loader; all other callers fail closed here.
+        WorkSettings._prepare_persisted_provider_credentials(data)
         data.setdefault("work_home", work_home)
         data.setdefault("workspace", work_home / "workspace")
         data.setdefault("state_dir", work_home / "state")
