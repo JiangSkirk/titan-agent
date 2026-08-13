@@ -11,14 +11,778 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Iterator
+from array import array
+from collections import deque
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import quote, quote_plus
 
 from cryptography.fernet import Fernet, InvalidToken
 
 from js.utils.db import db_connection
+
+
+class ProviderSecretScrubError(RuntimeError):
+    """Closed, secret-free failure raised by exact Provider response scrubbing."""
+
+    def __init__(self) -> None:
+        # All valid secrets are at least eight UTF-8 bytes. A three-byte error
+        # marker cannot itself contain an arbitrary configured secret.
+        super().__init__("[S]")
+
+    def __repr__(self) -> str:
+        return "[S]"
+
+
+class _ExactByteMatcher:
+    """Bounded Aho-Corasick matcher for private exact-value byte patterns."""
+
+    def __init__(self, patterns: Iterable[bytes]) -> None:
+        self._next: list[dict[int, int]] = [{}]
+        self._failure: list[int] = [0]
+        self._outputs: list[list[int]] = [[]]
+        self._depth: list[int] = [0]
+        self._max_pattern_length = 0
+        for pattern in patterns:
+            self._max_pattern_length = max(self._max_pattern_length, len(pattern))
+            state = 0
+            for byte in pattern:
+                child = self._next[state].get(byte)
+                if child is None:
+                    child = len(self._next)
+                    self._next[state][byte] = child
+                    self._next.append({})
+                    self._failure.append(0)
+                    self._outputs.append([])
+                    self._depth.append(self._depth[state] + 1)
+                state = child
+            self._outputs[state].append(len(pattern))
+
+        pending: deque[int] = deque()
+        for child in self._next[0].values():
+            pending.append(child)
+        while pending:
+            state = pending.popleft()
+            for byte, child in self._next[state].items():
+                pending.append(child)
+                failure = self._failure[state]
+                while failure and byte not in self._next[failure]:
+                    failure = self._failure[failure]
+                self._failure[child] = self._next[failure].get(byte, 0)
+                inherited = self._outputs[self._failure[child]]
+                if inherited:
+                    self._outputs[child].extend(inherited)
+
+    def _advance(self, state: int, byte: int) -> int:
+        while state and byte not in self._next[state]:
+            state = self._failure[state]
+        return self._next[state].get(byte, 0)
+
+    def iter_intervals(
+        self,
+        scan: bytes,
+        *,
+        origin_starts: array[int] | None = None,
+        origin_ends: array[int] | None = None,
+    ) -> Iterator[tuple[int, int]]:
+        """Yield matched source spans without retaining Python interval objects."""
+        if (origin_starts is None) != (origin_ends is None):
+            raise ProviderSecretScrubError
+        if origin_starts is not None and (
+            len(origin_starts) != len(scan) or len(origin_ends or ()) != len(scan)
+        ):
+            raise ProviderSecretScrubError
+        state = 0
+        for index, byte in enumerate(scan):
+            state = self._advance(state, byte)
+            for length in self._outputs[state]:
+                canonical_start = index + 1 - length
+                if origin_starts is None:
+                    yield canonical_start, index + 1
+                else:
+                    assert origin_ends is not None
+                    yield origin_starts[canonical_start], origin_ends[index]
+
+    def replace(
+        self,
+        data: bytes,
+        marker: bytes,
+        *,
+        match_data: bytes | None = None,
+    ) -> tuple[bytes, bool]:
+        """Return leftmost-longest replacement with bounded interval state."""
+        scan = data if match_data is None else match_data
+        if len(scan) != len(data):
+            raise ProviderSecretScrubError
+        intervals: dict[int, int] = {}
+        output = bytearray()
+        cursor = 0
+        state = 0
+        matched_any = False
+        for index, byte in enumerate(scan):
+            state = self._advance(state, byte)
+            for length in self._outputs[state]:
+                start = index + 1 - length
+                if start >= cursor:
+                    intervals[start] = max(intervals.get(start, 0), index + 1)
+            safe_through = index + 1 - self._max_pattern_length
+            while cursor <= safe_through:
+                end = intervals.get(cursor)
+                if end is None:
+                    output.append(data[cursor])
+                    cursor += 1
+                    continue
+                output.extend(marker)
+                matched_any = True
+                cursor = end
+                intervals = {
+                    start: interval_end
+                    for start, interval_end in intervals.items()
+                    if start >= cursor
+                }
+        while cursor < len(data):
+            end = intervals.get(cursor)
+            if end is None:
+                output.append(data[cursor])
+                cursor += 1
+                continue
+            output.extend(marker)
+            matched_any = True
+            cursor = end
+        return bytes(output), matched_any
+
+    def contains(self, data: bytes) -> bool:
+        state = 0
+        for byte in data:
+            state = self._advance(state, byte)
+            if self._outputs[state]:
+                return True
+        return False
+
+    def has_longer_prefix(self, data: bytes) -> bool:
+        """Return whether ``data`` is an exact trie prefix with descendants."""
+        state = 0
+        for byte in data:
+            child = self._next[state].get(byte)
+            if child is None:
+                return False
+            state = child
+        return bool(self._next[state])
+
+    def pending_suffix_length(self, data: bytes) -> int:
+        state = 0
+        for byte in data:
+            state = self._advance(state, byte)
+        return self._depth[state]
+
+    def deferred_suffix_length(self, data: bytes) -> int:
+        """Return a suffix that can still grow into a longer exact match."""
+        state = 0
+        for byte in data:
+            state = self._advance(state, byte)
+        if state == 0 or not self._next[state]:
+            return 0
+        return self._depth[state]
+
+    def terminal_match_length(self, data: bytes) -> int:
+        """Return the longest complete pattern ending at the final byte."""
+        state = 0
+        for byte in data:
+            state = self._advance(state, byte)
+        return max(self._outputs[state], default=0)
+
+
+class ProviderSecretScrubber:
+    """Redact one attempt's exact Provider secret forms without persistence.
+
+    The object deliberately exposes neither its source secrets nor derived
+    patterns. It never calls :class:`SecretManager`, writes detection state, or
+    logs matching data.
+    """
+
+    marker = "[S]"
+    _MARKER_BYTES = marker.encode("ascii")
+    _MAX_SECRETS = 64
+    _MAX_FORMS_PER_SECRET = 12
+    _MIN_SECRET_BYTES = 8
+    _MAX_SECRET_BYTES = 512
+    _MAX_DEPTH = 16
+    _MAX_NODES = 4096
+    _MAX_STRING_BYTES = 1024 * 1024
+    _MAX_AGGREGATE_STRING_BYTES = 16 * 1024 * 1024
+    _MIN_MATCH_CANDIDATE_BUDGET = 4096
+    _MATCH_CANDIDATES_PER_INPUT_BYTE = 4
+
+    def __init__(self, secrets: Iterable[str]) -> None:
+        values = list(secrets)
+        if len(values) > self._MAX_SECRETS:
+            raise ProviderSecretScrubError
+        exact_patterns: dict[bytes, None] = {}
+        url_patterns: dict[bytes, None] = {}
+        quote_plus_patterns: dict[bytes, None] = {}
+        json_patterns: dict[bytes, None] = {}
+        max_source_span = 1
+        for secret in values:
+            if type(secret) is not str:
+                raise ProviderSecretScrubError
+            if not secret:
+                continue
+            try:
+                raw = secret.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ProviderSecretScrubError from None
+            if not self._MIN_SECRET_BYTES <= len(raw) <= self._MAX_SECRET_BYTES:
+                raise ProviderSecretScrubError
+            exact_forms, percent_forms, json_forms = self._derive_forms(secret, raw)
+            if len({*exact_forms, *percent_forms, *json_forms}) > (
+                self._MAX_FORMS_PER_SECRET
+            ):
+                raise ProviderSecretScrubError
+            for form in exact_forms:
+                encoded_form = form.encode("utf-8")
+                exact_patterns[encoded_form] = None
+                max_source_span = max(max_source_span, len(encoded_form))
+            for form in percent_forms:
+                encoded_form = form.encode("utf-8")
+                max_source_span = max(max_source_span, len(encoded_form))
+            # URL encodings may legally percent-encode even an otherwise
+            # unreserved byte.  Match a decoded source view instead of
+            # enumerating the exponential set of literal/escaped mixtures.
+            url_patterns[raw] = None
+            quote_plus_patterns[raw] = None
+            max_source_span = max(max_source_span, len(raw) * 3)
+            for form in json_forms:
+                encoded_form = form.encode("utf-8")
+                canonical, _, _ = self._canonicalize_json_view(encoded_form)
+                json_patterns[canonical] = None
+                max_source_span = max(
+                    max_source_span,
+                    len(encoded_form) + encoded_form.count(b"/"),
+                )
+        if any(
+            self._MARKER_BYTES in pattern
+            for pattern in (
+                *exact_patterns,
+                *url_patterns,
+                *quote_plus_patterns,
+                *json_patterns,
+            )
+        ):
+            # Arbitrary secrets that contain the fixed marker cannot be safely
+            # transformed causally: a future replacement could reconnect an
+            # already-published prefix and suffix into the secret. Reject the
+            # provider configuration before any response or network I/O.
+            raise ProviderSecretScrubError
+        self._has_patterns = bool(
+            exact_patterns or url_patterns or quote_plus_patterns or json_patterns
+        )
+        self._exact_matcher = _ExactByteMatcher(exact_patterns)
+        self._url_matcher = _ExactByteMatcher(url_patterns)
+        self._quote_plus_matcher = _ExactByteMatcher(quote_plus_patterns)
+        self._json_matcher = _ExactByteMatcher(json_patterns)
+        self._max_pattern_length = max(
+            self._exact_matcher._max_pattern_length,
+            self._url_matcher._max_pattern_length,
+            self._quote_plus_matcher._max_pattern_length,
+            self._json_matcher._max_pattern_length,
+        )
+        self._max_source_span = max_source_span
+
+    def __repr__(self) -> str:
+        return "<S>"
+
+    @staticmethod
+    def _percent_lower(value: str) -> str:
+        return re.sub(
+            r"%[0-9A-Fa-f]{2}",
+            lambda match: match.group(0).lower(),
+            value,
+        )
+
+    @staticmethod
+    def _canonicalize_percent_bytes(data: bytes) -> bytes:
+        """Canonicalize only valid complete or partial URL percent escapes."""
+        canonical = bytearray(data)
+        index = 0
+        while index < len(canonical):
+            if canonical[index] == ord("%"):
+                start = index + 1
+                available = min(2, len(canonical) - start)
+                digits = canonical[start : start + available]
+                if available and all(
+                    ord("0") <= value <= ord("9")
+                    or ord("A") <= value <= ord("F")
+                    or ord("a") <= value <= ord("f")
+                    for value in digits
+                ):
+                    for position in range(start, start + available):
+                        value = canonical[position]
+                        if ord("a") <= value <= ord("f"):
+                            canonical[position] = value - 32
+                    index = start + available
+                    continue
+            index += 1
+        return bytes(canonical)
+
+    @staticmethod
+    def _canonicalize_url_view(
+        data: bytes,
+        *,
+        plus_as_space: bool,
+    ) -> tuple[bytes, array[int], array[int]]:
+        """Decode valid percent triplets while retaining exact source spans.
+
+        In the quote-plus view only a literal ``+`` becomes a space.  A
+        percent-encoded ``%2B`` remains a plus, which avoids conflating a
+        secret containing ``+`` with one containing a space.
+        """
+        scan = bytearray()
+        starts = array("I")
+        ends = array("I")
+        index = 0
+        while index < len(data):
+            if index + 2 < len(data) and data[index] == ord("%"):
+                pair = data[index + 1 : index + 3]
+                if all(
+                    ord("0") <= value <= ord("9")
+                    or ord("A") <= value <= ord("F")
+                    or ord("a") <= value <= ord("f")
+                    for value in pair
+                ):
+                    scan.append(int(pair.decode("ascii"), 16))
+                    starts.append(index)
+                    ends.append(index + 3)
+                    index += 3
+                    continue
+            value = data[index]
+            if plus_as_space and value == ord("+"):
+                value = ord(" ")
+            scan.append(value)
+            starts.append(index)
+            ends.append(index + 1)
+            index += 1
+        return bytes(scan), starts, ends
+
+    @staticmethod
+    def _has_incomplete_percent_suffix(data: bytes) -> bool:
+        """Return whether a later chunk can complete a trailing ``%HH`` token."""
+        if data.endswith(b"%"):
+            return True
+        if len(data) < 2 or data[-2] != ord("%"):
+            return False
+        value = data[-1]
+        return (
+            ord("0") <= value <= ord("9")
+            or ord("A") <= value <= ord("F")
+            or ord("a") <= value <= ord("f")
+        )
+
+    @staticmethod
+    def _has_incomplete_json_escape_suffix(data: bytes) -> bool:
+        """Return whether a later chunk can complete a JSON escape token.
+
+        The streaming fast path may otherwise publish a shorter exact secret
+        that is also the prefix of a longer secret's JSON ``\\uHHHH`` form.
+        Keep an odd escaping backslash, lowercase ``u``, and up to three valid
+        hex nibbles pending until the token is complete or the stream ends.
+        """
+        if data.endswith(b"\\"):
+            return True
+        for digit_count in range(4):
+            u_index = len(data) - digit_count - 1
+            if u_index <= 0 or data[u_index] != ord("u"):
+                continue
+            digits = data[u_index + 1 :]
+            if len(digits) != digit_count or not all(
+                ord("0") <= value <= ord("9")
+                or ord("A") <= value <= ord("F")
+                or ord("a") <= value <= ord("f")
+                for value in digits
+            ):
+                continue
+            slash_start = u_index
+            while slash_start > 0 and data[slash_start - 1] == ord("\\"):
+                slash_start -= 1
+            if (u_index - slash_start) % 2 == 1:
+                return True
+        return False
+
+    @staticmethod
+    def _canonicalize_json_view(
+        data: bytes,
+    ) -> tuple[bytes, array[int], array[int]]:
+        """Build a JSON-equivalent scan plus exact source-span mapping.
+
+        Only an odd final backslash may escape a solidus or introduce the
+        lowercase ``u`` JSON unicode escape. Even backslash runs represent
+        literal backslashes and remain byte-exact.
+        """
+        scan = bytearray()
+        starts = array("I")
+        ends = array("I")
+
+        def append(byte: int, start: int, end: int) -> None:
+            scan.append(byte)
+            starts.append(start)
+            ends.append(end)
+
+        index = 0
+        while index < len(data):
+            if data[index] != ord("\\"):
+                append(data[index], index, index + 1)
+                index += 1
+                continue
+            run_start = index
+            while index < len(data) and data[index] == ord("\\"):
+                index += 1
+            run_length = index - run_start
+            following = data[index] if index < len(data) else None
+            if following == ord("/") and run_length % 2 == 1:
+                for position in range(run_start, index - 1):
+                    append(ord("\\"), position, position + 1)
+                append(ord("/"), index - 1, index + 1)
+                index += 1
+                continue
+            unicode_end = index + 5
+            if (
+                following == ord("u")
+                and run_length % 2 == 1
+                and unicode_end <= len(data)
+                and all(
+                    ord("0") <= value <= ord("9")
+                    or ord("A") <= value <= ord("F")
+                    or ord("a") <= value <= ord("f")
+                    for value in data[index + 1 : unicode_end]
+                )
+            ):
+                for position in range(run_start, index):
+                    append(ord("\\"), position, position + 1)
+                append(ord("u"), index, index + 1)
+                for position in range(index + 1, unicode_end):
+                    value = data[position]
+                    if ord("a") <= value <= ord("f"):
+                        value -= 32
+                    append(value, position, position + 1)
+                index = unicode_end
+                continue
+            for position in range(run_start, index):
+                append(ord("\\"), position, position + 1)
+        return bytes(scan), starts, ends
+
+    @classmethod
+    def _derive_forms(
+        cls, secret: str, raw: bytes
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        quoted = quote(secret, safe="")
+        plus = quote_plus(secret, safe="")
+        json_inner = json.dumps(secret, ensure_ascii=True)[1:-1]
+        # JSON permits each solidus to be escaped independently. Rather than
+        # enumerate 2^N variants, matching canonicalizes `\/` to `/` only in
+        # the JSON matcher while retaining all other bytes exactly.
+        json_canonical = json_inner
+        standard = base64.b64encode(raw).decode("ascii")
+        urlsafe = base64.urlsafe_b64encode(raw).decode("ascii")
+        fully_percent_encoded = "".join(f"%{byte:02X}" for byte in raw)
+        exact_candidates = (
+            secret,
+            standard,
+            standard.rstrip("="),
+            urlsafe,
+            urlsafe.rstrip("="),
+            raw.hex(),
+            raw.hex().upper(),
+        )
+        percent_candidates = (quoted, plus, fully_percent_encoded)
+        json_candidates = (json_canonical,)
+        return (
+            tuple(dict.fromkeys(candidate for candidate in exact_candidates if candidate)),
+            tuple(dict.fromkeys(candidate for candidate in percent_candidates if candidate)),
+            tuple(dict.fromkeys(candidate for candidate in json_candidates if candidate)),
+        )
+
+    def _redact_bytes(self, data: bytes) -> bytes:
+        if not self._has_patterns:
+            return data
+        intervals = self._collect_intervals(data)
+        redacted, cursor, matched = self._replace_mature(
+            data,
+            intervals,
+            mature_limit=len(data),
+        )
+        if cursor != len(data):
+            raise ProviderSecretScrubError
+        if not matched:
+            return data
+        # A fixed marker can be part of an otherwise valid arbitrary secret.
+        # Never publish a replacement-boundary reconstruction.
+        if any(self._collect_intervals(redacted)):
+            raise ProviderSecretScrubError
+        return redacted
+
+    def _collect_intervals(self, data: bytes) -> array[int]:
+        best_end = array("I", [0]) * (len(data) + 1)
+        budget = max(
+            self._MIN_MATCH_CANDIDATE_BUDGET,
+            len(data) * self._MATCH_CANDIDATES_PER_INPUT_BYTE,
+        )
+        candidates = 0
+
+        def collect(intervals: Iterator[tuple[int, int]]) -> None:
+            nonlocal candidates
+            for start, end in intervals:
+                candidates += 1
+                if candidates > budget or not (0 <= start < end <= len(data)):
+                    raise ProviderSecretScrubError
+                if end > best_end[start]:
+                    best_end[start] = end
+
+        collect(self._exact_matcher.iter_intervals(data))
+        url_scan, url_starts, url_ends = self._canonicalize_url_view(
+            data,
+            plus_as_space=False,
+        )
+        collect(
+            self._url_matcher.iter_intervals(
+                url_scan,
+                origin_starts=url_starts,
+                origin_ends=url_ends,
+            )
+        )
+        plus_scan, plus_starts, plus_ends = self._canonicalize_url_view(
+            data,
+            plus_as_space=True,
+        )
+        collect(
+            self._quote_plus_matcher.iter_intervals(
+                plus_scan,
+                origin_starts=plus_starts,
+                origin_ends=plus_ends,
+            )
+        )
+        json_scan, json_starts, json_ends = self._canonicalize_json_view(data)
+        collect(
+            self._json_matcher.iter_intervals(
+                json_scan,
+                origin_starts=json_starts,
+                origin_ends=json_ends,
+            )
+        )
+        return best_end
+
+    def _replace_mature(
+        self,
+        data: bytes,
+        intervals: array[int],
+        *,
+        mature_limit: int,
+    ) -> tuple[bytes, int, bool]:
+        output = bytearray()
+        cursor = 0
+        matched = False
+        while cursor < mature_limit:
+            end = intervals[cursor]
+            if end > cursor:
+                output.extend(self._MARKER_BYTES)
+                cursor = end
+                matched = True
+            else:
+                output.append(data[cursor])
+                cursor += 1
+        return bytes(output), cursor, matched
+
+    @staticmethod
+    def _utf8_mature_limit(data: bytes, limit: int) -> int:
+        safe = min(limit, len(data))
+        while safe > 0 and safe < len(data) and data[safe] & 0xC0 == 0x80:
+            safe -= 1
+        return safe
+
+    def _redact_stream_prefix(self, data: bytes, *, final: bool) -> tuple[bytes, bytes]:
+        if not self._has_patterns:
+            return data, b""
+        intervals = self._collect_intervals(data)
+        limit = (
+            len(data)
+            if final
+            else max(0, len(data) - self._max_source_span + 1)
+        )
+        if (
+            not final
+            and intervals[0] == len(data)
+            and not self._has_incomplete_percent_suffix(data)
+            and not self._has_incomplete_json_escape_suffix(data)
+        ):
+            url_scan, _, _ = self._canonicalize_url_view(
+                data,
+                plus_as_space=False,
+            )
+            plus_scan, _, _ = self._canonicalize_url_view(
+                data,
+                plus_as_space=True,
+            )
+            json_scan, _, _ = self._canonicalize_json_view(data)
+            can_extend = (
+                self._exact_matcher.has_longer_prefix(data)
+                or self._url_matcher.has_longer_prefix(url_scan)
+                or self._quote_plus_matcher.has_longer_prefix(plus_scan)
+                or self._json_matcher.has_longer_prefix(json_scan)
+            )
+            if not can_extend:
+                limit = len(data)
+        limit = self._utf8_mature_limit(data, limit)
+        emitted, cursor, _ = self._replace_mature(
+            data,
+            intervals,
+            mature_limit=limit,
+        )
+        if any(self._collect_intervals(emitted)):
+            raise ProviderSecretScrubError
+        return emitted, data[cursor:]
+
+    def _advance_output_guard(self, history: bytes, emitted: bytes) -> bytes:
+        """Reject a secret reconstructed across sanitized stream returns."""
+        combined = history + emitted
+        if any(self._collect_intervals(combined)):
+            raise ProviderSecretScrubError
+        retain = max(0, self._max_source_span - 1)
+        return combined[-retain:] if retain else b""
+
+    @classmethod
+    def _encode_text(cls, text: str) -> bytes:
+        if type(text) is not str:
+            raise ProviderSecretScrubError
+        try:
+            encoded = text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ProviderSecretScrubError from None
+        if len(encoded) > cls._MAX_STRING_BYTES:
+            raise ProviderSecretScrubError
+        return encoded
+
+    def redact_text(self, text: str) -> str:
+        encoded = self._encode_text(text)
+        try:
+            return self._redact_bytes(encoded).decode("utf-8")
+        except UnicodeDecodeError:
+            raise ProviderSecretScrubError from None
+
+    def redact_value(self, value: object) -> object:
+        active: set[int] = set()
+        counters = {"nodes": 0, "bytes": 0}
+
+        def visit(current: object, depth: int) -> object:
+            if depth > self._MAX_DEPTH:
+                raise ProviderSecretScrubError
+            counters["nodes"] += 1
+            if counters["nodes"] > self._MAX_NODES:
+                raise ProviderSecretScrubError
+            if type(current) is str:
+                encoded = self._encode_text(current)
+                counters["bytes"] += len(encoded)
+                if counters["bytes"] > self._MAX_AGGREGATE_STRING_BYTES:
+                    raise ProviderSecretScrubError
+                return self._redact_bytes(encoded).decode("utf-8")
+            if current is None or type(current) in {bool, int, float}:
+                return current
+            if type(current) in {dict, list, tuple}:
+                identity = id(current)
+                if identity in active:
+                    raise ProviderSecretScrubError
+                active.add(identity)
+                try:
+                    if type(current) is dict:
+                        rebuilt: dict[str, object] = {}
+                        for key, item in current.items():
+                            if type(key) is not str:
+                                raise ProviderSecretScrubError
+                            safe_key = visit(key, depth + 1)
+                            if not isinstance(safe_key, str) or safe_key in rebuilt:
+                                raise ProviderSecretScrubError
+                            rebuilt[safe_key] = visit(item, depth + 1)
+                        return rebuilt
+                    if type(current) is list:
+                        return [visit(item, depth + 1) for item in current]
+                    if type(current) is tuple:
+                        return tuple(visit(item, depth + 1) for item in current)
+                    raise ProviderSecretScrubError
+                finally:
+                    active.remove(identity)
+            raise ProviderSecretScrubError
+
+        return visit(value, 0)
+
+    def open_stream(self) -> ProviderSecretStream:
+        return ProviderSecretStream(self)
+
+
+class ProviderSecretStream:
+    """Incremental exact-value stream with cross-chunk prefix retention."""
+
+    def __init__(self, scrubber: ProviderSecretScrubber) -> None:
+        self._scrubber = scrubber
+        self._pending = b""
+        self._published_guard_tail = b""
+        self._total_bytes = 0
+        self._closed = False
+
+    def __repr__(self) -> str:
+        return "<S>"
+
+    def feed(self, chunk: str) -> str:
+        if self._closed:
+            raise ProviderSecretScrubError
+        try:
+            encoded = self._scrubber._encode_text(chunk)
+            self._total_bytes += len(encoded)
+            if self._total_bytes > self._scrubber._MAX_AGGREGATE_STRING_BYTES:
+                raise ProviderSecretScrubError
+            combined = self._pending + encoded
+            emitted, pending = self._scrubber._redact_stream_prefix(
+                combined,
+                final=False,
+            )
+            published_guard_tail = self._scrubber._advance_output_guard(
+                self._published_guard_tail,
+                emitted,
+            )
+            decoded = emitted.decode("utf-8")
+            self._pending = pending
+            self._published_guard_tail = published_guard_tail
+            return decoded
+        except (ProviderSecretScrubError, UnicodeDecodeError):
+            self.discard()
+            raise ProviderSecretScrubError from None
+
+    def flush(self) -> str:
+        if self._closed:
+            return ""
+        pending = self._pending
+        try:
+            emitted, remainder = self._scrubber._redact_stream_prefix(
+                pending,
+                final=True,
+            )
+            if remainder:
+                raise ProviderSecretScrubError
+            published_guard_tail = self._scrubber._advance_output_guard(
+                self._published_guard_tail,
+                emitted,
+            )
+            decoded = emitted.decode("utf-8")
+            self._pending = b""
+            self._published_guard_tail = published_guard_tail
+            self._closed = True
+            return decoded
+        except (ProviderSecretScrubError, UnicodeDecodeError):
+            self.discard()
+            raise ProviderSecretScrubError from None
+
+    def discard(self) -> None:
+        self._pending = b""
+        self._published_guard_tail = b""
+        self._closed = True
 
 
 class SecretManager:

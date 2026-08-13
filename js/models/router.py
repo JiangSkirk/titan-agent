@@ -6,11 +6,12 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, cast
 
 from cachetools import TTLCache
 
 from js.config import JSSettings, ModelConfig
+from js.echo.ledger.service import EchoBlockedError, EchoUnavailableError
 from js.models.capability import (
     SafeProviderError,
     reraise_safe_provider_error,
@@ -25,11 +26,30 @@ from js.models.providers import (
     is_retryable_provider_error,
 )
 from js.models.stream_events import StreamEvent
-from js.utils.log import get_logger
+from js.security.secrets import (
+    ProviderSecretScrubber,
+    ProviderSecretScrubError,
+    ProviderSecretStream,
+)
 
-logger = get_logger("js.models.router")
 _NO_ROUTER_FALLBACK_ATTR = "_js_router_no_fallback"
 _MAX_ROUTER_PROVIDER_ATTEMPTS = 5
+_MAX_PROVIDER_USAGE_VALUE = (1 << 63) - 1
+_ALLOWED_USAGE_KEYS = frozenset(
+    {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "provider_reported_prompt_tokens",
+        "provider_reported_completion_tokens",
+        "provider_reported_total_tokens",
+    }
+)
+_ALLOWED_USAGE_SOURCES = frozenset(
+    {"provider_actual", "tokenizer", "estimated", "unavailable"}
+)
+_MAX_PROVIDER_SECRET_STREAM_CHANNELS = 128
 
 _ALLOWED_ERROR_META: dict[str, type] = {
     "retryable": bool,
@@ -56,7 +76,7 @@ _ALLOWED_STREAM_META: dict[str, dict[str, type]] = {
 
 def _filter_stream_meta(kind: str, meta: dict[str, Any] | None) -> dict[str, Any]:
     """Keep only allowlisted meta keys for the given stream event kind."""
-    if not meta:
+    if not meta or type(meta) is not dict:
         return {}
     allowed = _ALLOWED_STREAM_META.get(kind, {})
     if not allowed:
@@ -66,7 +86,7 @@ def _filter_stream_meta(kind: str, meta: dict[str, Any] | None) -> dict[str, Any
         if key not in meta:
             continue
         value = meta[key]
-        if isinstance(value, expected_type):
+        if type(value) is expected_type:
             filtered[key] = value
     return filtered
 
@@ -74,21 +94,6 @@ def _filter_stream_meta(kind: str, meta: dict[str, Any] | None) -> dict[str, Any
 def _filter_error_meta(meta: dict[str, Any] | None) -> dict[str, Any]:
     """Keep only allowlisted error meta keys with strict runtime types."""
     return _filter_stream_meta("error", meta)
-
-
-def _trusted_stream_event(ev: StreamEvent, decision: RoutingDecision) -> StreamEvent:
-    """Rebuild a stream event with trusted routing identity and meta allowlist."""
-    return StreamEvent(
-        kind=ev.kind,
-        text=ev.text if ev.kind in {"text_delta", "thinking_delta"} else "",
-        tool_call=ev.tool_call if ev.kind == "tool_call_delta" else None,
-        usage=ev.usage if ev.kind == "usage" else None,
-        finish_reason=ev.finish_reason if ev.kind == "done" else None,
-        error="",
-        provider=decision.provider_name,
-        model=decision.model,
-        meta=_filter_stream_meta(ev.kind, ev.meta),
-    )
 
 
 def _rebuild_error_event(
@@ -152,6 +157,22 @@ class _StreamCompletionBudgetExceededError(RuntimeError):
         self.completion_tokens = completion_tokens
 
 
+class _SafeCancelledError(asyncio.CancelledError):
+    def __init__(self, message: str = "[S]") -> None:
+        super().__init__(message)
+
+    def __repr__(self) -> str:
+        return "[S]"
+
+
+@dataclass(frozen=True, slots=True)
+class _FailureSnapshot:
+    category: str
+    message: str = "[S]"
+    retryable: bool = False
+    no_fallback: bool = False
+
+
 @dataclass
 class RoutingDecision:
     provider: ModelProvider
@@ -161,6 +182,8 @@ class RoutingDecision:
 
 
 def _mark_no_router_fallback(exc: BaseException) -> None:
+    if isinstance(exc, (ProviderSecretScrubError, _SafeCancelledError)):
+        return
     try:
         setattr(exc, _NO_ROUTER_FALLBACK_ATTR, True)
     except Exception:
@@ -168,7 +191,446 @@ def _mark_no_router_fallback(exc: BaseException) -> None:
 
 
 def _is_no_router_fallback(exc: BaseException) -> bool:
-    return bool(getattr(exc, _NO_ROUTER_FALLBACK_ATTR, False))
+    return isinstance(exc, (ProviderSecretScrubError, _SafeCancelledError)) or bool(
+        getattr(exc, _NO_ROUTER_FALLBACK_ATTR, False)
+    )
+
+
+def _failure_snapshot(
+    exc: BaseException,
+    scrubber: ProviderSecretScrubber | None,
+    provider: ModelProvider,
+) -> _FailureSnapshot:
+    """Detach a provider failure from tainted traceback frames and values."""
+    if isinstance(exc, ProviderSecretScrubError):
+        return _FailureSnapshot(category="scrub", no_fallback=True)
+    if isinstance(exc, asyncio.CancelledError):
+        if scrubber is None:
+            return _FailureSnapshot(category="cancel", no_fallback=True)
+        return _FailureSnapshot(
+            category="cancel",
+            message=_safe_exception_message(scrubber, exc),
+            no_fallback=True,
+        )
+    if scrubber is None:
+        return _FailureSnapshot(category="scrub", no_fallback=True)
+    try:
+        if isinstance(exc, PermissionError):
+            message = _safe_exception_message(scrubber, exc)
+            return _FailureSnapshot(
+                category="permission",
+                message=message,
+                no_fallback=True,
+            )
+        retryable = (
+            exc.retryable
+            if isinstance(exc, SafeProviderError)
+            else is_retryable_provider_error(exc)
+        )
+        # Exact-scrub the original message before the legacy sanitizer.  The
+        # latter intentionally retains four-character key prefixes/suffixes
+        # and therefore must never be the first B1C boundary.
+        exact_message = _safe_exception_message(scrubber, exc)
+        safe = _as_safe_provider_error(
+            SafeProviderError(exact_message, retryable=retryable),
+            provider,
+        )
+        message = _safe_exception_message(scrubber, safe)
+        return _FailureSnapshot(
+            category="safe",
+            message=message,
+            retryable=safe.retryable,
+            no_fallback=_is_no_router_fallback(exc),
+        )
+    except BaseException:
+        return _FailureSnapshot(category="scrub", no_fallback=True)
+
+
+def _materialize_failure(snapshot: _FailureSnapshot) -> BaseException:
+    """Create one fresh outward exception with no cause, context, or traceback."""
+    if snapshot.category == "cancel":
+        error: BaseException = _SafeCancelledError(snapshot.message)
+    elif snapshot.category == "generator_exit":
+        error = GeneratorExit()
+    elif snapshot.category in {"closed", "runtime"}:
+        error = RuntimeError(snapshot.message)
+    elif snapshot.category == "os":
+        error = OSError(snapshot.message)
+    elif snapshot.category == "permission":
+        error = PermissionError(snapshot.message)
+    elif snapshot.category == "echo_blocked":
+        error = EchoBlockedError(snapshot.message)
+    elif snapshot.category == "echo_unavailable":
+        error = EchoUnavailableError(snapshot.message)
+    elif snapshot.category == "safe":
+        error = SafeProviderError(snapshot.message, retryable=snapshot.retryable)
+    else:
+        error = ProviderSecretScrubError()
+    if snapshot.no_fallback:
+        _mark_no_router_fallback(error)
+    return error
+
+
+def _safe_outward_message(scrubber: ProviderSecretScrubber, message: str) -> str:
+    """Return one exact-scrubbed outward diagnostic or the opaque marker."""
+    try:
+        return scrubber.redact_text(message) or "[S]"
+    except ProviderSecretScrubError:
+        return "[S]"
+
+
+def _safe_exception_message(
+    scrubber: ProviderSecretScrubber,
+    error: BaseException,
+) -> str:
+    """Stringify an exception without allowing hostile ``__str__`` to escape."""
+    try:
+        message = str(error)
+    except BaseException:
+        return "[S]"
+    return _safe_outward_message(scrubber, message)
+
+
+def _hook_failure_snapshot(
+    exc: BaseException,
+    scrubber: ProviderSecretScrubber | None,
+    provider: ModelProvider,
+) -> _FailureSnapshot:
+    """Detach an after-hook failure while retaining supported control types."""
+    try:
+        if scrubber is None:
+            return _FailureSnapshot(category="scrub", no_fallback=True)
+        if isinstance(exc, EchoBlockedError):
+            return _FailureSnapshot(
+                category="echo_blocked",
+                message=_safe_exception_message(scrubber, exc),
+                no_fallback=True,
+            )
+        if isinstance(exc, EchoUnavailableError):
+            return _FailureSnapshot(
+                category="echo_unavailable",
+                message=_safe_exception_message(scrubber, exc),
+                no_fallback=True,
+            )
+        if isinstance(exc, GeneratorExit):
+            return _FailureSnapshot(category="generator_exit", no_fallback=True)
+        if type(exc) in {OSError, RuntimeError}:
+            return _FailureSnapshot(
+                category="os" if type(exc) is OSError else "runtime",
+                message=_safe_exception_message(scrubber, exc),
+                no_fallback=True,
+            )
+        return _failure_snapshot(exc, scrubber, provider)
+    except BaseException:
+        return _FailureSnapshot(category="scrub", no_fallback=True)
+
+
+def _secret_scrub_failure() -> ProviderSecretScrubError:
+    error = ProviderSecretScrubError()
+    _mark_no_router_fallback(error)
+    return error
+
+
+def _scrubber_for_decision(decision: RoutingDecision) -> ProviderSecretScrubber:
+    configured_values = (
+        getattr(getattr(decision.provider, "config", None), "api_key", None),
+    )
+    return _scrubber_for_values(decision, configured_values)
+
+
+def _scrubber_for_values(
+    decision: RoutingDecision,
+    configured_values: tuple[object, ...],
+) -> ProviderSecretScrubber:
+    secrets: list[str] = []
+    for configured in configured_values:
+        if configured is None or configured == "":
+            continue
+        if type(configured) is not str:
+            raise _secret_scrub_failure()
+        if configured not in secrets:
+            secrets.append(configured)
+    try:
+        scrubber = ProviderSecretScrubber(secrets)
+        # Routing identity cannot be rewritten without breaking attribution.
+        # If it collides with the active secret, fail before provider I/O.
+        for trusted_identity in (
+            decision.provider_name,
+            decision.model,
+            *_ALLOWED_USAGE_SOURCES,
+            *_ALLOWED_STREAM_META,
+            *_ALLOWED_USAGE_KEYS,
+            *_ALLOWED_ERROR_META,
+            "kind",
+            "text",
+            "tool_call",
+            "usage",
+            "finish_reason",
+            "error",
+            "provider",
+            "model",
+            "meta",
+            "content",
+            "tool_calls",
+            "reasoning_content",
+            "usage_source",
+            "index",
+            "id",
+            "type",
+            "name",
+            "arguments_delta",
+            "function",
+            "arguments",
+            "assistant_text",
+            "estimated_completion_tokens",
+            _NO_ROUTER_FALLBACK_ATTR,
+            "ChatResponse",
+            "StreamEvent",
+            "SafeProviderError",
+            "PermissionError",
+            "EchoBlockedError",
+            "EchoUnavailableError",
+            "ProviderSecretScrubError",
+            "CancelledError",
+            "_SafeCancelledError",
+            "_StreamCompletionBudgetExceededError",
+            "RuntimeError",
+            "OSError",
+            "is_stream_completion_budget_exceeded",
+            "completion_tokens_exceeded",
+            "Echo budget exceeded: completion_tokens_exceeded",
+            __file__,
+        ):
+            if scrubber.redact_text(trusted_identity) != trusted_identity:
+                raise ProviderSecretScrubError
+        return scrubber
+    except ProviderSecretScrubError:
+        raise _secret_scrub_failure() from None
+
+
+def _normalize_provider_usage(value: object) -> dict[str, int]:
+    if type(value) is not dict:
+        raise _secret_scrub_failure()
+    normalized: dict[str, int] = {}
+    for key, count in value.items():
+        if (
+            type(key) is not str
+            or key not in _ALLOWED_USAGE_KEYS
+            or type(count) is not int
+            or count < 0
+            or count > _MAX_PROVIDER_USAGE_VALUE
+        ):
+            raise _secret_scrub_failure()
+        normalized[key] = count
+    return normalized
+
+
+def _sanitize_chat_response(
+    raw: object,
+    decision: RoutingDecision,
+    scrubber: ProviderSecretScrubber,
+) -> ChatResponse:
+    try:
+        if type(raw) is not ChatResponse:
+            raise ProviderSecretScrubError
+        if raw.usage_source not in _ALLOWED_USAGE_SOURCES:
+            raise ProviderSecretScrubError
+        safe_fields = scrubber.redact_value(
+            {
+                "content": raw.content,
+                "tool_calls": raw.tool_calls,
+                "finish_reason": raw.finish_reason,
+                "reasoning_content": raw.reasoning_content,
+                "usage_source": raw.usage_source,
+            }
+        )
+        if type(safe_fields) is not dict:
+            raise ProviderSecretScrubError
+        safe_tools = safe_fields.get("tool_calls")
+        if type(safe_tools) is not list or any(
+            type(tool_call) is not dict for tool_call in safe_tools
+        ):
+            raise ProviderSecretScrubError
+        content = safe_fields.get("content")
+        finish_reason = safe_fields.get("finish_reason")
+        reasoning_content = safe_fields.get("reasoning_content")
+        usage_source = safe_fields.get("usage_source")
+        if not all(
+            type(value) is str
+            for value in (content, finish_reason, reasoning_content, usage_source)
+        ):
+            raise ProviderSecretScrubError
+        safe_content = cast("str", content)
+        safe_finish_reason = cast("str", finish_reason)
+        safe_reasoning_content = cast("str", reasoning_content)
+        safe_usage_source = cast(
+            "Literal['provider_actual', 'tokenizer', 'estimated', 'unavailable']",
+            usage_source,
+        )
+        return ChatResponse(
+            content=safe_content,
+            tool_calls=safe_tools,
+            model=decision.model,
+            usage=_normalize_provider_usage(raw.usage),
+            finish_reason=safe_finish_reason,
+            reasoning_content=safe_reasoning_content,
+            usage_source=safe_usage_source,
+        )
+    except ProviderSecretScrubError:
+        raise _secret_scrub_failure() from None
+
+
+class _ProviderResponseStreamScrubber:
+    """Per-attempt exact-value channels for successful Provider stream data."""
+
+    _TOOL_FIELDS = frozenset({"id", "type", "name", "arguments_delta"})
+    _MAX_TOTAL_BYTES = 16 * 1024 * 1024
+
+    def __init__(self, scrubber: ProviderSecretScrubber) -> None:
+        self._scrubber = scrubber
+        self._channels: dict[tuple[object, ...], ProviderSecretStream] = {}
+        self._tool_values: dict[int, dict[str, list[str]]] = {}
+        self._total_bytes = 0
+        self._closed = False
+
+    def _record_input(self, value: object) -> str:
+        if type(value) is not str:
+            raise _secret_scrub_failure()
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise _secret_scrub_failure() from None
+        self._total_bytes += size
+        if self._total_bytes > self._MAX_TOTAL_BYTES:
+            self.discard()
+            raise _secret_scrub_failure()
+        return value
+
+    def _channel(self, key: tuple[object, ...]) -> ProviderSecretStream:
+        if self._closed:
+            raise _secret_scrub_failure()
+        channel = self._channels.get(key)
+        if channel is not None:
+            return channel
+        if len(self._channels) >= _MAX_PROVIDER_SECRET_STREAM_CHANNELS:
+            self.discard()
+            raise _secret_scrub_failure()
+        channel = self._scrubber.open_stream()
+        self._channels[key] = channel
+        return channel
+
+    def _feed(self, key: tuple[object, ...], value: object) -> str:
+        text = self._record_input(value)
+        try:
+            return self._channel(key).feed(text)
+        except ProviderSecretScrubError:
+            self.discard()
+            raise _secret_scrub_failure() from None
+
+    def feed_text(self, kind: str, value: object) -> str:
+        if kind not in {"text_delta", "thinking_delta"}:
+            raise _secret_scrub_failure()
+        return self._feed((kind,), value)
+
+    def feed_tool(self, raw: object) -> dict[str, object] | None:
+        if type(raw) is not dict:
+            raise _secret_scrub_failure()
+        if any(type(key) is not str for key in raw) or not set(raw) <= {
+            "index",
+            *self._TOOL_FIELDS,
+        }:
+            raise _secret_scrub_failure()
+        index = raw.get("index")
+        if type(index) is not int or index < 0:
+            raise _secret_scrub_failure()
+        present_fields = self._TOOL_FIELDS.intersection(raw)
+        if not present_fields:
+            raise _secret_scrub_failure()
+        if index not in self._tool_values and len(self._tool_values) >= (
+            _MAX_PROVIDER_SECRET_STREAM_CHANNELS
+        ):
+            self.discard()
+            raise _secret_scrub_failure()
+        values = self._tool_values.setdefault(
+            index,
+            {"id": [], "type": [], "name": [], "arguments_delta": []},
+        )
+        emitted_arguments = ""
+        for field_name in ("id", "type", "name", "arguments_delta"):
+            if field_name not in raw:
+                continue
+            safe = self._feed(("tool", index, field_name), raw[field_name])
+            if safe:
+                values[field_name].append(safe)
+                if field_name == "arguments_delta":
+                    emitted_arguments += safe
+        # Tool identifiers are overwrite fields in the existing consumer, not
+        # append-only deltas. Hold the complete safe call until finish so a
+        # provider cannot make character-split ids/names collapse to the final
+        # character. Arguments retain their delta field shape at publication.
+        if emitted_arguments:
+            return {"index": index, "arguments_delta": emitted_arguments}
+        return None
+
+    def finish(
+        self,
+    ) -> tuple[str, str, list[dict[str, object]], list[dict[str, object]]]:
+        if self._closed:
+            raise _secret_scrub_failure()
+        emitted_tool_events: list[dict[str, object]] = []
+        response_tool_calls: list[dict[str, object]] = []
+        try:
+            text_tail = self._flush_channel(("text_delta",))
+            thinking_tail = self._flush_channel(("thinking_delta",))
+            for index in sorted(self._tool_values):
+                values = self._tool_values[index]
+                argument_tail = ""
+                for field_name in ("id", "type", "name", "arguments_delta"):
+                    tail = self._flush_channel(("tool", index, field_name))
+                    if tail:
+                        values[field_name].append(tail)
+                        if field_name == "arguments_delta":
+                            argument_tail += tail
+                stable_delta: dict[str, object] = {"index": index}
+                for field_name in ("id", "type", "name"):
+                    combined = "".join(values[field_name])
+                    if combined:
+                        stable_delta[field_name] = combined
+                arguments = "".join(values["arguments_delta"])
+                if argument_tail:
+                    stable_delta["arguments_delta"] = argument_tail
+                if len(stable_delta) > 1:
+                    emitted_tool_events.append(stable_delta)
+                call: dict[str, object] = {
+                    "type": "".join(values["type"]) or "function",
+                    "function": {
+                        "name": "".join(values["name"]),
+                        "arguments": arguments,
+                    },
+                }
+                call_id = "".join(values["id"])
+                if call_id:
+                    call["id"] = call_id
+                response_tool_calls.append(call)
+            self._closed = True
+            return text_tail, thinking_tail, emitted_tool_events, response_tool_calls
+        except ProviderSecretScrubError:
+            self.discard()
+            raise _secret_scrub_failure() from None
+
+    def _flush_channel(self, key: tuple[object, ...]) -> str:
+        channel = self._channels.get(key)
+        if channel is None:
+            return ""
+        try:
+            return channel.flush()
+        except ProviderSecretScrubError:
+            raise _secret_scrub_failure() from None
+
+    def discard(self) -> None:
+        for channel in self._channels.values():
+            channel.discard()
+        self._closed = True
 
 
 def _provider_attempt_limit(provider: ModelProvider) -> int:
@@ -187,6 +649,8 @@ def _stream_chat_response(
     usage: dict[str, int],
     finish_reason: str,
     estimated_completion_tokens: int,
+    reasoning_content: str,
+    tool_calls: list[dict[str, object]],
 ) -> ChatResponse:
     response_usage = (
         dict(usage)
@@ -218,10 +682,11 @@ def _stream_chat_response(
         normalized_usage["provider_reported_total_tokens"] = provider_total_tokens
     return ChatResponse(
         content=text,
-        tool_calls=[],
+        tool_calls=tool_calls,
         model=model,
         usage=normalized_usage,
         finish_reason=finish_reason,
+        reasoning_content=reasoning_content,
         usage_source="provider_actual" if usage and not conservative_override else "estimated",
     )
 
@@ -277,7 +742,7 @@ def _stream_failure_completion(event: StreamEvent | None, error: BaseException |
         value = event.meta.get("completion_tokens")
     if value is None and error is not None:
         value = getattr(error, "completion_tokens", None)
-    return max(0, int(value)) if isinstance(value, int) else 0
+    return max(0, value) if type(value) is int else 0
 
 
 class ModelSwitchValidationError(Exception):
@@ -392,6 +857,7 @@ class ModelRouter:
     def __init__(self, settings: JSSettings, *, permit_verifier: Any | None = None) -> None:
         self.settings = settings
         self._providers: dict[str, ModelProvider] = {}
+        self._registered_provider_secrets: dict[int, tuple[object, ...]] = {}
         self._model_map: dict[
             str, tuple[str, ModelConfig]
         ] = {}  # model_id -> (provider_name, config)
@@ -402,6 +868,64 @@ class ModelRouter:
         # from this cryptographic capability, not from rebindable callbacks.
         self._permit_verifier = permit_verifier
         self._init_providers()
+
+    @staticmethod
+    def _current_provider_secret(provider: ModelProvider) -> object:
+        try:
+            snapshot = getattr(provider, "response_secret_snapshot", None)
+            if callable(snapshot):
+                return snapshot()
+            return getattr(getattr(provider, "config", None), "api_key", None)
+        except BaseException:
+            raise _secret_scrub_failure() from None
+
+    def _remember_provider_secret(self, provider: ModelProvider) -> None:
+        """Bind a credential snapshot to one registered Provider generation."""
+        registry = getattr(self, "_registered_provider_secrets", None)
+        if type(registry) is not dict:
+            registry = {}
+            self._registered_provider_secrets = registry
+        registry[id(provider)] = (
+            self._current_provider_secret(provider),
+        )
+
+    def _provider_secret_values(self, provider: ModelProvider) -> tuple[object, ...]:
+        """Return the immutable credential bound to a Provider generation."""
+        registry = getattr(self, "_registered_provider_secrets", {})
+        values = list(registry.get(id(provider), ())) if type(registry) is dict else []
+        if not values:
+            # A decision may outlive removal from the routing table.  The
+            # Provider itself remains the authority for its frozen generation.
+            values.append(self._current_provider_secret(provider))
+        unique: list[object] = []
+        for value in values:
+            if value not in unique:
+                unique.append(value)
+        return tuple(unique)
+
+    def _decision(
+        self,
+        *,
+        provider: ModelProvider,
+        model: str,
+        provider_name: str,
+        reason: str,
+    ) -> RoutingDecision:
+        return RoutingDecision(
+            provider=provider,
+            model=model,
+            provider_name=provider_name,
+            reason=reason,
+        )
+
+    def _scrubber_for_registered_decision(
+        self,
+        decision: RoutingDecision,
+    ) -> ProviderSecretScrubber:
+        return _scrubber_for_values(
+            decision,
+            self._provider_secret_values(decision.provider),
+        )
 
     def _consume_model_permit(
         self,
@@ -455,6 +979,7 @@ class ModelRouter:
                 allow_private=allow_private,
             )
             self._providers[p_config.name] = provider
+            self._remember_provider_secret(provider)
             # Register explicitly-configured models
             for m in p_config.models:
                 full_id = f"{p_config.name}/{m.id}"
@@ -473,8 +998,13 @@ class ModelRouter:
         # Clear stale mappings for this provider first so that old model ids
         # (e.g. from a previous discover_models refresh) don't linger.
         old_provider = self._providers.pop(name, None)
+        if old_provider is not None:
+            registry = getattr(self, "_registered_provider_secrets", {})
+            if type(registry) is dict:
+                registry.pop(id(old_provider), None)
         self._model_map = {k: v for k, v in self._model_map.items() if v[0] != name}
         self._providers[name] = provider
+        self._remember_provider_secret(provider)
         for m in models:
             self._model_map[m.id] = (name, m)
             self._model_map[f"{name}/{m.id}"] = (name, m)
@@ -494,6 +1024,9 @@ class ModelRouter:
         if name not in self._providers:
             return False
         old_provider = self._providers.pop(name)
+        registry = getattr(self, "_registered_provider_secrets", {})
+        if type(registry) is dict:
+            registry.pop(id(old_provider), None)
         self._model_map = {k: v for k, v in self._model_map.items() if v[0] != name}
         self._routing_cache.clear()
         # Close the old provider asynchronously without blocking the caller.
@@ -607,7 +1140,7 @@ class ModelRouter:
             provider_name, config = self._model_map[preferred]
             provider = self._providers[provider_name]
             if await self._provider_healthy(provider):
-                decision = RoutingDecision(
+                decision = self._decision(
                     provider=provider,
                     model=config.id,
                     provider_name=provider_name,
@@ -617,7 +1150,7 @@ class ModelRouter:
                 # Respect user's explicit choice even if the provider appears
                 # unhealthy.  Let the actual API call fail and surface the
                 # error rather than silently falling back to a different model.
-                decision = RoutingDecision(
+                decision = self._decision(
                     provider=provider,
                     model=config.id,
                     provider_name=provider_name,
@@ -656,7 +1189,7 @@ class ModelRouter:
             )
             for (name, model, _provider), healthy in zip(candidates, health_results, strict=False):
                 if isinstance(healthy, bool) and healthy:
-                    decision = RoutingDecision(
+                    decision = self._decision(
                         provider=self._providers[name],
                         model=model,
                         provider_name=name,
@@ -669,7 +1202,7 @@ class ModelRouter:
         for provider_name, default_model in provider_defaults.items():
             maybe_provider = self._providers.get(provider_name)
             if maybe_provider is not None:
-                decision = RoutingDecision(
+                decision = self._decision(
                     provider=maybe_provider,
                     model=default_model,
                     provider_name=provider_name,
@@ -725,6 +1258,13 @@ class ModelRouter:
             )
         decision = await self.select_model(preferred=model)
         errors: list[str] = []
+        attempt_scrubbers: list[ProviderSecretScrubber] = []
+
+        def _scrub_attempt_diagnostics(message: str) -> str:
+            safe = message
+            for scrubber in attempt_scrubbers:
+                safe = _safe_outward_message(scrubber, safe)
+            return safe
 
         async def _before(call_decision: RoutingDecision) -> Any:
             if before_model_call is None:
@@ -739,50 +1279,68 @@ class ModelRouter:
             context: Any,
             response: ChatResponse | None,
             error: BaseException | None,
-        ) -> None:
+            scrubber: ProviderSecretScrubber,
+            provider: ModelProvider,
+        ) -> _FailureSnapshot | None:
             if after_model_call is not None:
                 try:
                     await after_model_call(context, response, error)
-                except Exception as exc:
-                    _mark_no_router_fallback(exc)
-                    raise
+                except BaseException as exc:
+                    return _hook_failure_snapshot(exc, scrubber, provider)
+            return None
 
-        async def _call_provider_once(call_decision: RoutingDecision) -> ChatResponse:
-            context: Any = None
+        async def _tainted_provider_call(
+            call_decision: RoutingDecision,
+            scrubber: ProviderSecretScrubber,
+        ) -> tuple[ChatResponse | None, _FailureSnapshot | None]:
             try:
-                self._consume_model_permit(permit_grant, call_decision, messages, tools)
-                context = await _before(call_decision)
-                response = await call_decision.provider.chat(
+                raw = await call_decision.provider.chat(
                     messages=messages,
                     model=call_decision.model,
                     tools=tools,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                return _sanitize_chat_response(raw, call_decision, scrubber), None
             except BaseException as exc:
-                # Convert provider failures before after-hooks / re-raise so Echo
-                # finalizers and logs never observe raw credential-bearing errors.
-                observed: BaseException = exc
-                if not isinstance(
-                    exc, (asyncio.CancelledError, SafeProviderError)
-                ) and not _is_no_router_fallback(exc):
-                    observed = _as_safe_provider_error(exc, call_decision.provider)
-                if context is not None:
-                    if isinstance(exc, asyncio.CancelledError):
-                        try:
-                            await _after(context, None, exc)
-                        except BaseException as cleanup_error:
-                            logger.warning(
-                                "Model-call cancellation cleanup failed",
-                                exc_info=True,
-                            )
-                            raise cleanup_error from None
-                    else:
-                        await _after(context, None, observed)
-                if isinstance(observed, SafeProviderError):
-                    reraise_safe_provider_error(observed)
-                raise observed from None
-            await _after(context, response, None)
+                return None, _failure_snapshot(exc, scrubber, call_decision.provider)
+
+        async def _call_provider_once(call_decision: RoutingDecision) -> ChatResponse:
+            context: Any = None
+            response: ChatResponse | None = None
+            failure: _FailureSnapshot | None = None
+            # Validate the attempt's immutable credential generation before a
+            # permit is consumed or Echo reserves a durable finish slot.
+            scrubber = self._scrubber_for_registered_decision(call_decision)
+            attempt_scrubbers.append(scrubber)
+            self._consume_model_permit(permit_grant, call_decision, messages, tools)
+            context = await _before(call_decision)
+            response, failure = await _tainted_provider_call(call_decision, scrubber)
+            if failure is not None:
+                hook_failure = await _after(
+                    context,
+                    None,
+                    _materialize_failure(failure),
+                    scrubber,
+                    call_decision.provider,
+                )
+                if hook_failure is not None:
+                    raise _materialize_failure(hook_failure) from None
+                propagated = _materialize_failure(failure)
+                if isinstance(propagated, SafeProviderError):
+                    reraise_safe_provider_error(propagated)
+                raise propagated from None
+            if response is None:
+                raise _secret_scrub_failure()
+            hook_failure = await _after(
+                context,
+                response,
+                None,
+                scrubber,
+                call_decision.provider,
+            )
+            if hook_failure is not None:
+                raise _materialize_failure(hook_failure) from None
             return response
 
         async def _call_provider(call_decision: RoutingDecision) -> ChatResponse:
@@ -798,16 +1356,11 @@ class ModelRouter:
                     ):
                         raise
                     delay = min(2**attempt, 30)
-                    logger.warning(
-                        "Provider transport retry %s/%s for %s after %ss",
-                        attempt + 2,
-                        attempt_limit,
-                        call_decision.provider_name,
-                        delay,
-                    )
                     await asyncio.sleep(delay)
             reraise_safe_provider_error(
-                SafeProviderError("provider retry loop ended without a result")
+                SafeProviderError(
+                    _scrub_attempt_diagnostics("provider retry loop ended without a result")
+                )
             )
 
         try:
@@ -820,7 +1373,11 @@ class ModelRouter:
             if model is not None:
                 # User explicitly requested this model – do not silently fallback.
                 reraise_safe_provider_error(
-                    SafeProviderError(f"Requested model '{model}' failed: {safe}")
+                    SafeProviderError(
+                        _scrub_attempt_diagnostics(
+                            f"Requested model '{model}' failed: {safe}"
+                        )
+                    )
                 )
 
         # Fallback is only reached when ``model`` is None (auto-select).
@@ -842,7 +1399,7 @@ class ModelRouter:
                 )
                 if not fallback_model:
                     continue
-                fallback_decision = RoutingDecision(
+                fallback_decision = self._decision(
                     provider=provider,
                     model=fallback_model,
                     provider_name=name,
@@ -854,7 +1411,6 @@ class ModelRouter:
                     raise
                 safe = _as_safe_provider_error(e, provider)
                 errors.append(f"{name}: {safe}")
-                logger.warning("Provider fallback %s failed: %s", name, safe)
 
         # Last resort: try the original selected provider even if unhealthy
         try:
@@ -865,7 +1421,11 @@ class ModelRouter:
             safe = _as_safe_provider_error(e, decision.provider)
             errors.append(f"{decision.provider_name}/{decision.model} (last resort): {safe}")
 
-        reraise_safe_provider_error(SafeProviderError(f"All providers failed: {'; '.join(errors)}"))
+        reraise_safe_provider_error(
+            SafeProviderError(
+                _scrub_attempt_diagnostics(f"All providers failed: {'; '.join(errors)}")
+            )
+        )
 
     async def chat_stream(
         self,
@@ -981,13 +1541,6 @@ class ModelRouter:
                             return
                 if retry_requested:
                     delay = min(2**attempt, 30)
-                    logger.warning(
-                        "Provider stream reconnect %s/%s for %s after %ss",
-                        attempt + 2,
-                        attempt_limit,
-                        decision.provider_name,
-                        delay,
-                    )
                     await asyncio.sleep(delay)
                     continue
                 break
@@ -999,13 +1552,6 @@ class ModelRouter:
                 first_error = _rebuild_error_event(None, decision, safe)
                 if is_retryable_provider_error(safe) and attempt + 1 < attempt_limit:
                     delay = min(2**attempt, 30)
-                    logger.warning(
-                        "Provider stream reconnect %s/%s for %s after %ss",
-                        attempt + 2,
-                        attempt_limit,
-                        decision.provider_name,
-                        delay,
-                    )
                     await asyncio.sleep(delay)
                     continue
                 if model is not None:
@@ -1016,7 +1562,7 @@ class ModelRouter:
         for name, provider in self._providers.items():
             if name == decision.provider_name:
                 continue
-            fallback_emitted_text = False
+            fallback_emitted_output = False
             attempt_max_tokens = (
                 None if max_tokens is None else max(0, max_tokens - consumed_completion_tokens)
             )
@@ -1035,7 +1581,7 @@ class ModelRouter:
                 )
                 if not fallback_model:
                     continue
-                fallback_decision = RoutingDecision(
+                fallback_decision = self._decision(
                     provider=provider,
                     model=fallback_model,
                     provider_name=name,
@@ -1054,14 +1600,18 @@ class ModelRouter:
                 )
                 async with aclosing(fallback_stream):
                     async for ev in fallback_stream:
-                        if ev.kind == "text_delta" and ev.text:
-                            fallback_emitted_text = True
+                        if ev.kind in {
+                            "text_delta",
+                            "thinking_delta",
+                            "tool_call_delta",
+                        }:
+                            fallback_emitted_output = True
                         if ev.kind == "error":
                             fallback_error = ev
                             fallback_error_decision = fallback_decision
                             fallback_failed = True
                             consumed_completion_tokens += _stream_failure_completion(ev, None)
-                            if fallback_emitted_text:
+                            if fallback_emitted_output:
                                 yield ev
                                 return
                             break
@@ -1072,11 +1622,10 @@ class ModelRouter:
                     continue
                 return
             except Exception as e:
-                if _is_no_router_fallback(e) or fallback_emitted_text:
+                if _is_no_router_fallback(e) or fallback_emitted_output:
                     raise
                 safe = _as_safe_provider_error(e, provider)
                 consumed_completion_tokens += _stream_failure_completion(None, safe)
-                logger.warning("Stream-event fallback %s failed: %s", name, safe)
 
         # All providers failed: emit the original error (or a synthesised one)
         # so the consumer always sees a terminal event.
@@ -1084,21 +1633,21 @@ class ModelRouter:
             yield _rebuild_error_event(
                 fallback_error,
                 fallback_error_decision or decision,
-                SafeProviderError(fallback_error.error or "stream error"),
+                SafeProviderError(fallback_error.error or "<F>"),
                 failure_meta=fallback_error.meta,
             )
         elif first_error is not None:
             yield _rebuild_error_event(
                 first_error,
                 decision,
-                SafeProviderError(first_error.error or "stream error"),
+                SafeProviderError(first_error.error or "<F>"),
                 failure_meta=first_error.meta,
             )
         else:
             yield _rebuild_error_event(
                 None,
                 decision,
-                SafeProviderError("all providers failed to produce a stream"),
+                SafeProviderError("<F>"),
             )
 
     async def _chat_stream_events_for_decision(
@@ -1127,9 +1676,15 @@ class ModelRouter:
         context: Any = None
         finalized = False
         text_parts: list[str] = []
+        thinking_parts: list[str] = []
         usage: dict[str, int] = {}
         estimated_completion_tokens = 0
         estimated_completion_bytes = 0
+        response_stream: _ProviderResponseStreamScrubber | None = None
+        exact_scrubber: ProviderSecretScrubber | None = None
+        before_completed = False
+        hook_failure: _FailureSnapshot | None = None
+        propagation_failure: _FailureSnapshot | None = None
 
         async def _before() -> Any:
             if before_model_call is None:
@@ -1162,13 +1717,17 @@ class ModelRouter:
             finalized = True
             await _after(response, error)
 
+        if permit_grant is None:
+            raise ModelPermitError("Echo model stream attempt is missing its runtime permit grant")
+        # Fail before consuming the permit or reserving an Echo finish slot if
+        # this Provider generation cannot be scrubbed safely.
+        exact_scrubber = self._scrubber_for_registered_decision(decision)
+        response_stream = _ProviderResponseStreamScrubber(exact_scrubber)
+        self._consume_model_permit(permit_grant, decision, messages, tools)
+        context = await _before()
+        before_completed = True
+
         try:
-            if permit_grant is None:
-                raise ModelPermitError(
-                    "Echo model stream attempt is missing its runtime permit grant"
-                )
-            self._consume_model_permit(permit_grant, decision, messages, tools)
-            context = await _before()
             async for raw_ev in decision.provider.chat_stream_events(
                 messages=messages,
                 model=decision.model,
@@ -1176,14 +1735,29 @@ class ModelRouter:
                 temperature=temperature,
                 max_tokens=provider_max_tokens,
             ):
+                if type(raw_ev) is not StreamEvent:
+                    raise _secret_scrub_failure()
                 if raw_ev.kind == "error":
+                    response_stream.discard()
                     # Re-scrub provider-aware: custom/legacy streams may emit raw secrets.
-                    error = _as_safe_provider_error(
+                    try:
+                        safe_raw_error = exact_scrubber.redact_text(raw_ev.error or "<F>")
+                    except ProviderSecretScrubError:
+                        raise _secret_scrub_failure() from None
+                    provisional_error = _as_safe_provider_error(
                         SafeProviderError(
-                            raw_ev.error or "stream error",
-                            retryable=bool(raw_ev.meta.get("retryable")),
+                            safe_raw_error,
+                            retryable=(
+                                isinstance(raw_ev.meta, dict)
+                                and type(raw_ev.meta.get("retryable")) is bool
+                                and raw_ev.meta["retryable"]
+                            ),
                         ),
                         decision.provider,
+                    )
+                    error = SafeProviderError(
+                        _safe_outward_message(exact_scrubber, str(provisional_error)),
+                        retryable=provisional_error.retryable,
                     )
                     failure_meta = _annotate_stream_failure(
                         error,
@@ -1191,23 +1765,31 @@ class ModelRouter:
                         usage=usage,
                         estimated_completion_tokens=estimated_completion_tokens,
                     )
+                    # Do not retain the provider-owned event across the hook
+                    # await: a hook failure traceback is an outward sink.
+                    raw_ev = StreamEvent(kind="error")
                     await _finalize(None, error)
                     yield _rebuild_error_event(
-                        raw_ev,
+                        None,
                         decision,
                         error,
                         failure_meta=failure_meta,
                     )
                     return
 
-                ev = _trusted_stream_event(raw_ev, decision)
-                if ev.kind == "text_delta" and ev.text:
-                    estimated_completion_bytes += len(ev.text.encode("utf-8"))
+                if raw_ev.kind == "text_delta":
+                    if type(raw_ev.text) is not str:
+                        raise _secret_scrub_failure()
+                    try:
+                        estimated_completion_bytes += len(raw_ev.text.encode("utf-8"))
+                    except UnicodeEncodeError:
+                        raise _secret_scrub_failure() from None
                     estimated_completion_tokens = max(
                         1,
                         (estimated_completion_bytes + 3) // 4,
                     )
                     if max_tokens is not None and estimated_completion_tokens > max_tokens:
+                        response_stream.discard()
                         budget_error = _StreamCompletionBudgetExceededError(
                             estimated_completion_tokens
                         )
@@ -1217,6 +1799,7 @@ class ModelRouter:
                             usage=usage,
                             estimated_completion_tokens=estimated_completion_tokens,
                         )
+                        raw_ev = StreamEvent(kind="error")
                         await _finalize(None, budget_error)
                         yield _rebuild_error_event(
                             None,
@@ -1225,30 +1808,115 @@ class ModelRouter:
                             failure_meta=failure_meta,
                         )
                         return
-                    text_parts.append(ev.text)
-                elif ev.kind == "usage" and ev.usage:
-                    usage = dict(ev.usage)
-                elif ev.kind == "done":
+                    safe_text = response_stream.feed_text("text_delta", raw_ev.text)
+                    if safe_text:
+                        text_parts.append(safe_text)
+                        yield StreamEvent(
+                            kind="text_delta",
+                            text=safe_text,
+                            provider=decision.provider_name,
+                            model=decision.model,
+                        )
+                elif raw_ev.kind == "thinking_delta":
+                    safe_thinking = response_stream.feed_text(
+                        "thinking_delta", raw_ev.text
+                    )
+                    if safe_thinking:
+                        thinking_parts.append(safe_thinking)
+                        yield StreamEvent(
+                            kind="thinking_delta",
+                            text=safe_thinking,
+                            provider=decision.provider_name,
+                            model=decision.model,
+                        )
+                elif raw_ev.kind == "tool_call_delta":
+                    safe_tool_delta = response_stream.feed_tool(raw_ev.tool_call)
+                    if safe_tool_delta is not None:
+                        yield StreamEvent(
+                            kind="tool_call_delta",
+                            tool_call=safe_tool_delta,
+                            provider=decision.provider_name,
+                            model=decision.model,
+                        )
+                elif raw_ev.kind == "usage":
+                    usage = _normalize_provider_usage(raw_ev.usage)
+                    yield StreamEvent(
+                        kind="usage",
+                        usage=dict(usage),
+                        provider=decision.provider_name,
+                        model=decision.model,
+                    )
+                elif raw_ev.kind == "done":
+                    text_tail, thinking_tail, tool_events, response_tools = (
+                        response_stream.finish()
+                    )
+                    if text_tail:
+                        text_parts.append(text_tail)
+                        yield StreamEvent(
+                            kind="text_delta",
+                            text=text_tail,
+                            provider=decision.provider_name,
+                            model=decision.model,
+                        )
+                    if thinking_tail:
+                        thinking_parts.append(thinking_tail)
+                        yield StreamEvent(
+                            kind="thinking_delta",
+                            text=thinking_tail,
+                            provider=decision.provider_name,
+                            model=decision.model,
+                        )
+                    for tool_event in tool_events:
+                        yield StreamEvent(
+                            kind="tool_call_delta",
+                            tool_call=tool_event,
+                            provider=decision.provider_name,
+                            model=decision.model,
+                        )
+                    raw_finish = raw_ev.finish_reason or "stop"
+                    if type(raw_finish) is not str:
+                        raise _secret_scrub_failure()
+                    try:
+                        finish_reason = exact_scrubber.redact_text(raw_finish)
+                    except ProviderSecretScrubError:
+                        raise _secret_scrub_failure() from None
+                    raw_finish = ""
+                    raw_ev = StreamEvent(kind="done")
                     await _finalize(
                         _stream_chat_response(
                             model=decision.model,
                             text="".join(text_parts),
                             usage=usage,
-                            finish_reason=ev.finish_reason or "stop",
+                            finish_reason=finish_reason,
                             estimated_completion_tokens=estimated_completion_tokens,
+                            reasoning_content="".join(thinking_parts),
+                            tool_calls=response_tools,
                         ),
                         None,
                     )
-                    yield ev
+                    yield StreamEvent(
+                        kind="done",
+                        finish_reason=finish_reason,
+                        provider=decision.provider_name,
+                        model=decision.model,
+                    )
                     return
-                yield ev
-            error = SafeProviderError("model stream ended without done event")
+                else:
+                    raise _secret_scrub_failure()
+            response_stream.discard()
+            error = SafeProviderError(
+                _safe_outward_message(
+                    exact_scrubber,
+                    "model stream ended without done event",
+                )
+            )
             failure_meta = _annotate_stream_failure(
                 error,
                 text="".join(text_parts),
                 usage=usage,
                 estimated_completion_tokens=estimated_completion_tokens,
             )
+            raw_ev = StreamEvent(kind="error")
             await _finalize(None, error)
             yield _rebuild_error_event(
                 None,
@@ -1257,43 +1925,80 @@ class ModelRouter:
                 failure_meta=failure_meta,
             )
         except BaseException as exc:
-            # Preserve Echo/permit fail-closed control errors. Only scrub unknown
-            # provider/stream failures into SafeProviderError.
-            preserve_control = isinstance(
-                exc,
-                (asyncio.CancelledError, PermissionError),
-            ) or _is_no_router_fallback(exc)
-            if context is not None and not finalized:
-                if isinstance(exc, asyncio.CancelledError) or preserve_control:
-                    cleanup_error: BaseException = exc
-                elif isinstance(exc, Exception):
-                    # Convert unknown stream-generator failures before after-hook /
-                    # logs / Echo finalizer can observe credential-bearing text.
-                    cleanup_error = _as_safe_provider_error(exc, decision.provider)
-                else:
-                    cleanup_error = RuntimeError("model stream closed early")
-                _annotate_stream_failure(
-                    cleanup_error,
-                    text="".join(text_parts),
-                    usage=usage,
-                    estimated_completion_tokens=estimated_completion_tokens,
+            # A detached outward exception must not keep the last Provider
+            # event reachable through this frame's locals.
+            raw_ev = StreamEvent(kind="error")
+            raw_finish = ""
+            if response_stream is not None:
+                response_stream.discard()
+            if isinstance(exc, GeneratorExit):
+                hook_failure = _FailureSnapshot(
+                    category="closed",
+                    message=_safe_outward_message(
+                        exact_scrubber,
+                        "model stream closed early",
+                    ),
+                    no_fallback=True,
                 )
-                if text_parts:
-                    _mark_no_router_fallback(cleanup_error)
-                try:
-                    await _finalize(None, cleanup_error)
-                except Exception as finalize_error:
-                    if isinstance(exc, (Exception, asyncio.CancelledError, GeneratorExit)):
-                        raise finalize_error from None
-                    logger.warning(
-                        "Model stream cleanup finalization failed",
-                        exc_info=True,
-                    )
-            if preserve_control:
-                raise
-            if isinstance(exc, Exception):
-                raise _as_safe_provider_error(exc, decision.provider) from None
-            raise
+                propagation_failure = _FailureSnapshot(
+                    category="generator_exit",
+                    no_fallback=True,
+                )
+            else:
+                snapshot_factory = _hook_failure_snapshot if finalized else _failure_snapshot
+                propagation_failure = snapshot_factory(
+                    exc, exact_scrubber, decision.provider
+                )
+                hook_failure = propagation_failure
+            if text_parts and hook_failure is not None:
+                hook_failure = _FailureSnapshot(
+                    category=hook_failure.category,
+                    message=hook_failure.message,
+                    retryable=hook_failure.retryable,
+                    no_fallback=True,
+                )
+            if text_parts and propagation_failure is not None:
+                propagation_failure = _FailureSnapshot(
+                    category=propagation_failure.category,
+                    message=propagation_failure.message,
+                    retryable=propagation_failure.retryable,
+                    no_fallback=True,
+                )
+
+        if hook_failure is None or propagation_failure is None:
+            return
+
+        hook_error = _materialize_failure(hook_failure)
+        if not isinstance(hook_error, GeneratorExit):
+            _annotate_stream_failure(
+                hook_error,
+                text="".join(text_parts),
+                usage=usage,
+                estimated_completion_tokens=estimated_completion_tokens,
+            )
+
+        finalize_failure: _FailureSnapshot | None = None
+        if before_completed and not finalized:
+            try:
+                await _finalize(None, hook_error)
+            except BaseException as finalize_error:
+                finalize_failure = _hook_failure_snapshot(
+                    finalize_error,
+                    exact_scrubber,
+                    decision.provider,
+                )
+        if finalize_failure is not None:
+            raise _materialize_failure(finalize_failure) from None
+
+        propagated_error = _materialize_failure(propagation_failure)
+        if not isinstance(propagated_error, GeneratorExit):
+            _annotate_stream_failure(
+                propagated_error,
+                text="".join(text_parts),
+                usage=usage,
+                estimated_completion_tokens=estimated_completion_tokens,
+            )
+        raise propagated_error from None
 
     async def health_check(self) -> dict[str, bool]:
         """Return cached provider health without performing network I/O."""
@@ -1308,4 +2013,7 @@ class ModelRouter:
             try:
                 await provider.close()
             except Exception:
-                logger.warning("Operation failed", exc_info=True)
+                continue
+        registry = getattr(self, "_registered_provider_secrets", {})
+        if type(registry) is dict:
+            registry.clear()

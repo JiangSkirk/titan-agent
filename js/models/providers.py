@@ -146,6 +146,16 @@ class ChatResponse:
 class ModelProvider(ABC):
     """Abstract base for model providers."""
 
+    def response_secret_snapshot(self) -> object:
+        """Return the credential bound to this Provider generation.
+
+        Concrete remote providers should freeze this value when they are
+        constructed.  The default keeps legacy/test providers compatible;
+        ModelRouter additionally records the value when a generation is
+        registered and never puts it on a public routing decision.
+        """
+        return getattr(getattr(self, "config", None), "api_key", None)
+
     @abstractmethod
     async def chat(
         self,
@@ -260,6 +270,11 @@ class OpenAICompatibleProvider(ModelProvider):
         allow_private: bool = False,
     ) -> None:
         self.config = config
+        # A Provider object is one immutable credential generation.  Static
+        # settings may be updated in place while an old operation is still
+        # active; lazy SDK construction and response scrubbing must therefore
+        # never re-read the mutable config credential.
+        self._credential_snapshot = config.api_key
         self._is_local = _is_local_provider(config.base_url)
         self._allow_private = allow_private is True
         self._validated_ips: tuple[str, ...] = ()
@@ -326,7 +341,7 @@ class OpenAICompatibleProvider(ModelProvider):
                 try:
                     self._transport = get_transport(
                         ttype,
-                        api_key=config.api_key,
+                        api_key=self._credential_snapshot,
                     )
                     logger.info(
                         "Provider %s using transport=%s",
@@ -349,8 +364,19 @@ class OpenAICompatibleProvider(ModelProvider):
             "Provider %s initialised (local=%s, key=%s, http2=%s)",
             config.name,
             self._is_local,
-            _credential_log_status(config.api_key),
+            _credential_log_status(self._credential_snapshot),
             self._http2,
+        )
+
+    def response_secret_snapshot(self) -> str | None:
+        """Return the immutable credential used by this Provider generation."""
+        # A small set of legacy unit fixtures construct the object with
+        # ``object.__new__`` and inject a fake client. Production construction
+        # always sets the frozen snapshot before any other Provider state.
+        return getattr(
+            self,
+            "_credential_snapshot",
+            getattr(getattr(self, "config", None), "api_key", None),
         )
 
     def _get_lifecycle_condition(self) -> asyncio.Condition:
@@ -386,6 +412,8 @@ class OpenAICompatibleProvider(ModelProvider):
         """Build and publish one pinned SDK client for a concurrent wave."""
         from js.security.net_guard import resolve_and_validate_provider_endpoint
 
+        api_key = self.response_secret_snapshot()
+
         validated = await asyncio.to_thread(
             resolve_and_validate_provider_endpoint,
             self.config.base_url,
@@ -413,17 +441,17 @@ class OpenAICompatibleProvider(ModelProvider):
         )
         client_kwargs: dict[str, Any] = {
             "base_url": self.config.base_url,
-            "api_key": self.config.api_key or "not-needed",
+            "api_key": api_key or "not-needed",
             "http_client": http_client,
             "max_retries": 0,
         }
         if (
             self.config.auth_adapter == "query_param"
-            and self.config.api_key
+            and api_key
             and self.config.query_param_name
         ):
             client_kwargs["default_query"] = {
-                self.config.query_param_name: self.config.api_key
+                self.config.query_param_name: api_key
             }
             client_kwargs["api_key"] = "not-needed"
         try:
@@ -661,7 +689,7 @@ class OpenAICompatibleProvider(ModelProvider):
                         )
                     safe_error = safe_provider_error(
                         mapped,
-                        api_key=self.config.api_key,
+                        api_key=self.response_secret_snapshot(),
                         query_param_name=getattr(self.config, "query_param_name", None),
                         retryable=is_retryable_provider_error(mapped),
                     )
@@ -690,7 +718,7 @@ class OpenAICompatibleProvider(ModelProvider):
                 raise
             _raise_as_safe_provider_error(
                 exc,
-                api_key=self.config.api_key,
+                api_key=self.response_secret_snapshot(),
                 query_param_name=getattr(self.config, "query_param_name", None),
             )
 
@@ -786,7 +814,7 @@ class OpenAICompatibleProvider(ModelProvider):
             await self.circuit.record_failure()
             _raise_as_safe_provider_error(
                 exc,
-                api_key=self.config.api_key,
+                api_key=self.response_secret_snapshot(),
                 query_param_name=getattr(self.config, "query_param_name", None),
             )
 
@@ -900,7 +928,7 @@ class OpenAICompatibleProvider(ModelProvider):
             # see scrubbed text (not a raw credential-bearing SDK exception).
             safe = safe_provider_error(
                 exc,
-                api_key=self.config.api_key,
+                api_key=self.response_secret_snapshot(),
                 query_param_name=getattr(self.config, "query_param_name", None),
                 retryable=compatibility_retry or is_retryable_provider_error(exc),
             )
