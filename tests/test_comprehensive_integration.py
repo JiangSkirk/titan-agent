@@ -593,7 +593,7 @@ class TestConfig:
     def test_provider_config_roundtrip(self) -> None:
         cfg = ModelProviderConfig(
             name="test",
-            base_url="http://localhost:1234/v1",
+            base_url="http://127.0.0.1:1234/v1",
             api_key="secret",
             default_model="gpt-4",
             models=[ModelConfig(id="gpt-4", name="GPT-4")],

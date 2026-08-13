@@ -107,7 +107,7 @@ class TestDiscoverPolicy:
     def test_private_allowed_when_opted_in(self) -> None:
         resolver = _fixed_resolver({"gpu.lan": ["192.168.1.50"]})
         ips = resolve_and_validate(
-            "http://gpu.lan:1234/v1", allow_loopback=True, allow_private=True, resolver=resolver
+            "https://gpu.lan:1234/v1", allow_loopback=True, allow_private=True, resolver=resolver
         )
         assert ips == ["192.168.1.50"]
 

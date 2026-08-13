@@ -105,6 +105,19 @@ class ModelProviderConfig(BaseModel):
         except InvalidRuntimeIdError as exc:
             raise ValueError(str(exc)) from exc
 
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        from js.security.net_guard import OutboundURLError, validate_provider_url
+
+        if not value:
+            return value
+        try:
+            validate_provider_url(value)
+            return value
+        except OutboundURLError as exc:
+            raise ValueError(str(exc)) from None
+
     @model_validator(mode="after")
     def resolve_api_key(self) -> ModelProviderConfig:
         # B1A: api_key_env is no longer resolved into api_key.

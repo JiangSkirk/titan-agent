@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NoReturn, cast
+from urllib.parse import urlparse
 
 import httpx
 from openai import AsyncOpenAI
@@ -21,6 +23,10 @@ from tenacity import (
 from js.config import ModelProviderConfig
 from js.models.circuit_breaker import CircuitBreaker
 from js.models.stream_events import StreamEvent
+from js.security.net_guard import (
+    PinnedTransport,
+    is_canonical_loopback_literal,
+)
 from js.utils.log import get_logger
 from js.utils.metrics import get_metrics, start_span
 
@@ -75,10 +81,15 @@ def _raise_as_safe_provider_error(
 
 
 def _is_local_provider(base_url: str) -> bool:
-    """Detect local model servers (LM Studio, Ollama, etc.) by URL."""
+    """Detect local model servers (LM Studio, Ollama, etc.) by URL.
+
+    Only canonical literal loopback addresses (127.0.0.0/8, ::1) are treated as
+    local.  ``localhost`` and other hostnames go through the full DNS guard.
+    """
     if not base_url:
         return False
-    return any(h in base_url for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1"))
+    hostname = (urlparse(base_url).hostname or "").lower()
+    return is_canonical_loopback_literal(hostname)
 
 
 def is_retryable_provider_error(exc: BaseException) -> bool:
@@ -242,11 +253,27 @@ class OpenAICompatibleProvider(ModelProvider):
     _SEMAPHORES: dict[str, asyncio.Semaphore] = {}
     _SEMA_LOCK = asyncio.Lock()
 
-    def __init__(self, config: ModelProviderConfig) -> None:
+    def __init__(
+        self,
+        config: ModelProviderConfig,
+        *,
+        allow_private: bool = False,
+    ) -> None:
         self.config = config
         self._is_local = _is_local_provider(config.base_url)
+        self._allow_private = allow_private is True
+        self._validated_ips: tuple[str, ...] = ()
+        self._pinned_transport: PinnedTransport | None = None
+        self._client_lock = asyncio.Lock()
+        self._client_init_task: asyncio.Task[AsyncOpenAI] | None = None
+        self._closed = False
+        self._lifecycle_condition = asyncio.Condition()
+        self._lifecycle_state = "OPEN"
+        self._active_operations = 0
+        self._close_task: asyncio.Task[None] | None = None
+        self._http_client: httpx.AsyncClient | None = None
+        self.client: AsyncOpenAI | None = None
 
-        # Local providers are more fragile — trip the breaker sooner
         cb_threshold = 3 if self._is_local else 5
         cb_recovery = 15.0 if self._is_local else 30.0
         self.circuit = CircuitBreaker(
@@ -255,60 +282,35 @@ class OpenAICompatibleProvider(ModelProvider):
             recovery_timeout=cb_recovery,
         )
 
-        # --- Optimised HTTP client ---
-        # 1. Connection pool: enough for concurrent tool calls + chat
-        # 2. HTTP/2: reduces latency for sequential requests
-        # 3. Keep-alive: avoids TLS handshake overhead on every request
-        # 4. trust_env=False: bypass system proxies for localhost
-        _limits = httpx.Limits(
+        self._http_limits = httpx.Limits(
             max_connections=20,
             max_keepalive_connections=10,
             keepalive_expiry=30.0,
         )
 
-        # Local models need longer timeouts — cold-start model loading into GPU
-        # can take 2-3 minutes (especially for large models like qwen3.5).
         if self._is_local:
             try:
                 cfg_timeout = float(config.timeout)
             except (TypeError, ValueError):
                 cfg_timeout = 120.0
             _local_timeout = max(cfg_timeout, 300.0)
-            _timeout = httpx.Timeout(
+            self._http_timeout = httpx.Timeout(
                 _local_timeout,
                 connect=3.0,
                 read=_local_timeout,
                 write=10.0,
                 pool=3.0,
             )
-            _http2 = False  # Many local servers don't support HTTP/2 well
+            self._http2 = False
         else:
-            _timeout = httpx.Timeout(
+            self._http_timeout = httpx.Timeout(
                 config.timeout,
                 connect=8.0,
                 read=config.timeout,
                 write=15.0,
                 pool=5.0,
             )
-            _http2 = True
-
-        _http_client = httpx.AsyncClient(
-            trust_env=False,
-            timeout=_timeout,
-            limits=_limits,
-            http2=_http2,
-        )
-
-        client_kwargs: dict[str, Any] = {
-            "base_url": config.base_url,
-            "api_key": config.api_key or "not-needed",
-            "http_client": _http_client,
-            "max_retries": 0,  # We handle retries ourselves
-        }
-        if config.auth_adapter == "query_param" and config.api_key and config.query_param_name:
-            client_kwargs["default_query"] = {config.query_param_name: config.api_key}
-            client_kwargs["api_key"] = "not-needed"  # Prevent Authorization Bearer token
-        self.client = AsyncOpenAI(**client_kwargs)
+            self._http2 = True
 
         self._last_health_check = 0.0
         self._health_status = False
@@ -348,8 +350,167 @@ class OpenAICompatibleProvider(ModelProvider):
             config.name,
             self._is_local,
             _credential_log_status(config.api_key),
-            _http2,
+            self._http2,
         )
+
+    def _get_lifecycle_condition(self) -> asyncio.Condition:
+        """Return lifecycle state, lazily initialising legacy test fixtures."""
+        condition = getattr(self, "_lifecycle_condition", None)
+        if condition is None:
+            condition = asyncio.Condition()
+            self._lifecycle_condition = condition
+            self._lifecycle_state = "CLOSED" if getattr(self, "_closed", False) else "OPEN"
+            self._active_operations = 0
+            self._close_task = None
+        return condition
+
+    @asynccontextmanager
+    async def _operation_lease(self) -> AsyncIterator[None]:
+        """Prevent the SDK client from closing while one operation is active."""
+        condition = self._get_lifecycle_condition()
+        async with condition:
+            if getattr(self, "_lifecycle_state", "OPEN") != "OPEN" or getattr(
+                self, "_closed", False
+            ):
+                raise RuntimeError("provider is closing or closed")
+            self._active_operations = getattr(self, "_active_operations", 0) + 1
+        try:
+            yield
+        finally:
+            async with condition:
+                self._active_operations -= 1
+                if self._active_operations == 0:
+                    condition.notify_all()
+
+    async def _initialise_client(self) -> AsyncOpenAI:
+        """Build and publish one pinned SDK client for a concurrent wave."""
+        from js.security.net_guard import resolve_and_validate_provider_endpoint
+
+        validated = await asyncio.to_thread(
+            resolve_and_validate_provider_endpoint,
+            self.config.base_url,
+            allow_private=getattr(self, "_allow_private", False) is True,
+        )
+        if not validated:
+            raise RuntimeError("provider endpoint produced no validated address")
+
+        http2 = getattr(self, "_http2", False)
+        limits = getattr(self, "_http_limits", httpx.Limits())
+        transport = PinnedTransport(
+            validated[0],
+            verify=True,
+            trust_env=False,
+            http2=http2,
+            limits=limits,
+        )
+        http_client = httpx.AsyncClient(
+            trust_env=False,
+            timeout=getattr(self, "_http_timeout", self.config.timeout),
+            limits=limits,
+            http2=http2,
+            follow_redirects=False,
+            transport=transport,
+        )
+        client_kwargs: dict[str, Any] = {
+            "base_url": self.config.base_url,
+            "api_key": self.config.api_key or "not-needed",
+            "http_client": http_client,
+            "max_retries": 0,
+        }
+        if (
+            self.config.auth_adapter == "query_param"
+            and self.config.api_key
+            and self.config.query_param_name
+        ):
+            client_kwargs["default_query"] = {
+                self.config.query_param_name: self.config.api_key
+            }
+            client_kwargs["api_key"] = "not-needed"
+        try:
+            client = AsyncOpenAI(**client_kwargs)
+        except BaseException:
+            await http_client.aclose()
+            raise
+
+        lock = getattr(self, "_client_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_lock = lock
+        async with lock:
+            # This task can only be created while _ensure_client still sees an
+            # OPEN provider.  If close begins afterwards, _finish_close waits
+            # for this exact task (and for its owning operation lease) before
+            # closing the published client.  Rejecting publication here would
+            # abort an operation that was already authorised before CLOSING.
+            existing = cast("AsyncOpenAI | None", getattr(self, "client", None))
+            if existing is not None:
+                await http_client.aclose()
+                return existing
+            self._validated_ips = tuple(validated)
+            self._pinned_transport = transport
+            self._http_client = http_client
+            self.client = client
+            return client
+
+    def _client_initialisation_done(self, task: asyncio.Task[AsyncOpenAI]) -> None:
+        """Consume an orphaned result and make the next failed wave retryable."""
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        asyncio.create_task(self._clear_client_init_task(task))
+
+    async def _clear_client_init_task(self, task: asyncio.Task[AsyncOpenAI]) -> None:
+        lock = getattr(self, "_client_lock", None)
+        if lock is None:
+            return
+        async with lock:
+            if getattr(self, "_client_init_task", None) is task:
+                self._client_init_task = None
+
+    async def _ensure_client(self) -> AsyncOpenAI:
+        """Create one shared SDK client after DNS validation and IP pinning."""
+        if getattr(self, "_closed", False) or getattr(
+            self, "_lifecycle_state", "OPEN"
+        ) != "OPEN":
+            raise RuntimeError("provider is closed")
+        existing = cast("AsyncOpenAI | None", getattr(self, "client", None))
+        if existing is not None:
+            return existing
+
+        lock = getattr(self, "_client_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_lock = lock
+        async with lock:
+            if (
+                getattr(self, "_closed", False)
+                or getattr(self, "_lifecycle_state", "OPEN") != "OPEN"
+            ):
+                raise RuntimeError("provider is closed")
+            existing = cast("AsyncOpenAI | None", getattr(self, "client", None))
+            if existing is not None:
+                return existing
+            task = getattr(self, "_client_init_task", None)
+            if task is None:
+                task = asyncio.create_task(self._initialise_client())
+                self._client_init_task = task
+                task.add_done_callback(self._client_initialisation_done)
+
+        return await asyncio.shield(task)
+
+    async def _get_or_create_pinned_transport(
+        self,
+        *,
+        allow_private: bool = False,
+    ) -> PinnedTransport:
+        if allow_private is not getattr(self, "_allow_private", False):
+            raise ValueError("provider private-network authority mismatch")
+        await self._ensure_client()
+        transport = self._pinned_transport
+        if transport is None:
+            raise RuntimeError("provider transport is unavailable")
+        return transport
 
     def _convert_messages(self, messages: list[ChatMessage]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -428,9 +589,10 @@ class OpenAICompatibleProvider(ModelProvider):
                         logger.warning("Suppressed error", exc_info=True)
 
                     # Concurrency gate: prevent overwhelming the endpoint
+                    client = await self._ensure_client()
                     sem = await self._semaphore()
                     async with sem:
-                        response = await self.client.chat.completions.create(**kwargs)
+                        response = await client.chat.completions.create(**kwargs)
 
                     choice = response.choices[0]
                     message = choice.message
@@ -519,7 +681,8 @@ class OpenAICompatibleProvider(ModelProvider):
                     reraise_safe_provider_error(safe_error)
 
         try:
-            return await self.circuit.execute(_do_chat())  # type: ignore[no-any-return]
+            async with self._operation_lease():
+                return await self.circuit.execute(_do_chat())  # type: ignore[no-any-return]
         except Exception as exc:
             from js.models.capability import SafeProviderError
 
@@ -539,6 +702,28 @@ class OpenAICompatibleProvider(ModelProvider):
         temperature: float = 0.7,
         max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
+        async with self._operation_lease():
+            stream = self._chat_stream_with_lease(
+                messages=messages,
+                model=model,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            try:
+                async for token in stream:
+                    yield token
+            finally:
+                await stream.aclose()
+
+    async def _chat_stream_with_lease(
+        self,
+        messages: list[ChatMessage],
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[str, None]:
         if not await self.circuit.can_execute():
             raise RuntimeError(f"Circuit breaker OPEN for {self.config.name}")
 
@@ -565,9 +750,10 @@ class OpenAICompatibleProvider(ModelProvider):
         try:
             # Use ``async with`` so the stream is closed cleanly even if the
             # async-for loop is cancelled or interrupted.
+            client = await self._ensure_client()
             sem = await self._semaphore()
             async with sem:
-                stream = await self.client.chat.completions.create(**kwargs)
+                stream = await client.chat.completions.create(**kwargs)
             async with stream as stream_ctx:
                 async for chunk in stream_ctx:
                     if getattr(chunk, "usage", None):
@@ -612,6 +798,28 @@ class OpenAICompatibleProvider(ModelProvider):
         temperature: float = 0.7,
         max_tokens: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        async with self._operation_lease():
+            stream = self._chat_stream_events_with_lease(
+                messages=messages,
+                model=model,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            try:
+                async for event in stream:
+                    yield event
+            finally:
+                await stream.aclose()
+
+    async def _chat_stream_events_with_lease(
+        self,
+        messages: list[ChatMessage],
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
         """OpenAI-compatible structured event stream.
 
         Unlike the legacy ``chat_stream()`` (which only yields text fragments),
@@ -651,9 +859,10 @@ class OpenAICompatibleProvider(ModelProvider):
             kwargs.pop("stream_options", None)
         done_emitted = False
         try:
+            client = await self._ensure_client()
             sem = await self._semaphore()
             async with sem:
-                stream = await self.client.chat.completions.create(**kwargs)
+                stream = await client.chat.completions.create(**kwargs)
             async with stream as stream_ctx:
                 async for chunk in stream_ctx:
                     for ev in parse_openai_chunk(chunk):
@@ -706,6 +915,10 @@ class OpenAICompatibleProvider(ModelProvider):
             )
 
     async def health_check(self) -> bool:
+        async with self._operation_lease():
+            return await self._health_check_with_lease()
+
+    async def _health_check_with_lease(self) -> bool:
         # Fast path: return cached result without lock
         now = time.time()
         # Local providers change state frequently (model loading/unloading) -
@@ -727,7 +940,8 @@ class OpenAICompatibleProvider(ModelProvider):
                 # kwarg in all versions, so we use asyncio.wait_for instead.
                 # Local providers should respond very fast.
                 hc_timeout = 4.0 if self._is_local else 8.0
-                await asyncio.wait_for(self.client.models.list(), timeout=hc_timeout)
+                client = await self._ensure_client()
+                await asyncio.wait_for(client.models.list(), timeout=hc_timeout)
                 self._health_status = True
                 # Do NOT record health-check success to circuit — only real calls should
                 # affect the breaker. Otherwise routine health checks can keep the
@@ -771,15 +985,73 @@ class OpenAICompatibleProvider(ModelProvider):
         )
 
         async def _do_embed() -> list[list[float]]:
+            client = await self._ensure_client()
             sem = await self._semaphore()
             async with sem:
-                response = await self.client.embeddings.create(
+                response = await client.embeddings.create(
                     model=resolved_model,
                     input=texts,
                 )
             return [item.embedding for item in response.data]
 
-        return await self.circuit.execute(_do_embed())  # type: ignore[no-any-return]
+        async with self._operation_lease():
+            return await self.circuit.execute(_do_embed())  # type: ignore[no-any-return]
 
     async def close(self) -> None:
-        await self.client.close()
+        condition = self._get_lifecycle_condition()
+        async with condition:
+            task = getattr(self, "_close_task", None)
+            if getattr(self, "_lifecycle_state", "OPEN") == "CLOSED":
+                return
+            if task is None or task.done():
+                self._lifecycle_state = "CLOSING"
+                self._closed = True
+                task = asyncio.create_task(self._finish_close())
+                self._close_task = task
+                task.add_done_callback(self._close_task_done)
+        await asyncio.shield(task)
+
+    @staticmethod
+    def _close_task_done(task: asyncio.Task[None]) -> None:
+        """Retrieve background close failures without changing await semantics."""
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    async def _finish_close(self) -> None:
+        condition = self._get_lifecycle_condition()
+        client: AsyncOpenAI | None = None
+        try:
+            async with condition:
+                while getattr(self, "_active_operations", 0):
+                    await condition.wait()
+
+            init_task = getattr(self, "_client_init_task", None)
+            if init_task is not None:
+                try:
+                    await asyncio.shield(init_task)
+                except BaseException:
+                    pass
+
+            lock = getattr(self, "_client_lock", None)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._client_lock = lock
+            async with lock:
+                client = getattr(self, "client", None)
+            if client is not None:
+                await client.close()
+            async with lock:
+                if getattr(self, "client", None) is client:
+                    self.client = None
+                    self._http_client = None
+                    self._pinned_transport = None
+                    self._validated_ips = ()
+        except BaseException:
+            async with condition:
+                condition.notify_all()
+            raise
+        async with condition:
+            self._lifecycle_state = "CLOSED"
+            condition.notify_all()

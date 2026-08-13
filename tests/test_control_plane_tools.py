@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -22,9 +22,16 @@ from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runt
 from js.models.provider_manager import ProviderManager, ProviderManagerError
 from js.provider_credential_types import ProviderCredentialRefV1
 from js.search.engines import SearchResult
+from js.security.net_guard import OutboundURLError
 from js.security.provider_credentials import fake_keychain_store
 from js.security.secrets import SecretManager
-from js.tools.registry import ToolRegistry, ToolResult, ToolSpec, required_network_hosts
+from js.tools.registry import (
+    ToolRegistry,
+    ToolResult,
+    ToolSpec,
+    network_authorization_error,
+    required_network_hosts,
+)
 
 _TEST_DURABLE_EXECUTOR = EchoDurableExecutor(
     max_claim_pending=8,
@@ -465,6 +472,103 @@ async def test_provider_discovery_uses_one_time_in_memory_key_and_exact_host_lea
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("settings_authority", "tool_claim", "expected_success", "expected_allow"),
+    [
+        (False, False, True, False),
+        (False, True, False, None),
+        (True, False, True, False),
+        (True, True, True, True),
+    ],
+)
+async def test_provider_discovery_private_authority_comes_only_from_settings(
+    settings_authority: bool,
+    tool_claim: bool,
+    expected_success: bool,
+    expected_allow: bool | None,
+    tmp_path: Path,
+) -> None:
+    executor = _ControlExecutor(tmp_path)
+    executor.settings.security.allow_private_model_providers = settings_authority
+    executor._register_control_plane_tools()
+    arguments = {
+        "base_url": "https://models.example/v1",
+        "api_key_ref": "",
+        "allow_private": tool_claim,
+    }
+    run_id = "provider-discovery-authority"
+    token = set_runtime_context(
+        _network_runtime_context(
+            executor,
+            tool_name="control_provider_discover",
+            arguments=arguments,
+            run_id=run_id,
+        )
+    )
+    try:
+        _message, result = await executor._execute_tool_call(
+            {
+                "id": "provider-discovery-authority-call",
+                "function": {
+                    "name": "control_provider_discover",
+                    "arguments": json.dumps(arguments),
+                },
+            },
+            session_id="admin-control-plane",
+            run_id=run_id,
+            user_input="Admin approved exact provider discovery",
+            allowed_tools={"control_provider_discover"},
+            owner_key_hash="admin-owner",
+        )
+    finally:
+        reset_runtime_context(token)
+
+    assert result.success is expected_success
+    if expected_allow is None:
+        executor.provider_manager.discover_models.assert_not_awaited()
+        assert result.metadata == {"status_code": 403}
+    else:
+        executor.provider_manager.discover_models.assert_awaited_once_with(
+            "https://models.example/v1",
+            None,
+            allow_private=expected_allow,
+        )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "allow_private", "expected_allowed"),
+    [
+        ("http://127.0.0.2:1234/v1", False, True),
+        ("http://[::1]:1234/v1", False, True),
+        ("https://10.0.0.2/v1", True, True),
+        ("https://[fc00::1]/v1", True, True),
+        ("https://[fc00::1]/v1", False, False),
+        ("https://[fd00:ec2::254]/v1", True, False),
+        ("https://[::ffff:127.0.0.1]/v1", True, False),
+    ],
+)
+def test_provider_discovery_echo_lease_matches_central_ip_policy(
+    base_url: str,
+    allow_private: bool,
+    expected_allowed: bool,
+) -> None:
+    arguments = {
+        "base_url": base_url,
+        "api_key_ref": "",
+        "allow_private": allow_private,
+    }
+    allowed_hosts = required_network_hosts("control_provider_discover", arguments)
+
+    error = network_authorization_error(
+        "control_provider_discover",
+        arguments,
+        allowed_hosts,
+    )
+
+    assert (error is None) is expected_allowed
 
 
 @pytest.mark.asyncio
@@ -1530,20 +1634,24 @@ async def test_provider_mutation_runs_inside_echo_and_consumes_opaque_key_once(
         )
     )
     try:
-        _message, result = await executor._execute_tool_call(
-            {
-                "id": "provider-mutation-call",
-                "function": {
-                    "name": "control_provider_mutate",
-                    "arguments": json.dumps(arguments),
+        with patch(
+            "js.security.net_guard.resolve_and_validate_provider_endpoint",
+            return_value=["93.184.216.34"],
+        ):
+            _message, result = await executor._execute_tool_call(
+                {
+                    "id": "provider-mutation-call",
+                    "function": {
+                        "name": "control_provider_mutate",
+                        "arguments": json.dumps(arguments),
+                    },
                 },
-            },
-            session_id="admin-control-plane",
-            run_id=run_id,
-            user_input="Admin approved provider mutation",
-            allowed_tools={"control_provider_mutate"},
-            owner_key_hash="admin-owner",
-        )
+                session_id="admin-control-plane",
+                run_id=run_id,
+                user_input="Admin approved provider mutation",
+                allowed_tools={"control_provider_mutate"},
+                owner_key_hash="admin-owner",
+            )
     finally:
         reset_runtime_context(token)
 
@@ -1567,6 +1675,112 @@ async def test_provider_mutation_runs_inside_echo_and_consumes_opaque_key_once(
             session_id="admin-control-plane",
         )
         is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["upsert", "update_key"])
+async def test_provider_mutation_preflights_endpoint_before_key_or_persistence(
+    action: str,
+    tmp_path: Path,
+) -> None:
+    executor = _ControlExecutor(tmp_path)
+    store, _backend = fake_keychain_store()
+    executor.provider_manager = ProviderManager(
+        executor.settings.state_dir,
+        store,
+        product_id="js-agent",
+    )
+    existing = ModelProviderConfig(
+        name="custom",
+        base_url="https://models.example/v1",
+        api_key="old-secret",
+        default_model="model-a",
+        models=[ModelConfig(id="model-a", name="Model A", provider="custom")],
+    )
+    if action == "update_key":
+        executor.provider_manager.add(existing)
+        persisted = executor.provider_manager.get("custom")
+        assert persisted is not None
+        executor.settings.providers = [persisted]
+    executor._register_control_plane_tools()
+    key_ref = executor.stage_provider_discovery_key(
+        "new-secret-must-remain-opaque",
+        owner_key_hash="admin-owner",
+        product_id="js-agent",
+        session_id="admin-control-plane",
+    )
+    if action == "upsert":
+        arguments: dict[str, Any] = {
+            "action": "upsert",
+            "provider": {
+                "name": "custom",
+                "base_url": "https://models.example/v1",
+                "default_model": "model-a",
+                "models": [
+                    {"id": "model-a", "name": "Model A", "provider": "custom"}
+                ],
+            },
+            "api_key_ref": key_ref,
+        }
+    else:
+        arguments = {
+            "action": "update_key",
+            "name": "custom",
+            "api_key_ref": key_ref,
+        }
+    provider_file = executor.settings.state_dir / "providers.json"
+    before_file = provider_file.read_bytes() if provider_file.exists() else None
+    before_settings = executor.settings.providers.copy()
+    run_id = f"provider-preflight-{action}"
+    token = set_runtime_context(
+        _network_runtime_context(
+            executor,
+            tool_name="control_provider_mutate",
+            arguments=arguments,
+            run_id=run_id,
+        )
+    )
+    try:
+        with patch(
+            "js.security.net_guard.resolve_and_validate_provider_endpoint",
+            side_effect=OutboundURLError("blocked synthetic destination"),
+        ) as resolver:
+            _message, result = await executor._execute_tool_call(
+                {
+                    "id": f"provider-preflight-{action}-call",
+                    "function": {
+                        "name": "control_provider_mutate",
+                        "arguments": json.dumps(arguments),
+                    },
+                },
+                session_id="admin-control-plane",
+                run_id=run_id,
+                user_input="Admin approved provider mutation",
+                allowed_tools={"control_provider_mutate"},
+                owner_key_hash="admin-owner",
+            )
+    finally:
+        reset_runtime_context(token)
+
+    assert result.success is False
+    assert result.metadata == {"status_code": 400}
+    resolver.assert_called_once_with(
+        "https://models.example/v1",
+        allow_private=False,
+    )
+    assert (provider_file.read_bytes() if provider_file.exists() else None) == before_file
+    assert executor.settings.providers == before_settings
+    executor.router.add_provider.assert_not_called()
+    executor.router.remove_provider.assert_not_called()
+    assert (
+        executor.take_provider_discovery_key(
+            key_ref,
+            owner_key_hash="admin-owner",
+            product_id="js-agent",
+            session_id="admin-control-plane",
+        )
+        == "new-secret-must-remain-opaque"
     )
 
 
@@ -1709,6 +1923,7 @@ async def test_provider_mutation_rejects_static_dynamic_name_shadow_without_side
 
 @pytest.mark.asyncio
 async def test_static_provider_key_is_encrypted_and_restart_hydratable(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     from js.models.provider_manager import hydrate_static_provider_api_keys
@@ -1745,6 +1960,10 @@ async def test_static_provider_key_is_encrypted_and_restart_hydratable(
         protected_refs=[old_ref],
     )
     executor._register_control_plane_tools()
+    monkeypatch.setattr(
+        "js.security.net_guard.resolve_and_validate_provider_endpoint",
+        lambda *_args, **_kwargs: ["93.184.216.34"],
+    )
     key_ref = executor.stage_provider_discovery_key(
         "static-super-secret",
         owner_key_hash="admin-owner",
@@ -1852,6 +2071,10 @@ async def test_static_provider_router_failure_and_config_rollback_failure_blocks
         original_save(self, *args, **kwargs)
 
     monkeypatch.setattr(JSSettings, "save", fail_rollback_save)
+    monkeypatch.setattr(
+        "js.security.net_guard.resolve_and_validate_provider_endpoint",
+        lambda *_args, **_kwargs: ["93.184.216.34"],
+    )
     executor._register_control_plane_tools()
     key_ref = executor.stage_provider_discovery_key(
         secret,
@@ -1989,6 +2212,10 @@ async def test_provider_mutation_error_logs_never_include_sdk_secret(
     monkeypatch.setattr(
         "js.models.providers.OpenAICompatibleProvider",
         lambda _config: object(),
+    )
+    monkeypatch.setattr(
+        "js.security.net_guard.resolve_and_validate_provider_endpoint",
+        lambda *_args, **_kwargs: ["93.184.216.34"],
     )
     if action == "upsert":
         executor.provider_manager.add.side_effect = RuntimeError(

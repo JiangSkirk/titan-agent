@@ -1401,6 +1401,14 @@ class ToolExecutorMixin(AgentBase):
         from js.tools.registry import ToolParam, ToolSpec
 
         provider_mutation_lock = asyncio.Lock()
+        allow_private_model_providers = (
+            getattr(
+                getattr(self.settings, "security", None),
+                "allow_private_model_providers",
+                False,
+            )
+            is True
+        )
         setup_mutation_lock = asyncio.Lock()
         desktop_mutation_lock = asyncio.Lock()
         session_mutation_lock = asyncio.Lock()
@@ -1570,6 +1578,8 @@ class ToolExecutorMixin(AgentBase):
                 return failure("api_key_ref must be a string", 400)
             if not isinstance(allow_private, bool):
                 return failure("allow_private must be a boolean", 400)
+            if allow_private and not allow_private_model_providers:
+                return failure("Private provider access is not authorized", 403)
             api_key = None
             if api_key_ref:
                 api_key = self.take_provider_discovery_key(api_key_ref)
@@ -1578,7 +1588,7 @@ class ToolExecutorMixin(AgentBase):
             result = await self.provider_manager.discover_models(
                 base_url.strip(),
                 api_key,
-                allow_private=allow_private,
+                allow_private=allow_private_model_providers and allow_private,
             )
             if "error" in result:
                 return failure(str(result["error"]), 502)
@@ -1615,6 +1625,30 @@ class ToolExecutorMixin(AgentBase):
 
             from js.config import ModelProviderConfig
             from js.models.providers import OpenAICompatibleProvider
+            from js.security.net_guard import (
+                OutboundURLError,
+                resolve_and_validate_provider_endpoint,
+            )
+
+            async def preflight_endpoint(base_url: str) -> ToolResult | None:
+                try:
+                    await asyncio.to_thread(
+                        resolve_and_validate_provider_endpoint,
+                        base_url,
+                        allow_private=allow_private_model_providers,
+                    )
+                except OutboundURLError:
+                    return failure(
+                        "Provider endpoint was rejected by the network security policy",
+                        400,
+                    )
+                except Exception as exc:  # noqa: BLE001 - fail closed at mutation boundary
+                    log_provider_mutation_failure("error", "endpoint_preflight", exc)
+                    return failure(
+                        "Provider endpoint could not be verified safely",
+                        500,
+                    )
+                return None
 
             api_key: str | None = None
             async with provider_mutation_lock:
@@ -1646,6 +1680,9 @@ class ToolExecutorMixin(AgentBase):
                     blocked = provider_mutation_guard_failure()
                     if blocked is not None:
                         return blocked
+                    endpoint_failure = await preflight_endpoint(cfg.base_url)
+                    if endpoint_failure is not None:
+                        return endpoint_failure
                     if api_key_ref:
                         api_key = self.take_provider_discovery_key(api_key_ref)
                         if api_key is None:
@@ -1668,7 +1705,10 @@ class ToolExecutorMixin(AgentBase):
                         self.settings.providers.append(canonical)
                         self.router.add_provider(
                             canonical.name,
-                            OpenAICompatibleProvider(canonical),
+                            OpenAICompatibleProvider(
+                                canonical,
+                                allow_private=allow_private_model_providers,
+                            ),
                             list(canonical.models),
                         )
                     except Exception as exc:  # noqa: BLE001 - effect boundary
@@ -1682,7 +1722,10 @@ class ToolExecutorMixin(AgentBase):
                                 self.provider_manager.add(previous_dynamic)
                                 self.router.add_provider(
                                     previous_dynamic.name,
-                                    OpenAICompatibleProvider(previous_dynamic),
+                                    OpenAICompatibleProvider(
+                                        previous_dynamic,
+                                        allow_private=allow_private_model_providers,
+                                    ),
                                     list(previous_dynamic.models),
                                 )
                         except Exception as rollback_exc:
@@ -1728,6 +1771,11 @@ class ToolExecutorMixin(AgentBase):
                 if blocked is not None:
                     return blocked
 
+                if action == "update_key":
+                    endpoint_failure = await preflight_endpoint(target.base_url)
+                    if endpoint_failure is not None:
+                        return endpoint_failure
+
                 api_key = None
                 if api_key_ref:
                     api_key = self.take_provider_discovery_key(api_key_ref)
@@ -1769,7 +1817,10 @@ class ToolExecutorMixin(AgentBase):
                         self.router.remove_provider(normalized_name)
                         self.router.add_provider(
                             normalized_name,
-                            OpenAICompatibleProvider(target),
+                            OpenAICompatibleProvider(
+                                target,
+                                allow_private=allow_private_model_providers,
+                            ),
                             list(target.models),
                         )
                     except Exception as exc:  # noqa: BLE001 - effect boundary
@@ -1810,7 +1861,10 @@ class ToolExecutorMixin(AgentBase):
                             self.router.remove_provider(normalized_name)
                             self.router.add_provider(
                                 normalized_name,
-                                OpenAICompatibleProvider(target),
+                                OpenAICompatibleProvider(
+                                    target,
+                                    allow_private=allow_private_model_providers,
+                                ),
                                 list(target.models),
                             )
                         except Exception as rollback_exc:
@@ -1885,7 +1939,10 @@ class ToolExecutorMixin(AgentBase):
                             )
                         self.router.add_provider(
                             normalized_name,
-                            OpenAICompatibleProvider(target),
+                            OpenAICompatibleProvider(
+                                target,
+                                allow_private=allow_private_model_providers,
+                            ),
                             list(target.models),
                         )
                     except Exception as rollback_exc:

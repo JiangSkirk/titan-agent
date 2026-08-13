@@ -178,7 +178,12 @@ class JSAgent(
             self.settings.providers.append(dyn_cfg)
             self.router.add_provider(
                 dyn_cfg.name,
-                OpenAICompatibleProvider(dyn_cfg),
+                OpenAICompatibleProvider(
+                    dyn_cfg,
+                    allow_private=(
+                        self.settings.security.allow_private_model_providers is True
+                    ),
+                ),
                 dyn_cfg.models,
             )
         self.guard = BehaviorGuard(settings.security, settings.workspace)
@@ -1025,6 +1030,9 @@ class JSAgent(
                     base_url=cfg.base_url,
                     api_key=cfg.api_key or "dummy",
                     model=cfg.embedding_model,
+                    allow_private=(
+                        self.settings.security.allow_private_model_providers is True
+                    ),
                 )
                 hybrid = HybridEmbedder(
                     primary=primary,

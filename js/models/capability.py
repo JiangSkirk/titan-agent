@@ -416,7 +416,11 @@ async def probe_provider(
     """
     import httpx
 
-    from js.security.net_guard import OutboundURLError, PinnedTransport, resolve_and_validate
+    from js.security.net_guard import (
+        OutboundURLError,
+        PinnedTransport,
+        resolve_and_validate_provider_endpoint,
+    )
 
     start = time.perf_counter()
     transport_kind = _detect_transport(base_url, transport)
@@ -431,12 +435,9 @@ async def probe_provider(
         )
 
     # SSRF / private-IP / metadata-IP guard (mirror provider_manager.discover_models).
-    hostname = (urlparse(base_url).hostname or "").lower()
-    is_local_literal = hostname in ("localhost", "127.0.0.1", "::1")
     try:
-        validated_ips = resolve_and_validate(
+        validated_ips = resolve_and_validate_provider_endpoint(
             base_url,
-            allow_loopback=is_local_literal,
             allow_private=allow_private,
         )
     except OutboundURLError as exc:
@@ -468,13 +469,27 @@ async def probe_provider(
 
     try:
         async with httpx.AsyncClient(
-            transport=PinnedTransport(validated_ips[0], verify=True),
+            transport=PinnedTransport(
+                validated_ips[0],
+                verify=True,
+                trust_env=False,
+            ),
             timeout=timeout,
             trust_env=False,
+            follow_redirects=False,
         ) as client:
             resp = await client.get(url, headers=headers)
             latency_ms = (time.perf_counter() - start) * 1000
 
+            if 300 <= resp.status_code < 400:
+                return ProbeResult(
+                    ok=False,
+                    status=resp.status_code,
+                    latency_ms=latency_ms,
+                    error="redirects are not allowed",
+                    transport=transport_kind,
+                    base_url=base_url,
+                )
             if resp.status_code == 401 or resp.status_code == 403:
                 return ProbeResult(
                     ok=False,

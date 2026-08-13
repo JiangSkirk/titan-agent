@@ -13,7 +13,6 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from js.config import ModelProviderConfig
 from js.provider_credential_types import ProductId, ProviderCredentialRefV1
@@ -826,17 +825,15 @@ class ProviderManager:
         """
         import httpx
 
-        from js.security.net_guard import OutboundURLError, PinnedTransport, resolve_and_validate
+        from js.security.net_guard import (
+            OutboundURLError,
+            PinnedTransport,
+            resolve_and_validate_provider_endpoint,
+        )
 
-        # Only explicit local literals get the loopback exemption; everything
-        # else (including loopback-resolving domains) must clear the remote
-        # policy, where loopback is forbidden.
-        hostname = (urlparse(base_url).hostname or "").lower()
-        is_local_literal = hostname in ("localhost", "127.0.0.1", "::1")
         try:
-            validated_ips = resolve_and_validate(
+            validated_ips = resolve_and_validate_provider_endpoint(
                 base_url,
-                allow_loopback=is_local_literal,
                 allow_private=allow_private,
             )
         except OutboundURLError as exc:
@@ -851,9 +848,11 @@ class ProviderManager:
                 transport=PinnedTransport(
                     validated_ips[0],
                     verify=True,
+                    trust_env=False,
                 ),
                 timeout=30.0,
                 trust_env=False,
+                follow_redirects=False,
             ) as client:
                 # Enhanced LM Studio metadata must use the same DNS-validated,
                 # IP-pinned transport as the authoritative /v1/models call.

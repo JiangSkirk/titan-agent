@@ -1683,6 +1683,7 @@ def create_app(
             allow_private=False,
             channel="provider_add_cloud",
         )
+        _raise_control_tool_error(discovered_result, default_status=502)
         discovered = discovered_result.metadata
         if discovered_result.success and discovered.get("models"):
             from js.config import ModelConfig

@@ -34,7 +34,7 @@ class TestResolveAndValidateReturnsIPs:
             return ["93.184.216.34"]  # example.com
 
         ips = resolve_and_validate(
-            "http://example.com/path",
+            "https://example.com/path",
             resolver=mock_resolver,
         )
         assert ips == ["93.184.216.34"]
@@ -45,7 +45,7 @@ class TestResolveAndValidateReturnsIPs:
             return ["1.2.3.4", "1.2.3.5"]
 
         ips = resolve_and_validate(
-            "http://example.com",
+            "https://example.com",
             resolver=mock_resolver,
         )
         assert ips == ["1.2.3.4", "1.2.3.5"]
@@ -56,7 +56,7 @@ class TestResolveAndValidateReturnsIPs:
             return ["127.0.0.1"]
 
         with pytest.raises(OutboundURLError, match="loopback"):
-            resolve_and_validate("http://evil.com", resolver=mock_resolver)
+            resolve_and_validate("https://evil.com", resolver=mock_resolver)
 
     def test_rejects_metadata_ip_even_with_mock_resolver(self) -> None:
         """Cloud metadata addresses are always rejected."""
@@ -64,7 +64,7 @@ class TestResolveAndValidateReturnsIPs:
             return ["169.254.169.254"]
 
         with pytest.raises(OutboundURLError, match="metadata"):
-            resolve_and_validate("http://evil.com", resolver=mock_resolver)
+            resolve_and_validate("https://evil.com", resolver=mock_resolver)
 
 
 class TestPinnedIPBackend:
@@ -155,7 +155,7 @@ class TestDNSRebindingDefense:
             return ["1.2.3.4"]
 
         validated_ips = resolve_and_validate(
-            "http://rebinding-test.example/path",
+            "https://rebinding-test.example/path",
             resolver=first_resolve,
         )
         assert validated_ips == ["1.2.3.4"]
@@ -245,7 +245,7 @@ class TestDNSRebindingDefense:
 
         with (
             patch(
-                "js.security.net_guard.resolve_and_validate",
+                "js.security.net_guard.resolve_and_validate_provider_endpoint",
                 return_value=["1.2.3.4"],
             ) as mock_resolve,
             patch(
@@ -268,7 +268,7 @@ class TestDNSRebindingDefense:
             mock_client.get = AsyncMock(return_value=mock_response)
 
             await ProviderManager.discover_models(
-                "http://example.com/v1", api_key="test"
+                "https://example.com/v1", api_key="test"
             )
 
             mock_resolve.assert_called_once()

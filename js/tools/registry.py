@@ -19,6 +19,7 @@ from js.config import ToolLimits
 from js.echo.primitives import stable_payload_hash
 from js.echo.turn_context import current_runtime_context
 from js.security.guard import BehaviorGuard, SecurityDecisionType
+from js.security.net_guard import is_blocked_ip, is_canonical_loopback_literal
 from js.utils.log import get_logger
 from js.utils.metrics import get_metrics, start_span
 
@@ -380,22 +381,10 @@ def network_authorization_error(
                     else _unsafe_network_host_error(canonical)
                 )
             else:
-                explicit_loopback = address.is_loopback and canonical in {
-                    "127.0.0.1",
-                    "::1",
-                }
-                explicit_private = bool(arguments.get("allow_private")) and any(
-                    address in network
-                    for network in (
-                        ipaddress.ip_network("10.0.0.0/8"),
-                        ipaddress.ip_network("172.16.0.0/12"),
-                        ipaddress.ip_network("192.168.0.0/16"),
-                    )
-                )
-                unsafe = (
-                    None
-                    if explicit_loopback or explicit_private or address.is_global
-                    else "unsafe private or metadata network destination denied"
+                unsafe = is_blocked_ip(
+                    address,
+                    allow_loopback=is_canonical_loopback_literal(canonical),
+                    allow_private=bool(arguments.get("allow_private")),
                 )
         else:
             unsafe = _unsafe_network_host_error(host)

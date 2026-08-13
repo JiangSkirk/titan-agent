@@ -441,8 +441,19 @@ class ModelRouter:
             raise ModelPermitError(f"model permit grant failed: {exc}") from exc
 
     def _init_providers(self) -> None:
+        allow_private = (
+            getattr(
+                getattr(self.settings, "security", None),
+                "allow_private_model_providers",
+                False,
+            )
+            is True
+        )
         for p_config in self.settings.providers:
-            provider = OpenAICompatibleProvider(p_config)
+            provider = OpenAICompatibleProvider(
+                p_config,
+                allow_private=allow_private,
+            )
             self._providers[p_config.name] = provider
             # Register explicitly-configured models
             for m in p_config.models:

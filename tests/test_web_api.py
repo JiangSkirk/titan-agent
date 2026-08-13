@@ -694,6 +694,45 @@ def test_cloud_provider_network_probe_uses_echo_control_effect(
         assert "cloud-key-ref" in effects[1].arguments_json
 
 
+def test_add_cloud_discovery_failure_does_not_attempt_provider_persistence(
+    client: TestClient,
+) -> None:
+    agent = web_server._agent
+    agent.stage_provider_discovery_key.return_value = "cloud-key-ref"
+    discovery_failure = (
+        ChatMessage(role="tool", content="failed", name="control_provider_discover"),
+        ToolResult(
+            success=False,
+            error="Provider discovery failed",
+            metadata={"status_code": 503},
+        ),
+    )
+    mutation_success = (
+        ChatMessage(role="tool", content="saved", name="control_provider_mutate"),
+        ToolResult(
+            success=True,
+            output="saved",
+            metadata={"provider": "deepseek"},
+        ),
+    )
+    agent.echo_runtime.execute_tool_effect = AsyncMock(
+        side_effect=[discovery_failure, mutation_success]
+    )
+
+    response = client.post(
+        "/api/providers/add-cloud",
+        json={"preset_id": "deepseek", "api_key": "cloud-super-secret"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Provider discovery failed"}
+    assert agent.echo_runtime.execute_tool_effect.await_count == 1
+    effect = agent.echo_runtime.execute_tool_effect.await_args.args[0]
+    assert effect.tool_name == "control_provider_discover"
+    assert agent.stage_provider_discovery_key.call_count == 1
+    assert agent.discard_provider_discovery_key.call_count == 1
+
+
 def test_desktop_wizard_action_uses_echo_effect_not_raw_action(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
