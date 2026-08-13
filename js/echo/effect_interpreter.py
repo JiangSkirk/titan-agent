@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ from js.echo.turn_context import (
     set_runtime_context,
 )
 from js.models.providers import ChatMessage, ChatResponse
-from js.security.approvals import ApprovalQueue
+from js.security.approvals import ApprovalClaimProof, ApprovalQueue
 from js.tools.registry import ToolResult
 
 if TYPE_CHECKING:
@@ -378,7 +379,10 @@ class EffectInterpreter:
         ):
             raise PermissionError("connector task_ref exceeds signed runtime identity")
 
-        actual_params = dict(params)
+        try:
+            actual_params = ApprovalQueue.snapshot_arguments(dict(params))
+        except (TypeError, ValueError):
+            raise ValueError("connector params must be a JSON-safe bounded object") from None
         if canonical_params_digest(actual_params) != request.params_digest:
             raise PermissionError("connector params do not match authority binding")
         grant = request.directory_grant
@@ -414,6 +418,7 @@ class EffectInterpreter:
         expected_fs_roots = () if grant is None else (grant.root,)
         approvals: ApprovalQueue | None = None
         approval_kwargs: dict[str, Any] | None = None
+        approval_claim: ApprovalClaimProof | None = None
         if request.operation == "write":
             approvals = getattr(self._agent, "approvals", None)
             if type(approvals) is not ApprovalQueue or request.approval_id is None:
@@ -455,7 +460,22 @@ class EffectInterpreter:
         # can only reach the fail-closed local declarations or the isolated Fake.
         if approvals is not None and approval_kwargs is not None:
             assert request.approval_id is not None
-            approvals.consume_approved_binding(request.approval_id, **approval_kwargs)
+            approval_claim = approvals.consume_approved_binding(
+                request.approval_id,
+                **approval_kwargs,
+            )
+            if (
+                type(approval_claim) is not ApprovalClaimProof
+                or approval_claim.claimed_now is not True
+                or approval_claim.request_id != request.approval_id
+                or approval_claim.arguments_hash != approval_kwargs["arguments_hash"]
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", approval_claim.binding_hash) is None
+                or re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", approval_claim.journal_record_hash
+                )
+                is None
+            ):
+                raise PermissionError("connector approval claim proof is invalid")
 
         # Two-phase Echo anchor: record pending intent before consume.
         # First, check if Echo already has a finalized anchor for this lease
@@ -539,7 +559,11 @@ class EffectInterpreter:
             authority_hash=request.authority_binding_hash(),
             context_fingerprint=context_fingerprint,
             appshell_operation_id=(operation.operation_id if operation else None),
-            approval_claim_receipt_hash=None,  # R4-B will bind approval receipt
+            approval_claim_receipt_hash=(
+                approval_claim.journal_record_hash
+                if approval_claim is not None
+                else None
+            ),
             lease_consume_receipt_hash=consume_receipt.ledger_record_hash,
             connector_type=request.connection.ref.connector_type,
             operation=request.operation,

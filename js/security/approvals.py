@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import stat
@@ -24,7 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from js.security.secrets import redact_known_secrets
 from js.utils.log import get_logger
@@ -45,6 +46,15 @@ def _secure_str_eq(left: str | None, right: str | None) -> bool:
 
 
 DEFAULT_APPROVAL_TIMEOUT = 300.0  # 5 minutes
+APPROVAL_ARGUMENTS_HASH_SCHEME = "stable_payload_hash:v1"
+
+# Approval inputs cross an authority boundary, so bound their in-memory and
+# serialized cost before hashing, callback projection, or durable persistence.
+_SNAPSHOT_MAX_UTF8_BYTES = 256 * 1024
+_SNAPSHOT_MAX_DEPTH = 32
+_SNAPSHOT_MAX_NODES = 8192
+_SNAPSHOT_MAX_STRING_UTF8_BYTES = 64 * 1024
+_SNAPSHOT_MAX_KEY_UTF8_BYTES = 512
 
 
 class ApprovalMode(StrEnum):
@@ -73,6 +83,34 @@ class ApprovalDecision:
     @property
     def approved(self) -> bool:
         return self.action in {ApprovalDecisionType.APPROVE, ApprovalDecisionType.EDIT}
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalClaimProof:
+    """Immutable typed proof of an exactly-once approval claim.
+
+    Returned by :meth:`ApprovalQueue.consume_approved_binding`.  All fields
+    are frozen closed-set identities and hashes.  Only
+    ``claimed_now is True`` authorises execution.
+    """
+
+    action: ApprovalDecisionType
+    request_id: str
+    arguments_hash: str
+    binding_hash: str
+    journal_record_hash: str
+    journal_seq: int
+    claimed_now: bool
+
+    @property
+    def approved(self) -> bool:
+        return self.action in {ApprovalDecisionType.APPROVE, ApprovalDecisionType.EDIT}
+
+    @property
+    def decision(self) -> ApprovalDecision:
+        """Return a fresh compatibility projection, never authority state."""
+
+        return ApprovalDecision(self.action, request_id=self.request_id)
 
 
 @dataclass
@@ -115,6 +153,7 @@ class _ResolvedDecisionRecord:
     run_id: str
     tool_name: str
     arguments_hash: str
+    arguments_hash_scheme: str
     requested_at: float
     expires_at: float
     approval_mode: ApprovalMode
@@ -125,8 +164,9 @@ class ApprovalEchoAuthority:
 
     Created by ``EchoSafetyService``, passed to ``ApprovalQueue`` via
     ``set_echo_authority()`` (set-once).  Once sealed, cannot be replaced.
-    All three methods (``claim_once``, ``lookup_claim``, ``record_event``)
-    operate on the same Echo journal partition.
+    All four methods (``claim_once``, ``lookup_claim``,
+    ``lookup_resolution``, ``record_event``) operate on the same Echo
+    journal partition.
     """
 
     __slots__ = ("_service", "_product_id", "_sealed")
@@ -151,6 +191,7 @@ class ApprovalEchoAuthority:
         approval_mode: str,
         expires_at: float,
         requested_at: float,
+        arguments_hash_scheme: str = APPROVAL_ARGUMENTS_HASH_SCHEME,
     ) -> Any:
         """Atomically claim one approval binding in the Echo journal."""
         return self._service.claim_approval_binding_once(
@@ -164,6 +205,7 @@ class ApprovalEchoAuthority:
             approval_mode=approval_mode,
             expires_at=expires_at,
             requested_at=requested_at,
+            arguments_hash_scheme=arguments_hash_scheme,
         )
 
     def lookup_claim(
@@ -175,6 +217,21 @@ class ApprovalEchoAuthority:
     ) -> Any | None:
         """Query whether a claim exists in the Echo journal."""
         return self._service.lookup_approval_claim(
+            tenant_id=tenant_id,
+            product_id=self._product_id,
+            session_id=session_id,
+            request_id=request_id,
+        )
+
+    def lookup_resolution(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        request_id: str,
+    ) -> Any | None:
+        """Query the unique authoritative terminal for one request."""
+        return self._service.lookup_approval_resolution(
             tenant_id=tenant_id,
             product_id=self._product_id,
             session_id=session_id,
@@ -232,6 +289,7 @@ class ApprovalQueue:
         self._ledger_prev_hash = "0" * 64
         self._ledger_mac_key = self._derive_ledger_mac_key()
         self._resolved_decisions: OrderedDict[str, _ResolvedDecisionRecord] = OrderedDict()
+        self._delivered_decisions: set[str] = set()
         # Authoritative EchoLedger sink for approval lifecycle events.  The
         # local JSONL file is only a derived mirror; the EchoLedger scope
         # partition journal is the system of record.
@@ -248,7 +306,12 @@ class ApprovalQueue:
         EchoLedger scope partition journal (atomically ordered with the Echo
         run it belongs to).  Sink failures propagate: the approval flow fails
         closed rather than proceeding on the derived JSONL mirror alone.
+
+        After ``set_echo_authority`` seals the queue, this method raises
+        ``RuntimeError`` to prevent replacing the authority-bound sink.
         """
+        if self._echo_authority_sealed:
+            raise RuntimeError("echo authority is sealed; sink cannot be replaced")
         self._echo_event_sink = sink
 
     def set_echo_authority(self, authority: ApprovalEchoAuthority) -> None:
@@ -507,21 +570,39 @@ class ApprovalQueue:
         self,
         decision: ApprovalDecision,
         request: ApprovalRequest,
+        *,
+        final_arguments_hash: str | None = None,
     ) -> None:
+        # For EDIT decisions the binding hash must reference the *edited*
+        # final arguments, not the original request arguments.  The caller
+        # may pass ``final_arguments_hash`` to override; otherwise we fall
+        # back to the original request arguments hash.
+        args_hash = final_arguments_hash
+        if args_hash is None:
+            if decision.action is ApprovalDecisionType.EDIT and isinstance(
+                decision.edited_arguments, dict
+            ):
+                args_hash = self._argument_hash(decision.edited_arguments)
+            else:
+                args_hash = self._argument_hash(request.arguments)
+        stored_decision = self._clone_decision(decision)
         self._resolved_decisions[decision.request_id] = _ResolvedDecisionRecord(
-            decision=decision,
+            decision=stored_decision,
             owner_key_hash=request.owner_key_hash,
             session_id=request.session_id or "",
             run_id=request.run_id or "",
             tool_name=request.tool_name,
-            arguments_hash=self._argument_hash(request.arguments),
+            arguments_hash=args_hash,
+            arguments_hash_scheme=APPROVAL_ARGUMENTS_HASH_SCHEME,
             requested_at=request.timestamp,
             expires_at=request.timestamp + request.timeout_seconds,
             approval_mode=request.approval_mode,
         )
+        self._delivered_decisions.discard(decision.request_id)
         self._resolved_decisions.move_to_end(decision.request_id)
         while len(self._resolved_decisions) > 1024:
-            self._resolved_decisions.popitem(last=False)
+            evicted_request_id, _evicted = self._resolved_decisions.popitem(last=False)
+            self._delivered_decisions.discard(evicted_request_id)
 
     def _record_outcome(self, approved: bool) -> None:
         with self._lock:
@@ -533,16 +614,198 @@ class ApprovalQueue:
 
     @staticmethod
     def _argument_hash(arguments: dict[str, Any]) -> str:
-        payload = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
-        return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        from js.echo.primitives import stable_payload_hash
+
+        return stable_payload_hash(arguments)
 
     @classmethod
     def arguments_hash(cls, arguments: dict[str, Any]) -> str:
         """Return the exact safe hash used by approval binding snapshots."""
 
-        if type(arguments) is not dict:
-            raise TypeError("approval arguments must be an exact dict")
-        return cls._argument_hash(arguments)
+        return cls._argument_hash(cls.snapshot_arguments(arguments))
+
+    @classmethod
+    def snapshot_arguments(cls, value: Any) -> dict[str, Any]:
+        """Return a bounded exact-JSON deep snapshot with fixed safe errors."""
+
+        nodes = 0
+        aggregate_utf8_bytes = 0
+
+        def limit() -> NoReturn:
+            raise ValueError("approval snapshot exceeds limits")
+
+        def unsafe() -> NoReturn:
+            raise ValueError("approval snapshot is not JSON-safe")
+
+        def bounded_utf8(text: str, maximum: int) -> None:
+            nonlocal aggregate_utf8_bytes
+            # Every Unicode code point needs at least one UTF-8 byte, so this
+            # cheap character bound avoids encoding attacker-sized strings
+            # merely to decide that they exceed the byte limit.
+            if len(text) > maximum:
+                limit()
+            try:
+                byte_length = len(text.encode("utf-8"))
+            except UnicodeEncodeError:
+                unsafe()
+            if byte_length > maximum:
+                limit()
+            aggregate_utf8_bytes += byte_length
+            if aggregate_utf8_bytes > _SNAPSHOT_MAX_UTF8_BYTES:
+                limit()
+
+        def visit(item: Any, depth: int) -> Any:
+            nonlocal nodes
+            if depth > _SNAPSHOT_MAX_DEPTH:
+                limit()
+            nodes += 1
+            if nodes > _SNAPSHOT_MAX_NODES:
+                limit()
+            if type(item) is dict:
+                result: dict[str, Any] = {}
+                for key, child in item.items():
+                    if type(key) is not str:
+                        unsafe()
+                    bounded_utf8(key, _SNAPSHOT_MAX_KEY_UTF8_BYTES)
+                    result[key] = visit(child, depth + 1)
+                return result
+            if type(item) is list:
+                return [visit(child, depth + 1) for child in item]
+            if item is None or type(item) in {bool, int}:
+                if type(item) is int:
+                    # Decimal digits <= ceil(bit_length * log10(2)) + sign.
+                    # Reject one chunk that could itself exceed the document
+                    # budget without materializing its decimal representation.
+                    digit_upper_bound = (item.bit_length() * 30103 + 99_999) // 100_000
+                    if digit_upper_bound + int(item < 0) > _SNAPSHOT_MAX_UTF8_BYTES:
+                        limit()
+                return item
+            if type(item) is float:
+                if not math.isfinite(item):
+                    unsafe()
+                return item
+            if type(item) is str:
+                bounded_utf8(item, _SNAPSHOT_MAX_STRING_UTF8_BYTES)
+                return item
+            unsafe()
+
+        if type(value) is not dict:
+            unsafe()
+        snapshot = cast("dict[str, Any]", visit(value, 0))
+        encoder = json.JSONEncoder(
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        encoded_size = 0
+        try:
+            for chunk in encoder.iterencode(snapshot):
+                encoded_size += len(chunk.encode("utf-8"))
+                if encoded_size > _SNAPSHOT_MAX_UTF8_BYTES:
+                    limit()
+        except ValueError as exc:
+            if str(exc) == "approval snapshot exceeds limits":
+                raise
+            unsafe()
+        except (TypeError, OverflowError, UnicodeEncodeError):
+            unsafe()
+        return snapshot
+
+    _json_safe_deep_snapshot = snapshot_arguments
+
+    @classmethod
+    def _clone_decision(cls, decision: ApprovalDecision) -> ApprovalDecision:
+        edited = (
+            cls.snapshot_arguments(decision.edited_arguments)
+            if decision.action is ApprovalDecisionType.EDIT
+            and decision.edited_arguments is not None
+            else None
+        )
+        return ApprovalDecision(
+            decision.action,
+            request_id=str(decision.request_id),
+            edited_arguments=edited,
+            response=decision.response if type(decision.response) is str else "",
+            reason=decision.reason if type(decision.reason) is str else "",
+        )
+
+    @classmethod
+    def _clone_request(cls, request: ApprovalRequest) -> ApprovalRequest:
+        decision = cls._clone_decision(request.decision) if request.decision else None
+        return ApprovalRequest(
+            id=request.id,
+            tool_name=request.tool_name,
+            arguments=cls.snapshot_arguments(request.arguments),
+            timestamp=request.timestamp,
+            context=request.context,
+            timeout_seconds=request.timeout_seconds,
+            session_id=request.session_id,
+            run_id=request.run_id,
+            owner_key_hash=request.owner_key_hash,
+            approval_mode=request.approval_mode,
+            resolved=request.resolved,
+            approved=request.approved,
+            decision=decision,
+        )
+
+    def _commit_pending_decision(
+        self,
+        request: ApprovalRequest,
+        decision: ApprovalDecision,
+        *,
+        event_type: str,
+        ledger_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[bool, ApprovalDecision]:
+        """Commit the sole terminal decision for a published manual request.
+
+        The request is marked resolved before calling the authoritative sink,
+        which closes both cross-thread races and same-thread sink re-entry.
+        Any uncertain authoritative failure permanently retires the id.
+        """
+
+        with self._lock:
+            current = self._pending.get(request.id)
+            if current is not request or request.resolved:
+                winning = request.decision
+                if winning is not None:
+                    return False, self._clone_decision(winning)
+                return False, ApprovalDecision(
+                    ApprovalDecisionType.PENDING,
+                    request_id=request.id,
+                )
+
+            stored = self._clone_decision(decision)
+            request.resolved = True
+            request.approved = stored.approved
+            request.decision = stored
+            kwargs = dict(ledger_kwargs or {})
+            try:
+                self._append_ledger(event_type, request, **kwargs)
+                self._store_resolved_decision(
+                    stored,
+                    request,
+                    final_arguments_hash=cast(
+                        "str | None",
+                        kwargs.get("final_arguments_hash"),
+                    ),
+                )
+                self._pending.pop(request.id, None)
+            except Exception:
+                request.approved = False
+                request.decision = None
+                self._resolved_decisions.pop(request.id, None)
+                self._delivered_decisions.discard(request.id)
+                if self._echo_event_sink is not None and self._echo_authority is None:
+                    # A legacy sink-only queue has no claim authority, so a
+                    # definite before-write failure may remain retryable while
+                    # execution stays fail-closed.  Typed Echo authority errors
+                    # are outcome-uncertain and permanently retire the id.
+                    request.resolved = False
+                else:
+                    self._pending.pop(request.id, None)
+                raise
+            return True, self._clone_decision(stored)
 
     @classmethod
     def _redact_ledger_value(cls, value: Any) -> Any:
@@ -560,7 +823,19 @@ class ApprovalQueue:
         except Exception:
             return "[SUPPRESSED:ledger_redaction_failed]"
 
-    def _append_ledger(self, event_type: str, req: ApprovalRequest, **extra: Any) -> None:
+    def _append_ledger(
+        self,
+        event_type: str,
+        req: ApprovalRequest,
+        *,
+        final_arguments_hash: str | None = None,
+        original_arguments_hash: str | None = None,
+        **extra: Any,
+    ) -> None:
+        reason = extra.pop("reason", "")
+        if reason:
+            safe_reason = reason if type(reason) is str else "invalid_reason"
+            extra["reason_hash"] = self._argument_hash({"reason": safe_reason})
         event = {
             "event_type": event_type,
             "request_id": req.id,
@@ -569,22 +844,34 @@ class ApprovalQueue:
             "session_id": req.session_id or "",
             "run_id": req.run_id or "",
             "owner_key_hash": req.owner_key_hash or "",
-            "arguments_hash": self._argument_hash(req.arguments),
+            "arguments_hash": final_arguments_hash or self._argument_hash(req.arguments),
+            "arguments_hash_scheme": APPROVAL_ARGUMENTS_HASH_SCHEME,
             "timestamp": req.timestamp,
             "requested_at": req.timestamp,
             "expires_at": req.timestamp + req.timeout_seconds,
             "approval_mode": req.approval_mode.value,
             **extra,
         }
+        if original_arguments_hash is not None:
+            event["original_arguments_hash"] = original_arguments_hash
         event = self._redact_ledger_value(event)
         # The EchoLedger scope partition journal is the authoritative record.
         # Call it before the derived mirror so a sink failure cannot leave a
         # locally claimable approval that the authoritative journal never saw.
+        authority_persisted = False
         if self._echo_event_sink is not None:
             self._echo_event_sink(dict(event))
+            authority_persisted = self._echo_authority is not None
         if self._ledger_path is not None:
-            with self._lock:
-                self._append_ledger_mirror(event)
+            try:
+                with self._lock:
+                    self._append_ledger_mirror(event)
+            except Exception:
+                if not authority_persisted:
+                    raise
+                # The local JSONL is a derived cache once an Echo authority is
+                # installed.  Never expose exception type, text, or path.
+                logger.warning("Approval mirror append failed after authoritative success")
 
     def _append_ledger_mirror(self, event: dict[str, Any]) -> None:
         """Append to the derived local JSONL mirror (not the system of record)."""
@@ -739,6 +1026,7 @@ class ApprovalQueue:
         reason: str = "",
     ) -> None:
         elapsed = time.time() - req.timestamp
+        reason_hash = self._argument_hash({"reason": reason}) if reason else ""
         logger.info(
             "AUDIT approval_id=%s tool=%s context=%s mode=%s outcome=%s elapsed=%.2fs %s",
             req.id,
@@ -747,7 +1035,7 @@ class ApprovalQueue:
             self.default_mode.value,
             outcome,
             elapsed,
-            f"reason={reason}" if reason else "",
+            f"reason_hash={reason_hash}" if reason_hash else "",
         )
 
     def _cleanup_stale(self) -> int:
@@ -793,13 +1081,14 @@ class ApprovalQueue:
             raise ValueError("approval callback session_id must not be empty")
         if not owner_key_hash or not run_id or not tool_name or arguments is None:
             raise ValueError("approval callback requires a complete Echo effect binding")
+        arguments_snapshot = self.snapshot_arguments(arguments)
         with self._lock:
             self._callbacks[session_id] = _CallbackRegistration(
                 callback=callback,
                 owner_key_hash=owner_key_hash,
                 run_id=run_id,
                 tool_name=tool_name,
-                arguments_hash=(self._argument_hash(arguments) if arguments is not None else None),
+                arguments_hash=self._argument_hash(arguments_snapshot),
             )
 
     def remove_callback(self, session_id: str) -> None:
@@ -895,6 +1184,10 @@ class ApprovalQueue:
 
         resolved_mode = mode or self.default_mode
 
+        # JSON-safe bounded deep snapshot: rejects custom objects, NaN, Inf,
+        # and isolates the queue from caller mutations.
+        arguments = self.snapshot_arguments(arguments)
+
         if resolved_mode == ApprovalMode.AUTO_APPROVE:
             auto_req = ApprovalRequest(
                 id=self._next_id(),
@@ -953,12 +1246,17 @@ class ApprovalQueue:
             self._emit_metrics(tool_name, resolved_mode, True)
             self._append_ledger("approval_requested", auto_req)
             self._append_ledger("approval_approved", auto_req, reason="auto_approve")
-            self._audit_log(auto_req, "approved", "auto_approve")
-            return ApprovalDecision(
+            auto_decision = ApprovalDecision(
                 ApprovalDecisionType.APPROVE,
                 request_id=auto_req.id,
                 reason="auto_approve",
             )
+            auto_req.resolved = True
+            auto_req.approved = True
+            auto_req.decision = self._clone_decision(auto_decision)
+            self._store_resolved_decision(auto_decision, auto_req)
+            self._audit_log(auto_req, "approved", "auto_approve")
+            return self._clone_decision(auto_decision)
 
         if resolved_mode == ApprovalMode.AUTO_DENY:
             logger.warning("Auto-denied %s (auto_deny mode)", tool_name)
@@ -1024,9 +1322,12 @@ class ApprovalQueue:
             approval_mode=resolved_mode,
         )
 
+        # Publish into the pending decision surface only after the
+        # authoritative requested event succeeds.  A failed or uncertain
+        # requested append therefore cannot leave an approvable request id.
+        self._append_ledger("approval_requested", req)
         with self._lock:
             self._pending[req.id] = req
-        self._append_ledger("approval_requested", req)
 
         # Try session callback first (lookup under lock to avoid TOCTOU)
         callback: ApprovalCallback | None = None
@@ -1057,38 +1358,87 @@ class ApprovalQueue:
 
         if callback:
             try:
-                callback_result = callback(req)
-                if isinstance(callback_result, ApprovalDecision):
-                    decision = callback_result
-                else:
+                callback_result = callback(self._clone_request(req))
+                if type(callback_result) is ApprovalDecision:
+                    if type(callback_result.action) is not ApprovalDecisionType:
+                        raise ValueError("approval callback action is invalid")
+                    if callback_result.action is ApprovalDecisionType.PENDING:
+                        raise ValueError("approval callback cannot resolve to pending")
+                    edited = None
+                    if callback_result.action is ApprovalDecisionType.EDIT:
+                        if callback_result.edited_arguments is None:
+                            raise ValueError("approval edit requires arguments")
+                        edited = self.snapshot_arguments(callback_result.edited_arguments)
+                    if (
+                        callback_result.action is ApprovalDecisionType.RESPOND
+                        and (
+                            type(callback_result.response) is not str
+                            or not callback_result.response
+                        )
+                    ):
+                        raise ValueError("approval respond requires response")
+                    # Always rebuild and normalize, even when the callback id
+                    # happens to match.  The callback object is never stored.
+                    decision = ApprovalDecision(
+                        callback_result.action,
+                        request_id=req.id,
+                        edited_arguments=edited,
+                        response=(
+                            callback_result.response
+                            if type(callback_result.response) is str
+                            else ""
+                        ),
+                        reason=(
+                            callback_result.reason
+                            if type(callback_result.reason) is str
+                            else ""
+                        ),
+                    )
+                elif type(callback_result) is bool:
                     decision = ApprovalDecision(
                         ApprovalDecisionType.APPROVE
-                        if bool(callback_result)
+                        if callback_result
                         else ApprovalDecisionType.REJECT,
                         request_id=req.id,
                         reason="callback",
                     )
+                else:
+                    raise ValueError("approval callback result is invalid")
+            except Exception:
+                # A callback is untrusted extension code.  Log a fixed code
+                # only: even a custom exception class name may carry secrets.
+                logger.error("Approval callback failed")
+            else:
                 approved = decision.approved
-                event_type = (
-                    "approval_edited"
-                    if decision.action == ApprovalDecisionType.EDIT
-                    else "approval_approved"
-                    if approved
-                    else "approval_rejected"
+                event_type = {
+                    ApprovalDecisionType.APPROVE: "approval_approved",
+                    ApprovalDecisionType.EDIT: "approval_edited",
+                    ApprovalDecisionType.REJECT: "approval_rejected",
+                    ApprovalDecisionType.RESPOND: "approval_responded",
+                }[decision.action]
+                ledger_kwargs: dict[str, Any] = {"reason": decision.reason}
+                if (
+                    decision.action is ApprovalDecisionType.EDIT
+                    and decision.edited_arguments is not None
+                ):
+                    ledger_kwargs["final_arguments_hash"] = self._argument_hash(
+                        decision.edited_arguments
+                    )
+                    ledger_kwargs["original_arguments_hash"] = self._argument_hash(
+                        req.arguments
+                    )
+                committed, result = self._commit_pending_decision(
+                    req,
+                    decision,
+                    event_type=event_type,
+                    ledger_kwargs=ledger_kwargs,
                 )
-                self._append_ledger(event_type, req, reason=decision.reason)
-                with self._lock:
-                    req.resolved = True
-                    req.approved = approved
-                    req.decision = decision
-                    self._store_resolved_decision(decision, req)
-                    self._pending.pop(req.id, None)
+                if not committed:
+                    return result
                 self._record_outcome(approved)
                 self._emit_metrics(tool_name, resolved_mode, approved)
                 self._audit_log(req, "approved" if approved else "denied", "callback")
-                return decision
-            except Exception as e:
-                logger.error("Approval callback failed: %s", e)
+                return result
 
         # CLI fallback: synchronous prompt
         if context == "cli":
@@ -1098,19 +1448,18 @@ class ApprovalQueue:
                 request_id=req.id,
                 reason="cli_prompt",
             )
-            req.decision = decision
-            self._append_ledger(
-                "approval_approved" if approved else "approval_rejected",
+            committed, result = self._commit_pending_decision(
                 req,
-                reason="cli_prompt",
+                decision,
+                event_type=("approval_approved" if approved else "approval_rejected"),
+                ledger_kwargs={"reason": "cli_prompt"},
             )
+            if not committed:
+                return result
             self._record_outcome(approved)
-            with self._lock:
-                self._store_resolved_decision(decision, req)
-                self._pending.pop(req.id, None)
             self._emit_metrics(tool_name, resolved_mode, approved)
             self._audit_log(req, "approved" if approved else "denied", "cli_prompt")
-            return decision
+            return result
 
         if queue_if_unhandled:
             logger.info(
@@ -1134,20 +1483,23 @@ class ApprovalQueue:
             tool_name,
             context,
         )
-        req.resolved = True
-        req.approved = False
-        req.decision = ApprovalDecision(
+        decision = ApprovalDecision(
             ApprovalDecisionType.REJECT,
             request_id=req.id,
             reason="no_handler",
         )
+        committed, result = self._commit_pending_decision(
+            req,
+            decision,
+            event_type="approval_rejected",
+            ledger_kwargs={"reason": "no_handler"},
+        )
+        if not committed:
+            return result
         self._record_outcome(False)
-        with self._lock:
-            self._pending.pop(req.id, None)
         self._emit_metrics(tool_name, resolved_mode, False)
-        self._append_ledger("approval_rejected", req, reason="no_handler")
         self._audit_log(req, "denied", "no_handler")
-        return req.decision
+        return result
 
     def _cli_prompt(self, req: ApprovalRequest) -> bool:
         """Synchronous CLI prompt for approval."""
@@ -1155,13 +1507,8 @@ class ApprovalQueue:
             args_str = ", ".join(f"{k}={v!r}" for k, v in req.arguments.items())
             prompt_text = f"\n[Approval] {req.tool_name}({args_str})\nApprove? [y/N]: "
             response = self._input_stream(prompt_text).strip().lower()
-            approved = response in ("y", "yes")
-            req.resolved = True
-            req.approved = approved
-            return approved
+            return response in ("y", "yes")
         except (EOFError, KeyboardInterrupt):
-            req.resolved = True
-            req.approved = False
             return False
 
     def resolve(self, request_id: str, approved: bool) -> bool:
@@ -1184,6 +1531,8 @@ class ApprovalQueue:
         owner_key_hash: str | None = None,
     ) -> ApprovalDecision:
         """Resolve a pending Echo approval with approve/edit/reject/respond."""
+        if type(action) is not ApprovalDecisionType:
+            raise ValueError("approval action is invalid")
         if action == ApprovalDecisionType.PENDING:
             raise ValueError("pending is not a resolution action")
         with self._lock:
@@ -1202,16 +1551,18 @@ class ApprovalQueue:
                         request_id=req.id,
                         reason="late_resolution",
                     )
-                    self._append_ledger("approval_expired", req, reason="late_resolution")
-                    req.resolved = True
-                    req.approved = False
-                    req.decision = decision
-                    self._store_resolved_decision(decision, req)
+                    committed, result = self._commit_pending_decision(
+                        req,
+                        decision,
+                        event_type="approval_expired",
+                        ledger_kwargs={"reason": "late_resolution"},
+                    )
+                    if not committed:
+                        return result
                     self._record_outcome(False)
-                    self._pending.pop(request_id, None)
                     self._audit_log(req, "expired", "late_resolution")
                     self._emit_metrics(req.tool_name, self.default_mode, False)
-                    return decision
+                    return result
                 approved = action in {
                     ApprovalDecisionType.APPROVE,
                     ApprovalDecisionType.EDIT,
@@ -1220,10 +1571,15 @@ class ApprovalQueue:
                     raise ValueError("edited_arguments are required for edit approval")
                 if action == ApprovalDecisionType.RESPOND and not response:
                     raise ValueError("response is required for respond approval")
+                frozen_edited = (
+                    self.snapshot_arguments(edited_arguments)
+                    if action is ApprovalDecisionType.EDIT
+                    else None
+                )
                 decision = ApprovalDecision(
                     action,
                     request_id=request_id,
-                    edited_arguments=edited_arguments,
+                    edited_arguments=frozen_edited,
                     response=response,
                     reason=reason,
                 )
@@ -1233,19 +1589,27 @@ class ApprovalQueue:
                     ApprovalDecisionType.REJECT: "approval_rejected",
                     ApprovalDecisionType.RESPOND: "approval_responded",
                 }[action]
-                # Persist both authoritative event and durable exact snapshot
-                # before removing the pending record. Sink/ledger failure leaves
-                # the request pending and therefore cannot authorize execution.
-                self._append_ledger(event_type, req, reason=reason)
-                req.resolved = True
-                req.approved = approved
-                req.decision = decision
-                self._store_resolved_decision(decision, req)
+                # For EDIT, the authoritative event arguments_hash must be
+                # the *final* edited hash (Contract C).  The original hash is
+                # attached for audit but raw args are never recorded.
+                ledger_kwargs: dict[str, Any] = {"reason": reason}
+                if action is ApprovalDecisionType.EDIT and frozen_edited is not None:
+                    final_hash = self._argument_hash(frozen_edited)
+                    original_hash = self._argument_hash(req.arguments)
+                    ledger_kwargs["final_arguments_hash"] = final_hash
+                    ledger_kwargs["original_arguments_hash"] = original_hash
+                committed, result = self._commit_pending_decision(
+                    req,
+                    decision,
+                    event_type=event_type,
+                    ledger_kwargs=ledger_kwargs,
+                )
+                if not committed:
+                    return result
                 self._record_outcome(approved)
-                self._pending.pop(request_id, None)
                 self._emit_metrics(req.tool_name, self.default_mode, approved)
                 self._audit_log(req, "approved" if approved else "denied", "resolved")
-                return decision
+                return result
         return ApprovalDecision(ApprovalDecisionType.PENDING, request_id=request_id)
 
     def get_pending(
@@ -1257,7 +1621,7 @@ class ApprovalQueue:
         self._cleanup_stale()
         with self._lock:
             return [
-                request
+                self._clone_request(request)
                 for request in self._pending.values()
                 if not request.resolved
                 and (
@@ -1280,7 +1644,7 @@ class ApprovalQueue:
                 request.owner_key_hash, owner_key_hash
             ):
                 return None
-            return request
+            return self._clone_request(request)
 
     def pending_arguments_hash(
         self,
@@ -1321,10 +1685,26 @@ class ApprovalQueue:
 
     def _durable_resolved_record(self, request_id: str) -> _ResolvedDecisionRecord | None:
         record: _ResolvedDecisionRecord | None = None
+        resolution_count = 0
+        invalid = False
+        resolution_events = {
+            "approval_approved",
+            "approval_edited",
+            "approval_rejected",
+            "approval_responded",
+            "approval_expired",
+            "approval_cancelled",
+        }
         for row in self._verified_ledger_rows():
             if row.get("request_id") != request_id:
                 continue
             event_type = str(row.get("event_type", ""))
+            if event_type in resolution_events:
+                resolution_count += 1
+                if resolution_count > 1:
+                    invalid = True
+                    record = None
+                    continue
             if event_type == "approval_approved":
                 try:
                     approval_mode = ApprovalMode(str(row["approval_mode"]))
@@ -1335,9 +1715,13 @@ class ApprovalQueue:
                     run_id = str(row["run_id"])
                     tool_name = str(row["tool_name"])
                     arguments_hash = str(row["arguments_hash"])
+                    arguments_hash_scheme = str(row["arguments_hash_scheme"])
                 except (KeyError, TypeError, ValueError):
-                    # Pre-R4 approval rows do not have the complete immutable
-                    # snapshot and therefore require fresh manual approval.
+                    invalid = True
+                    record = None
+                    continue
+                if arguments_hash_scheme != APPROVAL_ARGUMENTS_HASH_SCHEME:
+                    invalid = True
                     record = None
                     continue
                 record = _ResolvedDecisionRecord(
@@ -1350,18 +1734,59 @@ class ApprovalQueue:
                     run_id=run_id,
                     tool_name=tool_name,
                     arguments_hash=arguments_hash,
+                    arguments_hash_scheme=arguments_hash_scheme,
+                    requested_at=requested_at,
+                    expires_at=expires_at,
+                    approval_mode=approval_mode,
+                )
+            elif event_type == "approval_edited":
+                # approval_edited carries the *final* edited arguments_hash
+                # (Contract C/D).  Restore as a valid EDIT record.
+                try:
+                    approval_mode = ApprovalMode(str(row["approval_mode"]))
+                    requested_at = float(row["requested_at"])
+                    expires_at = float(row["expires_at"])
+                    owner_key_hash = str(row["owner_key_hash"])
+                    session_id = str(row["session_id"])
+                    run_id = str(row["run_id"])
+                    tool_name = str(row["tool_name"])
+                    arguments_hash = str(row["arguments_hash"])
+                    arguments_hash_scheme = str(row["arguments_hash_scheme"])
+                except (KeyError, TypeError, ValueError):
+                    invalid = True
+                    record = None
+                    continue
+                if arguments_hash_scheme != APPROVAL_ARGUMENTS_HASH_SCHEME:
+                    invalid = True
+                    record = None
+                    continue
+                record = _ResolvedDecisionRecord(
+                    decision=ApprovalDecision(
+                        ApprovalDecisionType.EDIT,
+                        request_id=request_id,
+                    ),
+                    owner_key_hash=owner_key_hash,
+                    session_id=session_id,
+                    run_id=run_id,
+                    tool_name=tool_name,
+                    arguments_hash=arguments_hash,
+                    arguments_hash_scheme=arguments_hash_scheme,
                     requested_at=requested_at,
                     expires_at=expires_at,
                     approval_mode=approval_mode,
                 )
             elif event_type in {
-                "approval_edited",
                 "approval_rejected",
                 "approval_responded",
                 "approval_expired",
+                "approval_cancelled",
                 "approval_execution_claimed",
             }:
                 record = None
+                if event_type == "approval_execution_claimed":
+                    invalid = True
+        if invalid:
+            record = None
         # If mirror has no claim but Echo authority is available, check Echo
         # for a durable claim.  This detects mirror truncation.
         if (
@@ -1378,7 +1803,57 @@ class ApprovalQueue:
                 return None
         return record
 
-    def _resolved_record_for_claim(self, request_id: str) -> _ResolvedDecisionRecord | None:
+    def _record_from_authority_resolution(
+        self,
+        resolution: Any,
+    ) -> _ResolvedDecisionRecord | None:
+        try:
+            action_name = str(resolution.action)
+            if action_name == "approval_approved":
+                action = ApprovalDecisionType.APPROVE
+            elif action_name == "approval_edited":
+                action = ApprovalDecisionType.EDIT
+            else:
+                return None
+            return _ResolvedDecisionRecord(
+                decision=ApprovalDecision(
+                    action,
+                    request_id=str(resolution.request_id),
+                ),
+                owner_key_hash=str(resolution.owner_key_hash),
+                session_id=str(resolution.session_id),
+                run_id=str(resolution.run_id),
+                tool_name=str(resolution.tool_name),
+                arguments_hash=str(resolution.arguments_hash),
+                arguments_hash_scheme=str(resolution.arguments_hash_scheme),
+                requested_at=float(resolution.requested_at),
+                expires_at=float(resolution.expires_at),
+                approval_mode=ApprovalMode(str(resolution.approval_mode)),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _resolved_record_for_claim(
+        self,
+        request_id: str,
+        *,
+        owner_key_hash: str | None = None,
+        session_id: str | None = None,
+    ) -> _ResolvedDecisionRecord | None:
+        if self._echo_authority is not None:
+            memory = self._resolved_decisions.get(request_id)
+            if memory is not None:
+                return memory
+            if not owner_key_hash or not session_id:
+                return None
+            resolution = self._echo_authority.lookup_resolution(
+                tenant_id=owner_key_hash,
+                session_id=session_id,
+                request_id=request_id,
+            )
+            if resolution is None:
+                return None
+            return self._record_from_authority_resolution(resolution)
         if self._ledger_path is not None:
             return self._durable_resolved_record(request_id)
         return self._resolved_decisions.get(request_id)
@@ -1396,12 +1871,16 @@ class ApprovalQueue:
     ) -> _ResolvedDecisionRecord:
         matches = record is not None and all(
             (
-                record.decision.action is ApprovalDecisionType.APPROVE,
+                record.decision.action in {
+                    ApprovalDecisionType.APPROVE,
+                    ApprovalDecisionType.EDIT,
+                },
                 _secure_str_eq(record.owner_key_hash, owner_key_hash),
                 _secure_str_eq(record.session_id, session_id),
                 _secure_str_eq(record.run_id, run_id),
                 record.tool_name == tool_name,
                 _secure_str_eq(record.arguments_hash, arguments_hash),
+                record.arguments_hash_scheme == APPROVAL_ARGUMENTS_HASH_SCHEME,
                 not require_manual or record.approval_mode is ApprovalMode.MANUAL,
                 time.time() <= record.expires_at,
             )
@@ -1425,7 +1904,11 @@ class ApprovalQueue:
 
         with self._lock, self._approval_claim_transaction():
             record = self._validate_approved_record(
-                self._resolved_record_for_claim(request_id),
+                self._resolved_record_for_claim(
+                    request_id,
+                    owner_key_hash=owner_key_hash,
+                    session_id=session_id,
+                ),
                 owner_key_hash=owner_key_hash,
                 session_id=session_id,
                 run_id=run_id,
@@ -1433,7 +1916,7 @@ class ApprovalQueue:
                 arguments_hash=arguments_hash,
                 require_manual=require_manual,
             )
-            return record.decision
+            return self._clone_decision(record.decision)
 
     def consume_approved_binding(
         self,
@@ -1445,22 +1928,30 @@ class ApprovalQueue:
         tool_name: str,
         arguments_hash: str,
         require_manual: bool,
-    ) -> ApprovalDecision:
+    ) -> ApprovalClaimProof:
         """Durably claim one exact manual approval at most once.
 
         When an :class:`ApprovalEchoAuthority` is installed, the claim is
         performed atomically in the Echo journal's cross-process lock
         (``claim_once``).  The local mirror is updated only as a cache;
-        mirror failure is non-fatal.  If the Echo authority is unavailable,
-        the claim fails closed and does NOT fall back to mirror-only trust.
+        mirror failure is non-fatal.  Only ``claimed_now=True`` authorises
+        execution; ``claimed_now=False`` (already claimed) raises
+        ``PermissionError``.
 
         Without an Echo authority (legacy/test mode), falls back to the
         mirror-based claim with cross-process file lock.
+
+        Returns an :class:`ApprovalClaimProof` carrying the immutable
+        claim receipt and the resolved approval decision.
         """
 
         with self._lock, self._approval_claim_transaction():
             record = self._validate_approved_record(
-                self._resolved_record_for_claim(request_id),
+                self._resolved_record_for_claim(
+                    request_id,
+                    owner_key_hash=owner_key_hash,
+                    session_id=session_id,
+                ),
                 owner_key_hash=owner_key_hash,
                 session_id=session_id,
                 run_id=run_id,
@@ -1471,7 +1962,7 @@ class ApprovalQueue:
 
             # --- Echo authority path (production) ---
             if self._echo_authority is not None:
-                self._echo_authority.claim_once(
+                receipt = self._echo_authority.claim_once(
                     tenant_id=record.owner_key_hash or "",
                     session_id=record.session_id,
                     run_id=record.run_id,
@@ -1481,10 +1972,12 @@ class ApprovalQueue:
                     approval_mode=record.approval_mode.value,
                     expires_at=record.expires_at,
                     requested_at=record.requested_at,
+                    arguments_hash_scheme=record.arguments_hash_scheme,
                 )
-                # receipt.claimed_now == False means already claimed (idempotent
-                # recovery).  Either way, the binding is consumed; we must NOT
-                # re-authorize execution from an already_claimed receipt.
+                if not receipt.claimed_now:
+                    raise PermissionError(
+                        "approval binding already claimed; re-approval required"
+                    )
                 # Mirror is cache-only:
                 event = self._redact_ledger_value(
                     {
@@ -1496,10 +1989,13 @@ class ApprovalQueue:
                         "run_id": record.run_id,
                         "owner_key_hash": record.owner_key_hash or "",
                         "arguments_hash": record.arguments_hash,
+                        "arguments_hash_scheme": record.arguments_hash_scheme,
                         "timestamp": time.time(),
                         "requested_at": record.requested_at,
                         "expires_at": record.expires_at,
                         "approval_mode": record.approval_mode.value,
+                        "binding_hash": receipt.binding_hash,
+                        "journal_record_hash": receipt.journal_record_hash,
                     }
                 )
                 if self._ledger_path is not None:
@@ -1508,9 +2004,25 @@ class ApprovalQueue:
                     except Exception:
                         pass  # mirror failure is non-fatal; Echo is authoritative
                 self._resolved_decisions.pop(request_id, None)
-                return record.decision
+                self._delivered_decisions.discard(request_id)
+                return ApprovalClaimProof(
+                    action=record.decision.action,
+                    request_id=request_id,
+                    arguments_hash=record.arguments_hash,
+                    binding_hash=receipt.binding_hash,
+                    journal_record_hash=receipt.journal_record_hash,
+                    journal_seq=receipt.journal_seq,
+                    claimed_now=True,
+                )
 
-            # --- Legacy mirror-only path (test/no-Echo mode) ---
+            # --- Fail-closed: sink exists but no authority ---
+            if self._echo_event_sink is not None:
+                raise PermissionError(
+                    "approval claim authority is unavailable; cannot claim"
+                    " with sink-only configuration"
+                )
+
+            # --- Legacy mirror-only path (isolated test/no-sink mode) ---
             event = self._redact_ledger_value(
                 {
                     "event_type": "approval_execution_claimed",
@@ -1521,6 +2033,7 @@ class ApprovalQueue:
                     "run_id": record.run_id,
                     "owner_key_hash": record.owner_key_hash or "",
                     "arguments_hash": record.arguments_hash,
+                    "arguments_hash_scheme": record.arguments_hash_scheme,
                     "timestamp": time.time(),
                     "requested_at": record.requested_at,
                     "expires_at": record.expires_at,
@@ -1529,10 +2042,17 @@ class ApprovalQueue:
             )
             if self._ledger_path is not None:
                 self._append_ledger_mirror(cast("dict[str, Any]", event))
-            if self._echo_event_sink is not None:
-                self._echo_event_sink(cast("dict[str, Any]", dict(event)))
             self._resolved_decisions.pop(request_id, None)
-            return record.decision
+            self._delivered_decisions.discard(request_id)
+            return ApprovalClaimProof(
+                action=record.decision.action,
+                request_id=request_id,
+                arguments_hash=record.arguments_hash,
+                binding_hash="",
+                journal_record_hash="",
+                journal_seq=-1,
+                claimed_now=True,
+            )
 
     def take_decision(
         self,
@@ -1540,7 +2060,11 @@ class ApprovalQueue:
         *,
         owner_key_hash: str | None = None,
     ) -> ApprovalDecision | None:
-        """Consume one externally resolved decision exactly once."""
+        """Read one externally resolved decision without consuming it.
+
+        Delivery is once-only, but an approved resolved record remains until
+        :meth:`consume_approved_binding` performs the authoritative CAS.
+        """
         with self._lock:
             record = self._resolved_decisions.get(request_id)
             if record is None:
@@ -1549,8 +2073,14 @@ class ApprovalQueue:
                 record.owner_key_hash, owner_key_hash
             ):
                 return None
-            self._resolved_decisions.pop(request_id, None)
-            return record.decision
+            if request_id in self._delivered_decisions:
+                return None
+            self._delivered_decisions.add(request_id)
+            decision = self._clone_decision(record.decision)
+            if not decision.approved:
+                self._resolved_decisions.pop(request_id, None)
+                self._delivered_decisions.discard(request_id)
+            return decision
 
     def get_stats(self) -> dict[str, Any]:
         with self._lock:
@@ -1619,8 +2149,8 @@ def wire_echo_approval_authority(
 ) -> ApprovalEchoAuthority:
     """Create a typed, sealed ``ApprovalEchoAuthority`` for an ApprovalQueue.
 
-    The authority provides atomic ``claim_once`` and ``lookup_claim``
-    operations backed by the Echo journal's cross-process lock.
+    The authority provides atomic ``claim_once``, ``lookup_claim``, and
+    ``lookup_resolution`` operations backed by the Echo journal.
     """
 
     return ApprovalEchoAuthority(service, product_id=product_id)

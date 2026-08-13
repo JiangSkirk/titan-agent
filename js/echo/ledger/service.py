@@ -5,6 +5,7 @@ import binascii
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -28,6 +29,8 @@ from js.echo.ledger.journal import (
     FileEchoLedger,
     JournalEntry,
     VerificationReport,
+    read_verified_logical_records_existing,
+    read_verified_records_existing,
     verify_file,
 )
 from js.echo.ledger.kernel import decide
@@ -90,6 +93,14 @@ _MAX_TENANT_STATES = 512
 _MAX_TOOL_ARTIFACT_REFS = 32
 _MAX_TOOL_ARTIFACT_BYTES = 128 * 1024
 _TOKEN_SOURCES = {"provider_actual", "tokenizer", "estimated", "unavailable"}
+_MAX_APPROVAL_TIMESTAMP = 253_402_300_799.0
+
+
+def _valid_approval_timestamp(value: object) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    numeric = cast("int | float", value)
+    return math.isfinite(numeric) and 0 <= numeric <= _MAX_APPROVAL_TIMESTAMP
 
 
 class EchoBlockedError(PermissionError):
@@ -1233,6 +1244,7 @@ class EchoSafetyService:
             tenant_state.effects.claim(context.outbox_id)
             return context
 
+    _APPROVAL_HASH_SCHEME = "stable_payload_hash:v1"
     _APPROVAL_EVENT_TYPES = frozenset(
         {
             "approval_requested",
@@ -1242,8 +1254,36 @@ class EchoSafetyService:
             "approval_responded",
             "approval_expired",
             "approval_cancelled",
-            "approval_execution_claimed",
+            "approval_execution_bound",
+            "approval_execution_finalized",
             "approval_finalized",
+        }
+    )
+    _APPROVAL_CORE_FIELDS = frozenset(
+        {
+            "event_type",
+            "request_id",
+            "tool_name",
+            "arguments_hash",
+            "session_id",
+            "run_id",
+            "owner_key_hash",
+        }
+    )
+    _APPROVAL_EXTRA_FIELDS = frozenset(
+        {
+            "context",
+            "requested_at",
+            "expires_at",
+            "approval_mode",
+            "arguments_hash_scheme",
+            "original_arguments_hash",
+            "reason_code",
+            "reason_hash",
+            "approval_effect_id",
+            "execution_effect_id",
+            "claim_receipt_hash",
+            "status",
         }
     )
 
@@ -1267,7 +1307,66 @@ class EchoSafetyService:
         run's effects and receipts.  Failures propagate (fail closed).
         """
         if event_type not in self._APPROVAL_EVENT_TYPES:
-            raise ValueError(f"unknown approval event type: {event_type}")
+            raise ValueError("unknown approval event type")
+        if type(arguments_hash) is not str or _SHA256_REF_RE.fullmatch(arguments_hash) is None:
+            raise ValueError("approval arguments hash is invalid")
+        if type(extra) is not dict and extra is not None:
+            raise ValueError("approval event extra fields are invalid")
+        supplied_extra = dict(extra or {})
+        if (
+            self._APPROVAL_CORE_FIELDS.intersection(supplied_extra)
+            or not set(supplied_extra).issubset(self._APPROVAL_EXTRA_FIELDS)
+            or "reason" in supplied_extra
+        ):
+            raise ValueError("approval event extra fields are invalid")
+        reason_code = supplied_extra.get("reason_code")
+        if reason_code is not None and (
+            type(reason_code) is not str
+            or re.fullmatch(r"[a-z0-9_]{1,64}", reason_code) is None
+        ):
+            raise ValueError("approval event extra fields are invalid")
+        status = supplied_extra.get("status")
+        if status is not None and status not in {"ok", "failed", "cancelled"}:
+            raise ValueError("approval event extra fields are invalid")
+        requested_at = supplied_extra.get("requested_at")
+        expires_at = supplied_extra.get("expires_at")
+        if (
+            (requested_at is not None and not _valid_approval_timestamp(requested_at))
+            or (expires_at is not None and not _valid_approval_timestamp(expires_at))
+            or (
+                requested_at is not None
+                and expires_at is not None
+                and requested_at > expires_at
+            )
+        ):
+            raise ValueError("approval event time is invalid")
+        for hash_field in (
+            "arguments_hash_scheme",
+            "original_arguments_hash",
+            "reason_hash",
+            "claim_receipt_hash",
+        ):
+            value = supplied_extra.get(hash_field)
+            if hash_field == "arguments_hash_scheme":
+                if value is not None and value != self._APPROVAL_HASH_SCHEME:
+                    raise ValueError("approval event extra fields are invalid")
+            elif value is not None and (
+                type(value) is not str or _SHA256_REF_RE.fullmatch(value) is None
+            ):
+                raise ValueError("approval event extra fields are invalid")
+        for text_field in (
+            "context",
+            "approval_mode",
+            "approval_effect_id",
+            "execution_effect_id",
+        ):
+            value = supplied_extra.get(text_field)
+            if value is not None and (
+                type(value) is not str
+                or len(value) > 256
+                or re.fullmatch(r"[A-Za-z0-9_.:-]*", value) is None
+            ):
+                raise ValueError("approval event extra fields are invalid")
         with self._state_lock, self._partition_operation_guard(
             tenant_id=tenant_id,
             product_id=product_id,
@@ -1287,8 +1386,7 @@ class EchoSafetyService:
                 "run_id": run_id,
                 "owner_key_hash": tenant_id,
             }
-            if extra:
-                payload.update(extra)
+            payload.update(supplied_extra)
             entries: tuple[JournalEntry, ...] = (
                 {
                     "record_type": "approval",
@@ -1451,6 +1549,12 @@ class EchoSafetyService:
     class _ApprovalClaimAlreadyExistsError(Exception):
         """Internal: raised inside semantic_check to abort duplicate append."""
 
+    class _ApprovalClaimDeniedError(Exception):
+        """Internal: preserve fail-closed denial across journal I/O wrapper."""
+
+    class _ApprovalJournalChangedError(Exception):
+        """Internal: retry after the verified logical snapshot changed."""
+
     @dataclass(frozen=True, slots=True)
     class ApprovalClaimReceipt:
         """Durable proof of an atomic approval binding claim.
@@ -1467,6 +1571,27 @@ class EchoSafetyService:
         journal_seq: int
         claimed_now: bool
 
+    @dataclass(frozen=True, slots=True)
+    class ApprovalResolutionRecord:
+        """Closed-set projection of one authoritative approval terminal.
+
+        Recovery may read this record; it never authorises execution by
+        itself.  Raw or edited arguments are never included.
+        """
+
+        request_id: str
+        action: str
+        tool_name: str
+        arguments_hash: str
+        arguments_hash_scheme: str
+        owner_key_hash: str
+        session_id: str
+        run_id: str
+        approval_mode: str
+        requested_at: float
+        expires_at: float
+        binding_hash: str
+
     def claim_approval_binding_once(
         self,
         *,
@@ -1480,6 +1605,7 @@ class EchoSafetyService:
         approval_mode: str,
         expires_at: float,
         requested_at: float,
+        arguments_hash_scheme: str = _APPROVAL_HASH_SCHEME,
     ) -> EchoSafetyService.ApprovalClaimReceipt:
         """Atomically claim one approval binding at most once.
 
@@ -1492,6 +1618,14 @@ class EchoSafetyService:
         ``ValueError`` (corruption/conflict).
         """
 
+        if type(arguments_hash) is not str or _SHA256_REF_RE.fullmatch(arguments_hash) is None:
+            raise ValueError("approval arguments hash is invalid")
+        if (
+            not _valid_approval_timestamp(requested_at)
+            or not _valid_approval_timestamp(expires_at)
+        ):
+            raise ValueError("approval claim time is invalid")
+
         binding_hash = self._approval_binding_hash(
             tenant_id=tenant_id,
             session_id=session_id,
@@ -1499,6 +1633,7 @@ class EchoSafetyService:
             tool_name=tool_name,
             arguments_hash=arguments_hash,
             approval_mode=approval_mode,
+            arguments_hash_scheme=arguments_hash_scheme,
         )
         with self._state_lock, self._partition_operation_guard(
             tenant_id=tenant_id,
@@ -1511,36 +1646,12 @@ class EchoSafetyService:
                 session_id=session_id,
             )
 
-            # Pre-scan cached state for existing claim (fast path).
-            for record in tenant_state.journal.records:
-                p = record.payload
-                if not isinstance(p, dict):
-                    continue
-                if p.get("event_type") != "approval_execution_claimed":
-                    continue
-                if p.get("request_id") != request_id:
-                    continue
-                existing_hash = p.get("binding_hash", "")
-                if existing_hash != binding_hash:
-                    raise ValueError(
-                        "approval binding conflict: request_id already"
-                        " claimed with different binding"
-                    )
-                return EchoSafetyService.ApprovalClaimReceipt(
-                    request_id=request_id,
-                    binding_hash=binding_hash,
-                    journal_record_hash=getattr(record, "record_hash", ""),
-                    journal_seq=getattr(record, "seq", 0),
-                    claimed_now=False,
-                )
-
-            # No existing claim in cached state: append with semantic_check
-            # that re-verifies inside the journal's cross-process flock.
             payload: dict[str, Any] = {
                 "event_type": "approval_execution_claimed",
                 "request_id": request_id,
                 "tool_name": tool_name,
                 "arguments_hash": arguments_hash,
+                "arguments_hash_scheme": arguments_hash_scheme,
                 "session_id": session_id,
                 "run_id": run_id,
                 "owner_key_hash": tenant_id,
@@ -1558,51 +1669,113 @@ class EchoSafetyService:
                 },
             )
 
-            found_existing: list[Any] = []
-
-            def check_before_append(
-                _effects: DurableEffectLog,
-                _disk_changed: bool,
-            ) -> None:
-                # Scan the journal's in-memory records (synced from disk
-                # inside the flock).  Do NOT call verified_logical_records()
-                # here -- it would re-acquire the same lock and deadlock.
-                for rec in tenant_state.journal.records:
+            # A verified logical snapshot includes both the immutable archive
+            # and active tail.  The append callback runs under the journal's
+            # flock and rejects the snapshot when the active fingerprint has
+            # changed, making the verified pre-scan + append one retryable CAS
+            # without recursively acquiring the journal lock.
+            for _attempt in range(8):
+                logical_records = tenant_state.journal.verified_logical_records()
+                existing: Any | None = None
+                latest_precursor: dict[str, Any] | None = None
+                resolution_count = 0
+                for rec in logical_records:
                     p = rec.payload
-                    if not isinstance(p, dict):
-                        continue
-                    if p.get("event_type") != "approval_execution_claimed":
+                    if rec.record_type != "approval" or not isinstance(p, dict):
                         continue
                     if p.get("request_id") != request_id:
                         continue
-                    existing_hash = p.get("binding_hash", "")
-                    if existing_hash != binding_hash:
-                        raise ValueError(
-                            "approval binding conflict: request_id already"
-                            " claimed with different binding"
-                        )
-                    found_existing.append(rec)
-                    raise EchoSafetyService._ApprovalClaimAlreadyExistsError()
+                    latest_precursor = p
+                    if p.get("event_type") in {
+                        "approval_approved",
+                        "approval_edited",
+                        "approval_rejected",
+                        "approval_responded",
+                        "approval_expired",
+                        "approval_cancelled",
+                    }:
+                        resolution_count += 1
+                    if p.get("event_type") == "approval_execution_claimed":
+                        existing_hash = p.get("binding_hash", "")
+                        if existing_hash != binding_hash:
+                            raise ValueError(
+                                "approval binding conflict: request_id already"
+                                " claimed with different binding"
+                            )
+                        existing = rec
+                if existing is not None:
+                    return EchoSafetyService.ApprovalClaimReceipt(
+                        request_id=request_id,
+                        binding_hash=binding_hash,
+                        journal_record_hash=getattr(existing, "record_hash", ""),
+                        journal_seq=getattr(existing, "seq", 0),
+                        claimed_now=False,
+                    )
 
-            try:
-                self._append_many(
-                    tenant_id,
-                    entries,
-                    state=tenant_state,
-                    semantic_check=check_before_append,
-                )
-            except EchoSafetyService._ApprovalClaimAlreadyExistsError:
-                rec = found_existing[0]
-                return EchoSafetyService.ApprovalClaimReceipt(
-                    request_id=request_id,
-                    binding_hash=binding_hash,
-                    journal_record_hash=getattr(rec, "record_hash", ""),
-                    journal_seq=getattr(rec, "seq", 0),
-                    claimed_now=False,
-                )
+                def check_before_append(
+                    _effects: DurableEffectLog,
+                    disk_changed: bool,
+                    _resolution_count: int = resolution_count,
+                    _latest_precursor: dict[str, Any] | None = latest_precursor,
+                ) -> None:
+                    if disk_changed:
+                        raise EchoSafetyService._ApprovalJournalChangedError()
+                    if (
+                        _resolution_count != 1
+                        or _latest_precursor is None
+                        or _latest_precursor.get("event_type")
+                        not in {"approval_approved", "approval_edited"}
+                    ):
+                        raise EchoSafetyService._ApprovalClaimDeniedError(
+                            "approval prerequisite is unavailable"
+                        )
+                    expected = {
+                        "owner_key_hash": tenant_id,
+                        "session_id": session_id,
+                        "run_id": run_id,
+                        "request_id": request_id,
+                        "tool_name": tool_name,
+                        "arguments_hash": arguments_hash,
+                        "arguments_hash_scheme": arguments_hash_scheme,
+                        "approval_mode": approval_mode,
+                        "expires_at": expires_at,
+                        "requested_at": requested_at,
+                    }
+                    if any(
+                        _latest_precursor.get(key) != value
+                        for key, value in expected.items()
+                    ):
+                        raise EchoSafetyService._ApprovalClaimDeniedError(
+                            "approval prerequisite does not match"
+                        )
+                    if (
+                        arguments_hash_scheme != self._APPROVAL_HASH_SCHEME
+                        or type(expires_at) not in {int, float}
+                        or type(requested_at) not in {int, float}
+                        or requested_at > expires_at
+                        or time() > expires_at
+                    ):
+                        raise EchoSafetyService._ApprovalClaimDeniedError(
+                            "approval prerequisite is invalid"
+                        )
+
+                try:
+                    self._append_many(
+                        tenant_id,
+                        entries,
+                        state=tenant_state,
+                        semantic_check=check_before_append,
+                    )
+                except EchoSafetyService._ApprovalJournalChangedError:
+                    continue
+                except EchoSafetyService._ApprovalClaimDeniedError as exc:
+                    raise PermissionError("approval claim denied") from exc
+                break
+            else:
+                raise PermissionError("approval claim denied")
 
             # Read back the just-appended record from cached journal state
-            for record in tenant_state.journal.records:
+            for record in tenant_state.journal.verified_logical_records():
                 p = record.payload
                 if (
                     isinstance(p, dict)
@@ -1634,17 +1807,15 @@ class EchoSafetyService:
         local mirror (e.g. mirror truncation).
         """
 
-        with self._state_lock, self._partition_operation_guard(
-            tenant_id=tenant_id,
-            product_id=product_id,
-            session_id=session_id,
-        ):
-            tenant_state = self._partition_state_locked(
+        with self._state_lock:
+            records = self._read_existing_partition_records(
                 tenant_id=tenant_id,
                 product_id=product_id,
                 session_id=session_id,
             )
-            for record in tenant_state.journal.records:
+            if records is None:
+                return None
+            for record in records:
                 p = record.payload
                 if not isinstance(p, dict):
                     continue
@@ -1661,6 +1832,143 @@ class EchoSafetyService:
                 )
             return None
 
+    def lookup_approval_resolution(
+        self,
+        *,
+        tenant_id: str,
+        product_id: str,
+        session_id: str,
+        request_id: str,
+    ) -> EchoSafetyService.ApprovalResolutionRecord | None:
+        """Return the unique unclaimed Echo terminal for one request, if any.
+
+        Reads verified active and compacted archive history.  This method
+        never appends, claims, or creates an approval.  Ambiguous, expired,
+        denied, cancelled, or already-claimed state returns ``None``.
+        """
+
+        resolution_events = {
+            "approval_approved",
+            "approval_edited",
+            "approval_rejected",
+            "approval_responded",
+            "approval_expired",
+            "approval_cancelled",
+        }
+        valid_terminals = {"approval_approved", "approval_edited"}
+        with self._state_lock:
+            records = self._read_existing_partition_records(
+                tenant_id=tenant_id,
+                product_id=product_id,
+                session_id=session_id,
+            )
+            if records is None:
+                return None
+            resolution_count = 0
+            terminal: dict[str, Any] | None = None
+            invalid = False
+            for record in records:
+                payload = record.payload
+                if record.record_type != "approval" or not isinstance(payload, dict):
+                    continue
+                if payload.get("request_id") != request_id:
+                    continue
+                event_type = payload.get("event_type")
+                if event_type in resolution_events:
+                    resolution_count += 1
+                    if event_type in valid_terminals and resolution_count == 1:
+                        terminal = payload
+                    else:
+                        invalid = True
+                if event_type == "approval_execution_claimed":
+                    invalid = True
+            if invalid or resolution_count != 1 or terminal is None:
+                return None
+            return self._approval_resolution_from_payload(
+                terminal,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                request_id=request_id,
+            )
+
+    def _approval_resolution_from_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        tenant_id: str,
+        session_id: str,
+        request_id: str,
+    ) -> EchoSafetyService.ApprovalResolutionRecord | None:
+        action = payload.get("event_type")
+        tool_name = payload.get("tool_name")
+        arguments_hash = payload.get("arguments_hash")
+        arguments_hash_scheme = payload.get("arguments_hash_scheme")
+        owner_key_hash = payload.get("owner_key_hash")
+        payload_session_id = payload.get("session_id")
+        run_id = payload.get("run_id")
+        approval_mode = payload.get("approval_mode")
+        requested_at = payload.get("requested_at")
+        expires_at = payload.get("expires_at")
+        identity_fields = (
+            tool_name,
+            owner_key_hash,
+            payload_session_id,
+            run_id,
+            approval_mode,
+        )
+        if (
+            action not in {"approval_approved", "approval_edited"}
+            or arguments_hash_scheme != self._APPROVAL_HASH_SCHEME
+            or type(arguments_hash) is not str
+            or _SHA256_REF_RE.fullmatch(arguments_hash) is None
+            or owner_key_hash != tenant_id
+            or payload_session_id != session_id
+            or payload.get("request_id") != request_id
+            or any(
+                type(value) is not str
+                or len(value) > 256
+                or re.fullmatch(r"[A-Za-z0-9_.:-]*", value) is None
+                for value in identity_fields
+            )
+            or type(requested_at) not in {int, float}
+            or type(expires_at) not in {int, float}
+        ):
+            return None
+        requested = float(cast("int | float", requested_at))
+        expires = float(cast("int | float", expires_at))
+        if (
+            not _valid_approval_timestamp(requested)
+            or not _valid_approval_timestamp(expires)
+            or requested > expires
+            or time() > expires
+        ):
+            return None
+        resolved_tool = str(tool_name)
+        resolved_run = str(run_id)
+        resolved_mode = str(approval_mode)
+        return EchoSafetyService.ApprovalResolutionRecord(
+            request_id=request_id,
+            action=str(action),
+            tool_name=resolved_tool,
+            arguments_hash=arguments_hash,
+            arguments_hash_scheme=self._APPROVAL_HASH_SCHEME,
+            owner_key_hash=tenant_id,
+            session_id=session_id,
+            run_id=resolved_run,
+            approval_mode=resolved_mode,
+            requested_at=requested,
+            expires_at=expires,
+            binding_hash=self._approval_binding_hash(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                run_id=resolved_run,
+                tool_name=resolved_tool,
+                arguments_hash=arguments_hash,
+                approval_mode=resolved_mode,
+                arguments_hash_scheme=self._APPROVAL_HASH_SCHEME,
+            ),
+        )
+
     @staticmethod
     def _approval_binding_hash(
         *,
@@ -1670,6 +1978,7 @@ class EchoSafetyService:
         tool_name: str,
         arguments_hash: str,
         approval_mode: str,
+        arguments_hash_scheme: str = "stable_payload_hash:v1",
     ) -> str:
         """Compute a domain-separated canonical binding hash."""
         import hashlib as _hl
@@ -1682,6 +1991,7 @@ class EchoSafetyService:
                 "tool_name": tool_name,
                 "arguments_hash": arguments_hash,
                 "approval_mode": approval_mode,
+                "arguments_hash_scheme": arguments_hash_scheme,
             }
         )
         return (
@@ -1690,6 +2000,195 @@ class EchoSafetyService:
                 b"js-agent:approval-binding:v1\0" + payload.encode("utf-8")
             ).hexdigest()
         )
+
+    def _read_existing_partition_records(
+        self,
+        *,
+        tenant_id: str,
+        product_id: str,
+        session_id: str,
+    ) -> tuple[Any, ...] | None:
+        """Descriptor-safe existing-only read of one partition's logical journal."""
+
+        try:
+            product_slug, owner_slug, session_slug = _scope_partition_slugs(
+                tenant_id=tenant_id,
+                product_id=product_id,
+                session_id=session_id,
+            )
+            for component in (product_slug, owner_slug, session_slug):
+                _require_existing_path_component(component)
+        except ValueError:
+            return None
+        opened: list[int] = []
+        try:
+            root_fd = _open_existing(self._root, _EXISTING_DIR_FLAGS)
+            opened.append(root_fd)
+            root_st = os.fstat(root_fd)
+            if not _is_existing_ancestor_directory(root_st):
+                return None
+
+            guard_fd = _open_existing(
+                "partitions.guard",
+                _EXISTING_FILE_FLAGS,
+                dir_fd=root_fd,
+            )
+            opened.append(guard_fd)
+            guard_st = os.fstat(guard_fd)
+            if not _is_existing_private_regular(guard_st, parent=root_st):
+                return None
+            if not _try_shared_lock(guard_fd):
+                return None
+
+            partitions_fd = _open_existing(
+                "partitions",
+                _EXISTING_DIR_FLAGS,
+                dir_fd=root_fd,
+            )
+            opened.append(partitions_fd)
+            partitions_st = os.fstat(partitions_fd)
+            if not _is_existing_ancestor_directory(partitions_st, parent=root_st):
+                return None
+
+            product_fd = _open_existing(
+                product_slug,
+                _EXISTING_DIR_FLAGS,
+                dir_fd=partitions_fd,
+            )
+            opened.append(product_fd)
+            product_st = os.fstat(product_fd)
+            if not _is_existing_ancestor_directory(product_st, parent=partitions_st):
+                return None
+
+            owner_fd = _open_existing(
+                owner_slug,
+                _EXISTING_DIR_FLAGS,
+                dir_fd=product_fd,
+            )
+            opened.append(owner_fd)
+            owner_st = os.fstat(owner_fd)
+            if not _is_existing_ancestor_directory(owner_st, parent=product_st):
+                return None
+
+            session_fd = _open_existing(
+                session_slug,
+                _EXISTING_DIR_FLAGS,
+                dir_fd=owner_fd,
+            )
+            opened.append(session_fd)
+            session_st = os.fstat(session_fd)
+            if not _is_existing_session_directory(session_st, parent=owner_st):
+                return None
+
+            journal_fd = _open_existing(
+                "chat.jsonl",
+                _EXISTING_FILE_FLAGS,
+                dir_fd=session_fd,
+            )
+            opened.append(journal_fd)
+            key_fd = _open_existing(
+                "journal.key",
+                _EXISTING_FILE_FLAGS,
+                dir_fd=session_fd,
+            )
+            opened.append(key_fd)
+            permit_fd = _open_existing(
+                "permit.key",
+                _EXISTING_FILE_FLAGS,
+                dir_fd=session_fd,
+            )
+            opened.append(permit_fd)
+            lock_fd = _open_existing(
+                "chat.jsonl.lock",
+                _EXISTING_FILE_FLAGS,
+                dir_fd=session_fd,
+            )
+            opened.append(lock_fd)
+
+            journal_st = os.fstat(journal_fd)
+            key_st = os.fstat(key_fd)
+            permit_st = os.fstat(permit_fd)
+            lock_st = os.fstat(lock_fd)
+            if not all(
+                _is_existing_private_regular(metadata, parent=session_st)
+                for metadata in (journal_st, key_st, permit_st, lock_st)
+            ):
+                return None
+            if not _try_shared_lock(lock_fd):
+                return None
+
+            mac_key = _read_existing_key(key_fd)
+            _read_existing_key(permit_fd)
+
+            active_probe = read_verified_records_existing(
+                journal_fd=journal_fd,
+                mac_key=mac_key,
+            )
+            archive_fd: int | None = None
+            archive_st: os.stat_result | None = None
+            anchors = [
+                record
+                for record in active_probe
+                if getattr(record, "record_type", None) == "snapshot_anchor"
+            ]
+            if anchors:
+                archive_name = getattr(anchors[0], "payload", {}).get("archive_name")
+                if not isinstance(archive_name, str):
+                    return None
+                _require_existing_path_component(archive_name)
+                archive_fd = _open_existing(
+                    archive_name,
+                    _EXISTING_FILE_FLAGS,
+                    dir_fd=session_fd,
+                )
+                opened.append(archive_fd)
+                archive_st = os.fstat(archive_fd)
+                if not _is_existing_private_regular(archive_st, parent=session_st):
+                    return None
+                records = read_verified_logical_records_existing(
+                    journal_fd=journal_fd,
+                    mac_key=mac_key,
+                    archive_fd=archive_fd,
+                )
+            else:
+                records = active_probe
+
+            if not _identities_unchanged(
+                (
+                    (journal_fd, journal_st),
+                    (key_fd, key_st),
+                    (permit_fd, permit_st),
+                    (lock_fd, lock_st),
+                    (session_fd, session_st),
+                    (guard_fd, guard_st),
+                )
+            ):
+                return None
+            if archive_fd is not None and archive_st is not None and not _identities_unchanged(
+                ((archive_fd, archive_st),)
+            ):
+                return None
+            live_session = os.stat(
+                session_slug,
+                dir_fd=owner_fd,
+                follow_symlinks=False,
+            )
+            if (live_session.st_dev, live_session.st_ino) != (
+                session_st.st_dev,
+                session_st.st_ino,
+            ):
+                return None
+            if not _is_existing_session_directory(live_session, parent=owner_st):
+                return None
+            return records
+        except (OSError, ValueError, EchoUnavailableError, json.JSONDecodeError):
+            return None
+        finally:
+            for fd in reversed(opened):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # R4A-B1: Two-phase lease consume anchor
@@ -3136,6 +3635,45 @@ class EchoSafetyService:
                 session_id=session_id,
             )
 
+    def _existing_partition_state_locked(
+        self,
+        *,
+        tenant_id: str,
+        product_id: str,
+        session_id: str,
+    ) -> _TenantJournalState | None:
+        """Return a cached or already-durable partition, never creating one."""
+
+        try:
+            product_slug, owner_slug, session_slug = _scope_partition_slugs(
+                tenant_id=tenant_id,
+                product_id=product_id,
+                session_id=session_id,
+            )
+        except ValueError:
+            return None
+        cache_key = f"partitions/{product_slug}/{owner_slug}/{session_slug}"
+        state = self._tenant_states.get(cache_key)
+        if state is not None:
+            self._tenant_states.move_to_end(cache_key)
+            return state
+        session_root = _existing_partition_root(
+            ledger_root=self._root,
+            product_slug=product_slug,
+            owner_slug=owner_slug,
+            session_slug=session_slug,
+        )
+        if session_root is None:
+            return None
+        try:
+            state = _load_existing_journal_state(session_root)
+        except (OSError, ValueError, PartitionRetentionError, EchoUnavailableError):
+            return None
+        self._remember_health_verified(state)
+        self._tenant_states[cache_key] = state
+        self._trim_tenant_states()
+        return state
+
     def _partition_state_locked(
         self,
         *,
@@ -3891,6 +4429,189 @@ def _load_journal_state(root: Path) -> _TenantJournalState:
     journal_path = root / "chat.jsonl"
     journal_key = _load_or_create_key(root / "journal.key")
     permit_key = _load_or_create_key(root / "permit.key")
+    journal = FileEchoLedger(journal_path, mac_key=journal_key)
+    effects = _replay_effects(
+        journal.records,
+        completed_effect_lookup=journal.contains_archived_effect,
+    )
+    return _TenantJournalState(
+        journal_path=journal_path,
+        journal_key=journal_key,
+        permit_key=permit_key,
+        journal=journal,
+        effects=effects,
+    )
+
+
+_EXISTING_DIR_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+_EXISTING_FILE_FLAGS = (
+    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+)
+
+
+def _require_existing_path_component(name: str) -> str:
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+    ):
+        raise ValueError("existing path component is unsafe")
+    return name
+
+
+def _open_existing(
+    name: str | Path,
+    flags: int,
+    *,
+    dir_fd: int | None = None,
+) -> int:
+    if flags & os.O_CREAT or flags & getattr(os, "O_TRUNC", 0):
+        raise ValueError("existing-only open refused creat/trunc")
+    if dir_fd is None:
+        return os.open(name, flags)
+    return os.open(name, flags, dir_fd=dir_fd)
+
+
+def _owned_by_current_user(metadata: os.stat_result) -> bool:
+    return metadata.st_uid == os.geteuid()
+
+
+def _is_existing_ancestor_directory(
+    metadata: os.stat_result,
+    *,
+    parent: os.stat_result | None = None,
+) -> bool:
+    mode = metadata.st_mode
+    if (
+        not stat.S_ISDIR(mode)
+        or not _owned_by_current_user(metadata)
+        or (stat.S_IMODE(mode) & 0o022) != 0
+    ):
+        return False
+    return parent is None or metadata.st_dev == parent.st_dev
+
+
+def _is_existing_session_directory(
+    metadata: os.stat_result,
+    *,
+    parent: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and _owned_by_current_user(metadata)
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+        and metadata.st_dev == parent.st_dev
+    )
+
+
+def _is_existing_private_regular(
+    metadata: os.stat_result,
+    *,
+    parent: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and _owned_by_current_user(metadata)
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_dev == parent.st_dev
+    )
+
+
+def _try_shared_lock(fd: int) -> bool:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _read_existing_key(fd: int) -> bytes:
+    data = os.pread(fd, os.fstat(fd).st_size, 0)
+    encoded = data.decode("utf-8").strip()
+    key = bytes.fromhex(encoded)
+    if len(encoded) != 64 or len(key) != 32:
+        raise ValueError("existing key is invalid")
+    return key
+
+
+def _identities_unchanged(
+    items: tuple[tuple[int, os.stat_result], ...],
+) -> bool:
+    for fd, expected in items:
+        current = os.fstat(fd)
+        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+            return False
+        if current.st_nlink != expected.st_nlink:
+            return False
+        if stat.S_IFMT(current.st_mode) != stat.S_IFMT(expected.st_mode):
+            return False
+    return True
+
+
+def _lstat_or_none(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except OSError:
+        return None
+
+
+def _is_existing_private_directory(path: Path) -> bool:
+    metadata = _lstat_or_none(path)
+    return (
+        metadata is not None
+        and not stat.S_ISLNK(metadata.st_mode)
+        and stat.S_ISDIR(metadata.st_mode)
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+    )
+
+
+def _is_existing_private_regular_file(path: Path) -> bool:
+    metadata = _lstat_or_none(path)
+    return (
+        metadata is not None
+        and not stat.S_ISLNK(metadata.st_mode)
+        and stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+    )
+
+
+def _existing_partition_root(
+    *,
+    ledger_root: Path,
+    product_slug: str,
+    owner_slug: str,
+    session_slug: str,
+) -> Path | None:
+    partitions_root = ledger_root / "partitions"
+    product_root = partitions_root / product_slug
+    owner_root = product_root / owner_slug
+    session_root = owner_root / session_slug
+    if not all(
+        _is_existing_private_directory(path)
+        for path in (partitions_root, product_root, owner_root, session_root)
+    ):
+        return None
+    if any(
+        not _is_existing_private_regular_file(session_root / name)
+        for name in ("chat.jsonl", "journal.key", "permit.key")
+    ):
+        return None
+    return session_root
+
+
+def _load_existing_journal_state(root: Path) -> _TenantJournalState:
+    """Open an already-durable partition without mkdir, keys, or empty journals."""
+
+    journal_path = root / "chat.jsonl"
+    if not _is_existing_private_regular_file(journal_path):
+        raise ValueError("existing approval partition journal is missing")
+    journal_key = _read_strict_key(root / "journal.key")
+    permit_key = _read_strict_key(root / "permit.key")
     journal = FileEchoLedger(journal_path, mac_key=journal_key)
     effects = _replay_effects(
         journal.records,

@@ -76,17 +76,27 @@ def _runtime_bundle(tmp_path: Path, *, managed: bool = False):  # type: ignore[n
         now_fn=lambda: 1_000,
         ledger_path=state_dir / "leases.jsonl",
     )
+    # Use the same real Echo authority for approval resolution/CAS and the
+    # connector lease anchor.  A mirror-only queue cannot mint a closed claim
+    # receipt and must not be used as a production-like runtime fixture.
+    from js.echo.ledger.service import EchoSafetyService
+    from js.security.approvals import wire_echo_approval_authority
+
+    echo_service = EchoSafetyService(state_dir=state_dir / "echo")
+    approvals = ApprovalQueue(
+        default_mode=ApprovalMode.MANUAL,
+        ledger_path=state_dir / "approvals.jsonl",
+    )
+    approvals.set_echo_authority(
+        wire_echo_approval_authority(echo_service, product_id="js-agent")
+    )
     agent = SimpleNamespace(
         settings=settings,
-        approvals=ApprovalQueue(default_mode=ApprovalMode.MANUAL),
+        approvals=approvals,
         _current_allowed_tools=set(),
         _tool_lease_authority=authority,
     )
     agent._get_echo_tool_lease_authority = lambda: authority
-    # Provide a real EchoSafetyService for the two-phase lease consume anchor
-    from js.echo.ledger.service import EchoSafetyService
-
-    echo_service = EchoSafetyService(state_dir=state_dir / "echo")
     agent._echo_safety_service = echo_service
     store = None
     binding_token = None

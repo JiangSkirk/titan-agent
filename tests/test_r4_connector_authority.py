@@ -5,7 +5,6 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import multiprocessing
-import time
 from pathlib import Path
 
 import pytest
@@ -576,30 +575,23 @@ def test_echo_claimed_now_vs_already_claimed(tmp_path: Path) -> None:
     """claim_once returns claimed_now=True first, False on retry."""
     queue, request_id, args_hash, service, authority = _resolved_echo_approval(tmp_path)
 
-    receipt1 = authority.claim_once(
-        tenant_id="owner-a",
-        session_id="session-a",
-        run_id="run-a",
-        request_id=request_id,
-        tool_name="connector.local_publish.write",
-        arguments_hash=args_hash,
-        approval_mode="manual",
-        expires_at=time.time() + 3600,
-        requested_at=time.time(),
-    )
+    record = queue._resolved_record_for_claim(request_id)  # noqa: SLF001
+    assert record is not None
+    claim_kwargs = {
+        "tenant_id": "owner-a",
+        "session_id": "session-a",
+        "run_id": "run-a",
+        "request_id": request_id,
+        "tool_name": "connector.local_publish.write",
+        "arguments_hash": args_hash,
+        "approval_mode": "manual",
+        "expires_at": record.expires_at,
+        "requested_at": record.requested_at,
+    }
+    receipt1 = authority.claim_once(**claim_kwargs)
     assert receipt1.claimed_now is True
 
-    receipt2 = authority.claim_once(
-        tenant_id="owner-a",
-        session_id="session-a",
-        run_id="run-a",
-        request_id=request_id,
-        tool_name="connector.local_publish.write",
-        arguments_hash=args_hash,
-        approval_mode="manual",
-        expires_at=time.time() + 3600,
-        requested_at=time.time(),
-    )
+    receipt2 = authority.claim_once(**claim_kwargs)
     assert receipt2.claimed_now is False
     assert receipt2.request_id == receipt1.request_id
 
@@ -608,6 +600,8 @@ def test_echo_binding_conflict_different_binding_same_id(tmp_path: Path) -> None
     """Same request_id but different binding -> ValueError (corruption)."""
     queue, request_id, args_hash, service, authority = _resolved_echo_approval(tmp_path)
 
+    record = queue._resolved_record_for_claim(request_id)  # noqa: SLF001
+    assert record is not None
     authority.claim_once(
         tenant_id="owner-a",
         session_id="session-a",
@@ -616,8 +610,8 @@ def test_echo_binding_conflict_different_binding_same_id(tmp_path: Path) -> None
         tool_name="connector.local_publish.write",
         arguments_hash=args_hash,
         approval_mode="manual",
-        expires_at=time.time() + 3600,
-        requested_at=time.time(),
+        expires_at=record.expires_at,
+        requested_at=record.requested_at,
     )
 
     # Try to claim with different binding (different tool_name)
@@ -630,8 +624,8 @@ def test_echo_binding_conflict_different_binding_same_id(tmp_path: Path) -> None
             tool_name="connector.local_import.read",  # different
             arguments_hash=args_hash,
             approval_mode="manual",
-            expires_at=time.time() + 3600,
-            requested_at=time.time(),
+            expires_at=record.expires_at,
+            requested_at=record.requested_at,
         )
 
 
@@ -653,6 +647,8 @@ def _echo_claim_worker(
     product_id: str,
     request_id: str,
     args_hash: str,
+    expires_at: float,
+    requested_at: float,
     start_event: object,
     result_queue: object,
 ) -> None:
@@ -671,8 +667,8 @@ def _echo_claim_worker(
             tool_name="connector.local_publish.write",
             arguments_hash=args_hash,
             approval_mode="manual",
-            expires_at=time.time() + 3600,
-            requested_at=time.time(),
+            expires_at=expires_at,
+            requested_at=requested_at,
         )
         result_queue.put("claimed_now" if receipt.claimed_now else "already_claimed")  # type: ignore[attr-defined]
     except Exception as exc:
@@ -682,6 +678,8 @@ def _echo_claim_worker(
 def test_two_process_echo_claim_exact_once(tmp_path: Path) -> None:
     """Two processes claim same binding; exactly one succeeds via Echo CAS."""
     queue, request_id, args_hash, service, authority = _resolved_echo_approval(tmp_path)
+    record = queue._resolved_record_for_claim(request_id)  # noqa: SLF001
+    assert record is not None
     del queue
 
     ctx = multiprocessing.get_context("spawn")
@@ -693,8 +691,10 @@ def test_two_process_echo_claim_exact_once(tmp_path: Path) -> None:
             args=(
                 str(tmp_path / "echo"),
                 "js-agent",
-                request_id,
-                args_hash,
+                    request_id,
+                    args_hash,
+                    record.expires_at,
+                    record.requested_at,
                 start_event,
                 result_queue,
             ),

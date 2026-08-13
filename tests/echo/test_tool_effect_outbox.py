@@ -23,7 +23,11 @@ from js.echo.ledger.journal import FileEchoLedger
 from js.echo.ledger.service import EchoSafetyService, EchoUnavailableError
 from js.echo.mode_contract import AppMode, ArtifactRefV1, TaskRef
 from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runtime_context
-from js.security.approvals import ApprovalMode, ApprovalQueue
+from js.security.approvals import (
+    ApprovalMode,
+    ApprovalQueue,
+    wire_echo_approval_authority,
+)
 from js.security.guard import BehaviorGuard
 from js.security.secrets import SecretManager
 from js.tools.registry import ToolRegistry, ToolResult, ToolSpec
@@ -725,6 +729,12 @@ def _build_executor(
     executor._echo_durable_executor = _TEST_DURABLE_EXECUTOR
     executor.echo_safety_service = EchoSafetyService(state_dir=tmp_path)
     executor.approvals = ApprovalQueue(default_mode=ApprovalMode.AUTO_APPROVE)
+    executor.approvals.set_echo_authority(
+        wire_echo_approval_authority(
+            executor.echo_safety_service,
+            product_id=settings.product_id,
+        )
+    )
     return executor
 
 

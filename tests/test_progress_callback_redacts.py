@@ -26,7 +26,13 @@ from js.echo.ledger.service import EchoSafetyService
 from js.echo.primitives import stable_payload_hash
 from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runtime_context
 from js.echo.types import CapabilityLease
-from js.security.approvals import ApprovalDecision, ApprovalDecisionType
+from js.security.approvals import (
+    ApprovalDecision,
+    ApprovalDecisionType,
+    ApprovalMode,
+    ApprovalQueue,
+    wire_echo_approval_authority,
+)
 from js.security.secrets import SecretManager
 from js.tools.registry import (
     EchoToolExecutionContext,
@@ -97,10 +103,35 @@ class _DecisionApprovals:
     def __init__(self, decision: ApprovalDecision) -> None:
         self.decision = decision
         self.requests: list[dict[str, Any]] = []
+        self._queue: ApprovalQueue | None = None
+
+    def bind_echo_authority(self, service: EchoSafetyService, state_dir: Any) -> None:
+        queue = ApprovalQueue(
+            default_mode=ApprovalMode.MANUAL,
+            ledger_path=state_dir / "approval-harness.jsonl",
+        )
+        queue.set_echo_authority(
+            wire_echo_approval_authority(service, product_id="js-agent")
+        )
+        self._queue = queue
 
     def request_decision(self, *args: Any, **kwargs: Any) -> ApprovalDecision:
         self.requests.append({"args": args, "kwargs": kwargs})
-        return self.decision
+        assert self._queue is not None
+        arguments = kwargs["arguments"]
+        self._queue.set_callback(
+            kwargs["session_id"],
+            lambda _request: self.decision,
+            owner_key_hash=kwargs["owner_key_hash"],
+            run_id=kwargs["run_id"],
+            tool_name=kwargs["tool_name"],
+            arguments=arguments,
+        )
+        return self._queue.request_decision(*args, **kwargs)
+
+    def consume_approved_binding(self, *args: Any, **kwargs: Any) -> Any:
+        assert self._queue is not None
+        return self._queue.consume_approved_binding(*args, **kwargs)
 
     def request(self, *args: Any, **kwargs: Any) -> bool:
         raise AssertionError("dangerous Echo tools must use request_decision")
@@ -110,13 +141,23 @@ class _PendingThenApprove:
     def __init__(self) -> None:
         self.polls = 0
         self.request_kwargs: dict[str, Any] = {}
+        self._queue: ApprovalQueue | None = None
+        self._resolved = False
+
+    def bind_echo_authority(self, service: EchoSafetyService, state_dir: Any) -> None:
+        queue = ApprovalQueue(
+            default_mode=ApprovalMode.MANUAL,
+            ledger_path=state_dir / "approval-harness.jsonl",
+        )
+        queue.set_echo_authority(
+            wire_echo_approval_authority(service, product_id="js-agent")
+        )
+        self._queue = queue
 
     def request_decision(self, *args: Any, **kwargs: Any) -> ApprovalDecision:
         self.request_kwargs = kwargs
-        return ApprovalDecision(
-            ApprovalDecisionType.PENDING,
-            request_id="approval-pending",
-        )
+        assert self._queue is not None
+        return self._queue.request_decision(*args, **kwargs)
 
     def take_decision(
         self,
@@ -124,16 +165,20 @@ class _PendingThenApprove:
         *,
         owner_key_hash: str | None = None,
     ) -> ApprovalDecision | None:
-        assert request_id == "approval-pending"
         assert owner_key_hash == "owner-a"
+        assert self._queue is not None
         self.polls += 1
         if self.polls < 2:
             return None
-        return ApprovalDecision(
-            ApprovalDecisionType.APPROVE,
-            request_id=request_id,
-            reason="web operator",
-        )
+        if not self._resolved:
+            self._queue.decide(
+                request_id,
+                ApprovalDecisionType.APPROVE,
+                owner_key_hash=owner_key_hash,
+                reason="web_operator",
+            )
+            self._resolved = True
+        return self._queue.take_decision(request_id, owner_key_hash=owner_key_hash)
 
     def get_pending_request(
         self,
@@ -141,9 +186,13 @@ class _PendingThenApprove:
         *,
         owner_key_hash: str | None = None,
     ) -> Any:
-        assert request_id == "approval-pending"
         assert owner_key_hash == "owner-a"
-        return type("_Pending", (), {"timeout_seconds": 1.0})()
+        assert self._queue is not None
+        return self._queue.get_pending_request(request_id, owner_key_hash=owner_key_hash)
+
+    def consume_approved_binding(self, *args: Any, **kwargs: Any) -> Any:
+        assert self._queue is not None
+        return self._queue.consume_approved_binding(*args, **kwargs)
 
 
 class _ResolvedBetweenPollAndPendingLookup:
@@ -206,6 +255,7 @@ class _Settings:
 
     security = _Sec()
     echo_engine = "on"
+    product_id = "js-agent"
 
 
 class _Executor(ToolExecutorMixin):
@@ -233,6 +283,9 @@ class _Executor(ToolExecutorMixin):
         self._echo_durable_executor = _TEST_DURABLE_EXECUTOR
         self.echo_safety_service = EchoSafetyService(state_dir=self.settings.state_dir)
         _TEST_SAFETY_SERVICES.append(self.echo_safety_service)
+        bind_approval_authority = getattr(self.approvals, "bind_echo_authority", None)
+        if callable(bind_approval_authority):
+            bind_approval_authority(self.echo_safety_service, self.settings.state_dir)
         self._current_allowed_tools: set[str] = {"stub_tool"}
         self._role = None  # disable role-based whitelist
         self.handler_calls = 0

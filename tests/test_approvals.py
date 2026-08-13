@@ -226,7 +226,7 @@ class TestApprovalQueue:
         assert stats["resolved"] == 1
         assert stats["denied"] == 1
 
-    def test_client_reason_is_redacted_before_approval_ledger_write(
+    def test_client_reason_is_hashed_before_approval_ledger_write(
         self,
         tmp_path: Path,
     ) -> None:
@@ -252,7 +252,13 @@ class TestApprovalQueue:
 
         ledger_text = ledger_path.read_text(encoding="utf-8")
         assert secret not in ledger_text
-        assert "[REDACTED:openai_key]" in ledger_text
+        assert "[REDACTED:openai_key]" not in ledger_text
+        rows = [json.loads(line) for line in ledger_text.splitlines()]
+        responded = next(row for row in rows if row["event_type"] == "approval_responded")
+        assert "reason" not in responded
+        assert responded["reason_hash"] == ApprovalQueue.arguments_hash(
+            {"reason": f"diagnostic {secret}"}
+        )
 
     def test_pending_requests_are_owner_scoped(self, queue: ApprovalQueue) -> None:
         first = queue.request_decision(

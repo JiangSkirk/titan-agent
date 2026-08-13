@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import threading
 import time
@@ -810,6 +811,174 @@ class FileEchoLedger:
         self._offset = clean_offset
         self._reload_or_raise_locked(handle, replacement=False)
         return True
+
+
+def read_verified_records_existing(*, journal_fd: int, mac_key: bytes) -> tuple[CommitRecord, ...]:
+    """Read verified active-journal records from an already-opened descriptor."""
+
+    return tuple(_read_verified_records_from_fd(journal_fd, mac_key=mac_key))
+
+
+def read_verified_logical_records_existing(
+    *,
+    journal_fd: int,
+    mac_key: bytes,
+    archive_fd: int | None = None,
+) -> tuple[CommitRecord | ArchiveRecord, ...]:
+    """Read an already-opened journal (and optional archive) with zero writes.
+
+    The caller must supply descriptors opened existing-only
+    (``O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC``) and already
+    fstat-validated.  This function only uses ``os.pread`` / in-memory
+    SQLite deserialize.  It never creates, chmod's, truncates, isolates,
+    or re-opens a path.
+    """
+
+    records = _read_verified_records_from_fd(journal_fd, mac_key=mac_key)
+    anchors = [record for record in records if record.record_type == "snapshot_anchor"]
+    if not anchors:
+        if archive_fd is not None:
+            raise ValueError("existing journal archive is unexpected")
+        return tuple(records)
+    if len(anchors) != 1 or records[0] != anchors[0]:
+        raise ValueError("invalid journal archive chain")
+    anchor = anchors[0]
+    if not _is_sqlite_archive_anchor(anchor.payload):
+        raise ValueError("invalid journal archive chain")
+    if archive_fd is None:
+        raise ValueError("invalid required journal archive")
+    ref = _archive_ref_from_payload(anchor.payload)
+    archived = _read_verified_archive_records_from_fd(
+        archive_fd,
+        ref=ref,
+        mac_key=mac_key,
+    )
+    retained_count = anchor.payload.get("retained_record_count")
+    current = tuple(
+        record for record in records if record.record_type != "snapshot_anchor"
+    )
+    if (
+        not isinstance(retained_count, int)
+        or isinstance(retained_count, bool)
+        or retained_count < 0
+        or retained_count > len(current)
+    ):
+        raise ValueError("invalid journal archive chain")
+    return tuple(archived) + current[retained_count:]
+
+
+def _pread_all(fd: int) -> bytes:
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("existing journal node is not a regular file")
+    size = metadata.st_size
+    if size <= 0:
+        return b""
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < size:
+        piece = os.pread(fd, min(1 << 20, size - offset), offset)
+        if not piece:
+            break
+        chunks.append(piece)
+        offset += len(piece)
+    return b"".join(chunks)
+
+
+def _read_verified_records_from_fd(fd: int, *, mac_key: bytes) -> list[CommitRecord]:
+    data = _pread_all(fd)
+    if data and not data.endswith((b"\n", b"\r")):
+        raise ValueError("invalid journal file")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("invalid journal file") from exc
+    records: list[CommitRecord] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid journal file") from exc
+        if not isinstance(row, dict):
+            raise ValueError("invalid journal file")
+        try:
+            record = _record_from_row(row)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid journal file") from exc
+        tip = records[-1] if records else None
+        error = _validate_next_record(
+            record,
+            expected_seq=len(records),
+            expected_prev_hash=tip.record_hash if tip is not None else GENESIS_HASH,
+            mac_key=mac_key,
+        )
+        if error:
+            raise ValueError("invalid journal file")
+        records.append(record)
+    return records
+
+
+def _read_verified_archive_records_from_fd(
+    fd: int,
+    *,
+    ref: ArchiveManifestRef,
+    mac_key: bytes,
+) -> list[ArchiveRecord]:
+    connection = _connect_existing_sqlite(fd)
+    try:
+        store = object.__new__(ArchiveStore)
+        store._path = Path(".")
+        store._tenant_id = ref.tenant_id
+        store._mac_key = _archive_mac_key(mac_key)
+        store._store_id = ref.store_id
+        store._verified_snapshot = None
+        store._busy_timeout_ms = 1
+        if not store._verify_in_transaction(connection, ref):
+            raise ValueError("invalid required journal archive")
+        rows = connection.execute(
+            "SELECT record_type, tenant_id, run_id, canonical_payload "
+            "FROM archive_records WHERE generation <= ? ORDER BY sequence",
+            (ref.generation,),
+        )
+        archived: list[ArchiveRecord] = []
+        for row in rows:
+            payload = json.loads(str(row[3]))
+            archived.append(
+                ArchiveRecord(
+                    record_type=str(row[0]),
+                    tenant_id=str(row[1]),
+                    run_id=str(row[2]),
+                    payload=payload,
+                )
+            )
+        return archived
+    except (ArchiveStoreError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid required journal archive") from exc
+    finally:
+        connection.close()
+
+
+def _connect_existing_sqlite(fd: int) -> sqlite3.Connection:
+    """Open an already-validated archive descriptor without path reopen or writes."""
+
+    uri = f"file:/dev/fd/{fd}?mode=ro&immutable=1"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        connection = None
+    if connection is not None:
+        return connection
+    data = _pread_all(fd)
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.deserialize(data)
+    except sqlite3.Error:
+        connection.close()
+        raise
+    return connection
 
 
 def verify_records(records: tuple[CommitRecord, ...], *, mac_key: bytes) -> VerificationReport:

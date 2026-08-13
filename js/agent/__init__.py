@@ -282,14 +282,15 @@ class JSAgent(
         )
         # Unify the approval lifecycle into the authoritative EchoLedger; the
         # local JSONL file remains only a derived mirror.
-        from js.security.approvals import wire_echo_approval_sink
+        from js.security.approvals import wire_echo_approval_authority
 
-        self.approvals.set_echo_event_sink(
-            wire_echo_approval_sink(
-                self.echo_safety_service,
-                product_id=str(getattr(settings, "product_id", "js-agent")),
-            )
+        # Install the sealed Echo authority so consume_approved_binding
+        # uses Echo CAS for exactly-once claims (fail-closed without it).
+        echo_authority = wire_echo_approval_authority(
+            self.echo_safety_service,
+            product_id=str(getattr(settings, "product_id", "js-agent")),
         )
+        self.approvals.set_echo_authority(echo_authority)
         self.defense_strategies = build_default_strategies()
         self._setup_tools()
 

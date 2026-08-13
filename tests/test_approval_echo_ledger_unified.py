@@ -30,7 +30,7 @@ from js.agent.tool_executor import ToolExecutorMixin
 from js.echo.durable_thread import EchoDurableExecutor
 from js.echo.ledger.journal import FileEchoLedger
 from js.echo.ledger.service import EchoSafetyService
-from js.security.approvals import ApprovalMode, ApprovalQueue
+from js.security.approvals import ApprovalMode, ApprovalQueue, wire_echo_approval_authority
 from js.security.guard import BehaviorGuard
 from js.tools.registry import ToolRegistry, ToolResult, ToolSpec
 
@@ -134,7 +134,12 @@ def _build_executor(
         default_mode=ApprovalMode.AUTO_APPROVE,
         ledger_path=tmp_path / "echo_approvals.jsonl",
     )
-    executor.approvals.set_echo_event_sink(_make_sink(executor.echo_safety_service))
+    executor.approvals.set_echo_authority(
+        wire_echo_approval_authority(
+            executor.echo_safety_service,
+            product_id="product-a",
+        )
+    )
     return executor
 
 
@@ -206,13 +211,17 @@ async def test_approved_execution_records_claim_and_finalize(tmp_path: Path) -> 
     events = _approval_events(_journal_records(executor.echo_safety_service))
     by_type: dict[str, dict[str, Any]] = {event["event_type"]: event for event in events}
     assert "approval_execution_claimed" in by_type
-    assert "approval_finalized" in by_type
+    assert "approval_execution_bound" in by_type
+    assert "approval_execution_finalized" in by_type
     claimed = by_type["approval_execution_claimed"]
-    finalized = by_type["approval_finalized"]
+    bound = by_type["approval_execution_bound"]
+    finalized = by_type["approval_execution_finalized"]
     assert claimed["request_id"] == by_type["approval_approved"]["request_id"]
     assert finalized["request_id"] == claimed["request_id"]
-    assert claimed["execution_effect_id"]
-    assert finalized["execution_effect_id"] == claimed["execution_effect_id"]
+    assert bound["execution_effect_id"]
+    assert bound["claim_receipt_hash"]
+    assert finalized["execution_effect_id"] == bound["execution_effect_id"]
+    assert finalized["claim_receipt_hash"] == bound["claim_receipt_hash"]
     assert finalized["status"] == "ok"
 
 
@@ -227,7 +236,12 @@ async def test_rejected_approval_has_no_execution_link(tmp_path: Path) -> None:
         default_mode=ApprovalMode.AUTO_DENY,
         ledger_path=tmp_path / "echo_approvals.jsonl",
     )
-    executor.approvals.set_echo_event_sink(_make_sink(executor.echo_safety_service))
+    executor.approvals.set_echo_authority(
+        wire_echo_approval_authority(
+            executor.echo_safety_service,
+            product_id="product-a",
+        )
+    )
     _message, result = await _execute(executor, tool_name="dangerous_action", arguments={})
     assert result.success is False
 
@@ -389,7 +403,12 @@ async def test_edit_reissues_lease_bound_to_edited_arguments(tmp_path: Path) -> 
         default_mode=ApprovalMode.MANUAL,
         ledger_path=tmp_path / "echo_approvals.jsonl",
     )
-    executor.approvals.set_echo_event_sink(_make_sink(executor.echo_safety_service))
+    executor.approvals.set_echo_authority(
+        wire_echo_approval_authority(
+            executor.echo_safety_service,
+            product_id="product-a",
+        )
+    )
 
     def edit_callback(_req: Any) -> ApprovalDecision:
         return ApprovalDecision(

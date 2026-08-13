@@ -26,7 +26,12 @@ from js.echo.durable_thread import claim_to_thread, durable_to_thread
 from js.echo.private_handoff import PrivateHandoffVault
 from js.echo.turn_context import current_runtime_context
 from js.models.providers import ChatMessage
-from js.security.approvals import ApprovalDecision, ApprovalDecisionType
+from js.security.approvals import (
+    ApprovalClaimProof,
+    ApprovalDecision,
+    ApprovalDecisionType,
+    ApprovalQueue,
+)
 from js.security.audit import AuditEventType
 from js.tools.registry import (
     EchoToolExecutionContext,
@@ -1090,7 +1095,7 @@ class ToolExecutorMixin(AgentBase):
                     session_id=session_id,
                     run_id=run_id,
                     tool_name=tool_name,
-                    arguments=arguments,
+                    arguments={"arguments_hash": stable_payload_hash(arguments)},
                 )
             )
             run_context = _approval_context_from_channel(channel)
@@ -1138,8 +1143,7 @@ class ToolExecutorMixin(AgentBase):
                 claim=claimed,
             )
             raise
-        except Exception as exc:
-            exception_type = type(exc).__name__
+        except Exception:
             await durable_to_thread(
                 lambda: echo_service.finish_tool_effect(
                     approval_effect,
@@ -1148,7 +1152,7 @@ class ToolExecutorMixin(AgentBase):
                         {
                             "status": "failed",
                             "approval_binding": binding_hash,
-                            "exception_type": exception_type,
+                            "error_code": "approval_resolution_failed",
                         }
                     ),
                 ),
@@ -1184,6 +1188,7 @@ class ToolExecutorMixin(AgentBase):
             "request_id": str(getattr(decision, "request_id", "")),
             "approval_effect_id": str(getattr(approval_effect, "effect_id", "")),
             "tenant_id": owner_key_hash,
+            "product_id": product_id,
         }
         return decision, approval_ref
 
@@ -4228,13 +4233,29 @@ class ToolExecutorMixin(AgentBase):
             )
 
         try:
-            arguments = (
+            parsed_arguments = (
                 json.loads(raw_args)
                 if isinstance(raw_args, str)
                 else (raw_args if isinstance(raw_args, dict) else {})
             )
         except json.JSONDecodeError as e:
             err_result = ToolResult(success=False, error=f"Invalid tool arguments JSON: {e}")
+            return (
+                ChatMessage(
+                    role="tool",
+                    content=err_result.to_text(),
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                ),
+                err_result,
+            )
+        try:
+            arguments = ApprovalQueue.snapshot_arguments(parsed_arguments)
+        except ValueError:
+            err_result = ToolResult(
+                success=False,
+                error="Invalid tool arguments: JSON-safe bounded object required",
+            )
             return (
                 ChatMessage(
                     role="tool",
@@ -4390,6 +4411,8 @@ class ToolExecutorMixin(AgentBase):
 
         # Approval check for dangerous tools (must be awaited, so runs inline)
         approval_ref: dict[str, str] | None = None
+        approval_claim: ApprovalClaimProof | None = None
+        final_arguments_hash: str | None = None
         spec = self.registry.get(tool_name)
         if spec and spec.dangerous:
             from js.events.models import AgentEvent
@@ -4464,7 +4487,22 @@ class ToolExecutorMixin(AgentBase):
                         ),
                         denied_result,
                     )
-                arguments = edited_arguments
+                try:
+                    arguments = ApprovalQueue.snapshot_arguments(edited_arguments)
+                except ValueError:
+                    denied_result = ToolResult(
+                        success=False,
+                        error="Operation denied: edited arguments are invalid",
+                    )
+                    return (
+                        ChatMessage(
+                            role="tool",
+                            content=denied_result.to_text(),
+                            tool_call_id=tool_call_id,
+                            name=tool_name,
+                        ),
+                        denied_result,
+                    )
                 argument_security_error = self._tool_argument_security_error(arguments)
                 if argument_security_error is not None:
                     denied_result = ToolResult(success=False, error=argument_security_error)
@@ -4501,15 +4539,54 @@ class ToolExecutorMixin(AgentBase):
                         session_id=session_id,
                         run_id=run_id,
                         tool_name=tool_name,
-                        reason=decision.reason or "approval rejected",
+                        reason="approval_rejected",
                     )
                 )
                 denied_result = ToolResult(
                     success=False,
-                    error=(
-                        "Operation denied: approval rejected"
-                        + (f" ({decision.reason})" if decision.reason else "")
+                    error="Operation denied: approval rejected",
+                )
+                return (
+                    ChatMessage(
+                        role="tool",
+                        content=denied_result.to_text(),
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
                     ),
+                    denied_result,
+                )
+            # The exact final EDIT/APPROVE arguments are now safety-checked.
+            # Claim before any granted/audit event, execution lease, outbox,
+            # or handler side effect.  A CAS loser returns with all of those
+            # downstream counts still zero.
+            try:
+                final_arguments_hash = stable_payload_hash(arguments)
+                approval_claim = await asyncio.to_thread(
+                    self.approvals.consume_approved_binding,
+                    approval_ref["request_id"],
+                    owner_key_hash=approval_owner_key_hash,
+                    session_id=session_id,
+                    run_id=run_id,
+                    tool_name=tool_name,
+                    arguments_hash=final_arguments_hash,
+                    require_manual=False,
+                )
+                if (
+                    not isinstance(approval_claim, ApprovalClaimProof)
+                    or approval_claim.claimed_now is not True
+                    or approval_claim.request_id != approval_ref["request_id"]
+                    or approval_claim.arguments_hash != final_arguments_hash
+                    or re.fullmatch(r"sha256:[0-9a-f]{64}", approval_claim.binding_hash) is None
+                    or re.fullmatch(
+                        r"sha256:[0-9a-f]{64}", approval_claim.journal_record_hash
+                    )
+                    is None
+                ):
+                    raise PermissionError("approval claim proof is invalid")
+            except Exception:
+                denied_result = ToolResult(
+                    success=False,
+                    error="Operation denied: approval claim failed",
                 )
                 return (
                     ChatMessage(
@@ -4531,6 +4608,7 @@ class ToolExecutorMixin(AgentBase):
         lease_error, echo_context = self._authorize_echo_tool_lease(
             tool_name=tool_name,
             arguments=arguments,
+            arguments_hash=final_arguments_hash,
             session_id=session_id,
             run_id=run_id,
             owner_key_hash=owner_key_hash,
@@ -4547,13 +4625,18 @@ class ToolExecutorMixin(AgentBase):
                 denied_result,
             )
 
+        audit_payload = (
+            {"arguments_hash": final_arguments_hash}
+            if approval_claim is not None
+            else {"arguments": arguments}
+        )
         self.audit.log(
             AuditEventType.TOOL_CALL,
             session_id,
             run_id,
             "agent",
             tool_name,
-            {"arguments": arguments},
+            audit_payload,
         )
         from js.events.models import AgentEvent
 
@@ -4562,7 +4645,11 @@ class ToolExecutorMixin(AgentBase):
                 session_id=session_id,
                 run_id=run_id,
                 tool_name=tool_name,
-                arguments=arguments,
+                arguments=(
+                    {"arguments_hash": final_arguments_hash}
+                    if approval_claim is not None
+                    else arguments
+                ),
             )
         )
 
@@ -4624,7 +4711,7 @@ class ToolExecutorMixin(AgentBase):
             executor=self._echo_durable_executor,
         )
         tool_effect = claimed_effect.value
-        if approval_ref is not None:
+        if approval_ref is not None and approval_claim is not None:
             # Link the approved execution back to its approval in the
             # authoritative EchoLedger (claim is exactly-once via the outbox).
             await asyncio.to_thread(
@@ -4633,32 +4720,34 @@ class ToolExecutorMixin(AgentBase):
                     product_id=product_id,
                     session_id=session_id,
                     run_id=run_id,
-                    event_type="approval_execution_claimed",
+                    event_type="approval_execution_bound",
                     request_id=approval_ref["request_id"],
                     tool_name=tool_name,
                     arguments_hash=echo_context.args_hash,
                     extra={
                         "approval_effect_id": approval_ref["approval_effect_id"],
                         "execution_effect_id": tool_effect.effect_id,
+                        "claim_receipt_hash": approval_claim.journal_record_hash,
                     },
                 )
             )
 
         def _record_approval_finalized(final_status: str) -> None:
-            if approval_ref is None:
+            if approval_ref is None or approval_claim is None:
                 return
             echo_service.record_approval_event(
                 tenant_id=approval_ref["tenant_id"],
                 product_id=product_id,
                 session_id=session_id,
                 run_id=run_id,
-                event_type="approval_finalized",
+                event_type="approval_execution_finalized",
                 request_id=approval_ref["request_id"],
                 tool_name=tool_name,
                 arguments_hash=echo_context.args_hash,
                 extra={
                     "approval_effect_id": approval_ref["approval_effect_id"],
                     "execution_effect_id": tool_effect.effect_id,
+                    "claim_receipt_hash": approval_claim.journal_record_hash,
                     "status": final_status,
                 },
             )
@@ -4955,6 +5044,7 @@ class ToolExecutorMixin(AgentBase):
         *,
         tool_name: str,
         arguments: dict[str, Any],
+        arguments_hash: str | None = None,
         session_id: str,
         run_id: str,
         owner_key_hash: str | None = None,
@@ -4964,7 +5054,7 @@ class ToolExecutorMixin(AgentBase):
         try:
             authority = self._get_echo_tool_lease_authority()
             owner = self._current_echo_owner(owner_key_hash)
-            args_hash = stable_payload_hash(arguments)
+            args_hash = arguments_hash or stable_payload_hash(arguments)
             runtime_context = current_runtime_context()
             product_id = str(getattr(self.settings, "product_id", "js-agent"))
             profile = str(getattr(self.settings, "work_profile", "default"))
