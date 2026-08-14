@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,6 +23,11 @@ from js.models.router import ModelRouter, RoutingDecision
 class RecordingProvider(ModelProvider):
     def __init__(self) -> None:
         self.calls: list[tuple[list[ChatMessage], list[dict[str, Any]] | None]] = []
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     async def chat(
         self,
@@ -71,6 +77,7 @@ class RecordingRouter(ModelRouter):
         self._providers: dict[str, ModelProvider] = {"mock": provider}
         self._model_map: dict[str, str] = {}
         self._permit_verifier = permit_verifier or ModelPermitIssuer()
+        self._egress_consent_broker = None
 
     async def select_model(
         self, task_complexity: str = "medium", preferred: str | None = None
@@ -92,6 +99,7 @@ class RecordingRouter(ModelRouter):
         before_model_call: Any = None,
         after_model_call: Any = None,
         permit_grant: Any = None,
+        **kwargs: Any,
     ) -> ChatResponse:
         if before_model_call is None or after_model_call is None or permit_grant is None:
             raise RuntimeError(
@@ -106,15 +114,27 @@ class RecordingRouter(ModelRouter):
             )
 
         decision = await self.select_model(preferred=model)
-        self._consume_model_permit(permit_grant, decision, messages, tools)
-        context = await before_model_call(decision, messages, tools)
-        try:
-            response = await decision.provider.chat(
+        send_messages, send_tools, send_max_tokens, context = (
+            await self._authorize_egress_then_permit(
+                decision,
                 messages=messages,
-                model=decision.model,
                 tools=tools,
+                attachments=kwargs.get("attachments"),
+                provenance=kwargs.get("provenance"),
                 temperature=temperature,
                 max_tokens=max_tokens,
+                attempt_kind="initial",
+                before_model_call=before_model_call,
+                permit_grant=permit_grant,
+            )
+        )
+        try:
+            response = await decision.provider.chat(
+                messages=send_messages,
+                model=decision.model,
+                tools=send_tools,
+                temperature=temperature,
+                max_tokens=send_max_tokens,
             )
         except Exception as exc:
             await after_model_call(context, None, exc)

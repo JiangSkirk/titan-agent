@@ -12,6 +12,8 @@ from cachetools import TTLCache
 
 from js.config import JSSettings, ModelConfig
 from js.echo.ledger.service import EchoBlockedError, EchoUnavailableError
+from js.echo.model_budget import EchoBudgetExceededError
+from js.echo.turn_context import current_runtime_context
 from js.models.capability import (
     SafeProviderError,
     reraise_safe_provider_error,
@@ -26,6 +28,24 @@ from js.models.providers import (
     is_retryable_provider_error,
 )
 from js.models.stream_events import StreamEvent
+from js.security.egress import (
+    LOOPBACK_EXEMPTION_RECEIPT,
+    EgressAttemptV1,
+    EgressConsentError,
+    EgressConsentReceiptV1,
+    EgressIdentityV1,
+    build_egress_attempt,
+    classify_provider_endpoint,
+    consume_egress_receipt,
+    digest_jsonable,
+    endpoint_digest,
+    freeze_messages,
+    freeze_tools,
+    provider_endpoint_digest,
+    provider_endpoint_url,
+    provider_generation_of,
+    safe_egress_summary,
+)
 from js.security.secrets import (
     ProviderSecretScrubber,
     ProviderSecretScrubError,
@@ -191,9 +211,15 @@ def _mark_no_router_fallback(exc: BaseException) -> None:
 
 
 def _is_no_router_fallback(exc: BaseException) -> bool:
-    return isinstance(exc, (ProviderSecretScrubError, _SafeCancelledError)) or bool(
-        getattr(exc, _NO_ROUTER_FALLBACK_ATTR, False)
-    )
+    return isinstance(
+        exc,
+        (
+            ProviderSecretScrubError,
+            _SafeCancelledError,
+            EgressConsentError,
+            ModelPermitError,
+        ),
+    ) or bool(getattr(exc, _NO_ROUTER_FALLBACK_ATTR, False))
 
 
 def _failure_snapshot(
@@ -262,6 +288,8 @@ def _materialize_failure(snapshot: _FailureSnapshot) -> BaseException:
         error = EchoBlockedError(snapshot.message)
     elif snapshot.category == "echo_unavailable":
         error = EchoUnavailableError(snapshot.message)
+    elif snapshot.category == "echo_budget":
+        error = EchoBudgetExceededError(snapshot.message)
     elif snapshot.category == "safe":
         error = SafeProviderError(snapshot.message, retryable=snapshot.retryable)
     else:
@@ -309,6 +337,12 @@ def _hook_failure_snapshot(
         if isinstance(exc, EchoUnavailableError):
             return _FailureSnapshot(
                 category="echo_unavailable",
+                message=_safe_exception_message(scrubber, exc),
+                no_fallback=True,
+            )
+        if isinstance(exc, EchoBudgetExceededError):
+            return _FailureSnapshot(
+                category="echo_budget",
                 message=_safe_exception_message(scrubber, exc),
                 no_fallback=True,
             )
@@ -634,9 +668,11 @@ class _ProviderResponseStreamScrubber:
 
 
 def _provider_attempt_limit(provider: ModelProvider) -> int:
-    configured = getattr(getattr(provider, "config", None), "max_retries", 1)
+    configured = getattr(provider, "_max_retries_snapshot", None)
+    if configured is None:
+        configured = getattr(getattr(provider, "config", None), "max_retries", 1)
     try:
-        attempts = int(configured)
+        attempts = int(configured if configured is not None else 1)
     except (TypeError, ValueError):
         attempts = 1
     return max(1, min(attempts, _MAX_ROUTER_PROVIDER_ATTEMPTS))
@@ -854,7 +890,13 @@ class ModelRouter:
     # closed at the permit gate instead of raising AttributeError.
     _permit_verifier: Any | None = None
 
-    def __init__(self, settings: JSSettings, *, permit_verifier: Any | None = None) -> None:
+    def __init__(
+        self,
+        settings: JSSettings,
+        *,
+        permit_verifier: Any | None = None,
+        egress_consent_broker: Any | None = None,
+    ) -> None:
         self.settings = settings
         self._providers: dict[str, ModelProvider] = {}
         self._registered_provider_secrets: dict[int, tuple[object, ...]] = {}
@@ -867,7 +909,13 @@ class ModelRouter:
         # There is deliberately no public setter: authorization identity comes
         # from this cryptographic capability, not from rebindable callbacks.
         self._permit_verifier = permit_verifier
+        self._egress_consent_broker = egress_consent_broker
         self._init_providers()
+
+    def bind_egress_consent_broker(self, broker: Any) -> None:
+        if self._egress_consent_broker is not None:
+            raise RuntimeError("egress consent broker already bound")
+        self._egress_consent_broker = broker
 
     @staticmethod
     def _current_provider_secret(provider: ModelProvider) -> object:
@@ -935,27 +983,82 @@ class ModelRouter:
         decision: RoutingDecision,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None,
+        *,
+        attempt: EgressAttemptV1 | None = None,
+        receipt: EgressConsentReceiptV1 | None = None,
+        classification: str = "invalid",
     ) -> None:
         """Issue-and-verify a fresh single-use permit for one provider attempt.
 
-        Called before every real provider attempt (initial try, transport
-        retry, cross-provider fallback and stream reconnect).  Fails closed:
-        a missing/invalid verifier or a forged, expired, mismatched, or
+        Called after egress consent (when required) and the before-hook
+        re-check, immediately before transport.  Fails closed: a
+        missing/invalid verifier or a forged, expired, mismatched, or
         replayed permit aborts the call before any provider code runs.
+        Unbound ``permit_grant`` results never reach a provider method.
         """
+        del permit_grant, classification
         if self._permit_verifier is None:
             raise ModelPermitError(
                 "ModelRouter has no Echo permit verifier; direct provider calls "
                 "are only available through the Echo turn runtime."
             )
+        if attempt is None:
+            raise ModelPermitError("model permit requires a bound egress attempt")
         try:
-            permit = permit_grant(decision, messages, tools)
+            issuer = self._permit_verifier
+            if not callable(getattr(issuer, "issue", None)):
+                raise ModelPermitError("model permit issuer is unavailable")
+            consent_hash = (
+                receipt.claim_receipt_hash
+                if receipt is not None
+                else LOOPBACK_EXEMPTION_RECEIPT
+            )
+            if not attempt.attempt_hash:
+                raise ModelPermitError("model permit requires a bound egress attempt")
+            permit = issuer.issue(
+                provider_name=decision.provider_name,
+                model=decision.model,
+                messages=messages,
+                tools=tools,
+                owner_key_hash=attempt.owner_key_hash,
+                session_id=attempt.session_id,
+                run_id=attempt.run_id,
+                attempt_hash=attempt.attempt_hash,
+                consent_receipt_hash=consent_hash,
+                channel=attempt.channel,
+                provider_generation=attempt.provider_generation,
+                endpoint_digest=attempt.endpoint_digest,
+                attachments_digest=attempt.attachments_digest,
+                provenance_digest=attempt.provenance_digest,
+                temperature=attempt.temperature,
+                effective_max_tokens=attempt.effective_max_tokens,
+                appshell_epoch=attempt.appshell_epoch,
+            )
+            if (
+                getattr(permit, "attempt_hash", "") != attempt.attempt_hash
+                or getattr(permit, "endpoint_digest", "") != attempt.endpoint_digest
+                or getattr(permit, "provider_generation", "") != attempt.provider_generation
+            ):
+                raise ModelPermitError("model permit is not bound to the egress attempt")
             self._permit_verifier.verify_and_consume(
                 permit,
                 provider_name=decision.provider_name,
                 model=decision.model,
                 messages=messages,
                 tools=tools,
+                owner_key_hash=attempt.owner_key_hash,
+                session_id=attempt.session_id,
+                run_id=attempt.run_id,
+                attempt_hash=attempt.attempt_hash,
+                consent_receipt_hash=consent_hash,
+                channel=attempt.channel,
+                provider_generation=attempt.provider_generation,
+                endpoint_digest=attempt.endpoint_digest,
+                attachments_digest=attempt.attachments_digest,
+                provenance_digest=attempt.provenance_digest,
+                temperature=attempt.temperature,
+                effective_max_tokens=attempt.effective_max_tokens,
+                appshell_epoch=attempt.appshell_epoch,
             )
         except ModelPermitError as exc:
             _mark_no_router_fallback(exc)
@@ -963,6 +1066,216 @@ class ModelRouter:
         except Exception as exc:  # defensive: a broken grant must fail closed
             _mark_no_router_fallback(exc)
             raise ModelPermitError(f"model permit grant failed: {exc}") from exc
+
+    def _current_egress_identity(self) -> EgressIdentityV1 | None:
+        context = current_runtime_context()
+        if context is None or not context.owner_key_hash.strip():
+            return None
+        epoch = None
+        binding = context.appshell_epoch_binding
+        if binding is not None:
+            epoch = str(getattr(binding, "epoch", "") or "")
+        return EgressIdentityV1(
+            product_id=context.product_id,
+            channel=context.channel,
+            owner_key_hash=context.owner_key_hash,
+            session_id=context.session_id,
+            run_id=context.run_id,
+            appshell_epoch=epoch,
+        )
+
+    def _reverify_egress_attempt(
+        self,
+        *,
+        decision: RoutingDecision,
+        attempt: EgressAttemptV1,
+        identity: EgressIdentityV1,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+        attachments: Any,
+        provenance: Any,
+        temperature: float,
+        effective_max_tokens: int | None,
+    ) -> None:
+        context = current_runtime_context()
+        cancel = getattr(context, "cancel_token", None) if context is not None else None
+        if cancel is not None and bool(getattr(cancel, "is_set", lambda: False)()):
+            raise asyncio.CancelledError()
+        current = self._current_egress_identity()
+        if current is None:
+            raise EgressConsentError("trusted owner required for model egress")
+        if (
+            current.owner_key_hash != identity.owner_key_hash
+            or current.session_id != identity.session_id
+            or current.run_id != identity.run_id
+            or current.channel != identity.channel
+            or (current.appshell_epoch or "") != (identity.appshell_epoch or "")
+            or current.product_id != identity.product_id
+        ):
+            raise EgressConsentError("egress identity changed after consent")
+        if provider_generation_of(decision.provider) != attempt.provider_generation:
+            raise EgressConsentError("provider generation changed after consent")
+        if provider_endpoint_digest(decision.provider) != attempt.endpoint_digest:
+            raise EgressConsentError("provider endpoint changed after consent")
+        if endpoint_digest(provider_endpoint_url(decision.provider)) != attempt.endpoint_digest:
+            raise EgressConsentError("provider endpoint changed after consent")
+        replay = build_egress_attempt(
+            identity=identity,
+            attempt_kind=attempt.attempt_kind,
+            provider_name=decision.provider_name,
+            provider_generation=attempt.provider_generation,
+            model=decision.model,
+            endpoint_url=provider_endpoint_url(decision.provider),
+            messages=messages,
+            tools=tools,
+            attachments=attachments,
+            provenance=provenance,
+            temperature=temperature,
+            effective_max_tokens=effective_max_tokens,
+        )
+        # attempt_id is unique per attempt; compare the bound digests only.
+        if (
+            replay.messages_digest != attempt.messages_digest
+            or replay.tools_digest != attempt.tools_digest
+            or replay.attachments_digest != attempt.attachments_digest
+            or replay.provenance_digest != attempt.provenance_digest
+            or replay.temperature != attempt.temperature
+            or replay.effective_max_tokens != attempt.effective_max_tokens
+            or replay.endpoint_digest != attempt.endpoint_digest
+            or replay.provider_generation != attempt.provider_generation
+        ):
+            raise EgressConsentError("egress attempt digest changed after consent")
+
+    async def _authorize_egress_then_permit(
+        self,
+        decision: RoutingDecision,
+        *,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+        attachments: Any,
+        provenance: Any,
+        temperature: float,
+        max_tokens: int | None,
+        attempt_kind: str,
+        before_model_call: Callable[
+            [RoutingDecision, list[ChatMessage], list[dict[str, Any]] | None], Awaitable[Any]
+        ]
+        | None,
+        permit_grant: Callable[
+            [RoutingDecision, list[ChatMessage], list[dict[str, Any]] | None], Any
+        ],
+    ) -> tuple[list[ChatMessage], list[dict[str, Any]] | None, int | None, Any]:
+        classification = classify_provider_endpoint(decision.provider)
+        if classification == "invalid" or classification not in {
+            "literal_loopback",
+            "remote",
+        }:
+            raise EgressConsentError("provider endpoint is invalid")
+        frozen_messages = freeze_messages(messages)
+        frozen_tools = freeze_tools(tools)
+        frozen_attachments = digest_jsonable(attachments or [])
+        frozen_provenance = digest_jsonable(provenance or {})
+        effective_max_tokens = self._clamp_stream_max_tokens(decision, max_tokens)
+        identity = self._current_egress_identity()
+        if identity is None:
+            raise EgressConsentError("trusted owner required for model egress")
+        attempt = build_egress_attempt(
+            identity=identity,
+            attempt_kind=attempt_kind,
+            provider_name=decision.provider_name,
+            provider_generation=provider_generation_of(decision.provider),
+            model=decision.model,
+            endpoint_url=provider_endpoint_url(decision.provider),
+            messages=frozen_messages,
+            tools=frozen_tools,
+            attachments=attachments or [],
+            provenance=provenance or {},
+            temperature=temperature,
+            effective_max_tokens=effective_max_tokens,
+        )
+        receipt: EgressConsentReceiptV1 | None = None
+        if classification == "remote":
+            broker = self._egress_consent_broker
+            if broker is None:
+                raise EgressConsentError("egress consent broker required")
+            try:
+                receipt = await broker.request_and_claim(
+                    attempt,
+                    safe_egress_summary(
+                        attempt,
+                        endpoint_url=provider_endpoint_url(decision.provider),
+                        message_count=len(frozen_messages),
+                        tool_count=len(frozen_tools or []),
+                    ),
+                )
+            except BaseException as exc:
+                _mark_no_router_fallback(exc)
+                raise
+            if (
+                receipt.attempt_hash != attempt.attempt_hash
+                or not receipt.claim_receipt_hash
+                or not receipt.nonce
+            ):
+                raise EgressConsentError("egress consent receipt does not match the attempt")
+            consume_egress_receipt(receipt)
+        hook_messages = freeze_messages(frozen_messages)
+        hook_tools = freeze_tools(frozen_tools)
+        context: Any = None
+        if before_model_call is not None:
+            try:
+                context = await before_model_call(decision, hook_messages, hook_tools)
+            except Exception as exc:
+                _mark_no_router_fallback(exc)
+                raise
+        if (
+            digest_jsonable(attachments or []) != frozen_attachments
+            or digest_jsonable(provenance or {}) != frozen_provenance
+        ):
+            raise EgressConsentError("egress attachments or provenance changed after consent")
+        self._reverify_egress_attempt(
+            decision=decision,
+            attempt=attempt,
+            identity=identity,
+            messages=frozen_messages,
+            tools=frozen_tools,
+            attachments=attachments,
+            provenance=provenance,
+            temperature=temperature,
+            effective_max_tokens=effective_max_tokens,
+        )
+        current_identity = self._current_egress_identity()
+        if current_identity is None:
+            raise EgressConsentError("trusted owner required for model egress")
+        identity = current_identity
+        self._consume_model_permit(
+            permit_grant,
+            decision,
+            frozen_messages,
+            frozen_tools,
+            attempt=attempt,
+            receipt=receipt,
+            classification=classification,
+        )
+        if (
+            provider_endpoint_digest(decision.provider) != attempt.endpoint_digest
+            or provider_generation_of(decision.provider) != attempt.provider_generation
+            or endpoint_digest(provider_endpoint_url(decision.provider))
+            != attempt.endpoint_digest
+        ):
+            raise EgressConsentError("provider endpoint generation mismatch")
+        if (
+            receipt is not None
+            and receipt.attempt_hash != attempt.attempt_hash
+        ):
+            raise EgressConsentError("egress consent receipt does not match the attempt")
+        self._raise_if_runtime_cancelled()
+        return freeze_messages(frozen_messages), freeze_tools(frozen_tools), effective_max_tokens, context
+
+    def _raise_if_runtime_cancelled(self) -> None:
+        context = current_runtime_context()
+        cancel = getattr(context, "cancel_token", None) if context is not None else None
+        if cancel is not None and bool(getattr(cancel, "is_set", lambda: False)()):
+            raise asyncio.CancelledError()
 
     def _init_providers(self) -> None:
         allow_private = (
@@ -1232,6 +1545,8 @@ class ModelRouter:
             [RoutingDecision, list[ChatMessage], list[dict[str, Any]] | None], Any
         ]
         | None = None,
+        attachments: Any = None,
+        provenance: Any = None,
     ) -> ChatResponse:
         """Send chat request with automatic fallback.
 
@@ -1266,15 +1581,6 @@ class ModelRouter:
                 safe = _safe_outward_message(scrubber, safe)
             return safe
 
-        async def _before(call_decision: RoutingDecision) -> Any:
-            if before_model_call is None:
-                return None
-            try:
-                return await before_model_call(call_decision, messages, tools)
-            except Exception as exc:
-                _mark_no_router_fallback(exc)
-                raise
-
         async def _after(
             context: Any,
             response: ChatResponse | None,
@@ -1292,20 +1598,28 @@ class ModelRouter:
         async def _tainted_provider_call(
             call_decision: RoutingDecision,
             scrubber: ProviderSecretScrubber,
+            send_messages: list[ChatMessage],
+            send_tools: list[dict[str, Any]] | None,
+            send_temperature: float,
+            send_max_tokens: int | None,
         ) -> tuple[ChatResponse | None, _FailureSnapshot | None]:
             try:
                 raw = await call_decision.provider.chat(
-                    messages=messages,
+                    messages=send_messages,
                     model=call_decision.model,
-                    tools=tools,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                    tools=send_tools,
+                    temperature=send_temperature,
+                    max_tokens=send_max_tokens,
                 )
                 return _sanitize_chat_response(raw, call_decision, scrubber), None
             except BaseException as exc:
                 return None, _failure_snapshot(exc, scrubber, call_decision.provider)
 
-        async def _call_provider_once(call_decision: RoutingDecision) -> ChatResponse:
+        async def _call_provider_once(
+            call_decision: RoutingDecision,
+            *,
+            attempt_kind: str,
+        ) -> ChatResponse:
             context: Any = None
             response: ChatResponse | None = None
             failure: _FailureSnapshot | None = None
@@ -1313,9 +1627,30 @@ class ModelRouter:
             # permit is consumed or Echo reserves a durable finish slot.
             scrubber = self._scrubber_for_registered_decision(call_decision)
             attempt_scrubbers.append(scrubber)
-            self._consume_model_permit(permit_grant, call_decision, messages, tools)
-            context = await _before(call_decision)
-            response, failure = await _tainted_provider_call(call_decision, scrubber)
+            if permit_grant is None:
+                raise ModelPermitError("Echo model attempt is missing its runtime permit grant")
+            send_messages, send_tools, send_max_tokens, context = (
+                await self._authorize_egress_then_permit(
+                    call_decision,
+                    messages=messages,
+                    tools=tools,
+                    attachments=attachments,
+                    provenance=provenance,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    attempt_kind=attempt_kind,
+                    before_model_call=before_model_call,
+                    permit_grant=permit_grant,
+                )
+            )
+            response, failure = await _tainted_provider_call(
+                call_decision,
+                scrubber,
+                send_messages,
+                send_tools,
+                temperature,
+                send_max_tokens,
+            )
             if failure is not None:
                 hook_failure = await _after(
                     context,
@@ -1343,11 +1678,16 @@ class ModelRouter:
                 raise _materialize_failure(hook_failure) from None
             return response
 
-        async def _call_provider(call_decision: RoutingDecision) -> ChatResponse:
+        async def _call_provider(
+            call_decision: RoutingDecision,
+            *,
+            attempt_kind_base: str = "initial",
+        ) -> ChatResponse:
             attempt_limit = _provider_attempt_limit(call_decision.provider)
             for attempt in range(attempt_limit):
                 try:
-                    return await _call_provider_once(call_decision)
+                    kind = attempt_kind_base if attempt == 0 else "retry"
+                    return await _call_provider_once(call_decision, attempt_kind=kind)
                 except Exception as exc:
                     if (
                         _is_no_router_fallback(exc)
@@ -1405,7 +1745,7 @@ class ModelRouter:
                     provider_name=name,
                     reason=f"Fallback: {fallback_model}",
                 )
-                return await _call_provider(fallback_decision)
+                return await _call_provider(fallback_decision, attempt_kind_base="fallback")
             except Exception as e:
                 if _is_no_router_fallback(e):
                     raise
@@ -1414,7 +1754,7 @@ class ModelRouter:
 
         # Last resort: try the original selected provider even if unhealthy
         try:
-            return await _call_provider(decision)
+            return await _call_provider(decision, attempt_kind_base="last_resort")
         except Exception as e:
             if _is_no_router_fallback(e):
                 raise
@@ -1465,6 +1805,8 @@ class ModelRouter:
             [RoutingDecision, list[ChatMessage], list[dict[str, Any]] | None], Any
         ]
         | None = None,
+        attachments: Any = None,
+        provenance: Any = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Structured-event variant of ``chat_stream``.
 
@@ -1514,6 +1856,9 @@ class ModelRouter:
                 before_model_call=before_model_call,
                 after_model_call=after_model_call,
                 permit_grant=permit_grant,
+                attachments=attachments,
+                provenance=provenance,
+                attempt_kind="initial" if attempt == 0 else "stream_reconnect",
             )
             primary_emitted_output = False
             retry_requested = False
@@ -1597,6 +1942,9 @@ class ModelRouter:
                     before_model_call=before_model_call,
                     after_model_call=after_model_call,
                     permit_grant=permit_grant,
+                    attachments=attachments,
+                    provenance=provenance,
+                    attempt_kind="fallback",
                 )
                 async with aclosing(fallback_stream):
                     async for ev in fallback_stream:
@@ -1670,9 +2018,11 @@ class ModelRouter:
             [RoutingDecision, list[ChatMessage], list[dict[str, Any]] | None], Any
         ]
         | None = None,
+        attachments: Any = None,
+        provenance: Any = None,
+        attempt_kind: str = "initial",
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream one provider decision through the same model-gate hooks as chat()."""
-        provider_max_tokens = self._clamp_stream_max_tokens(decision, max_tokens)
         context: Any = None
         finalized = False
         text_parts: list[str] = []
@@ -1685,15 +2035,9 @@ class ModelRouter:
         before_completed = False
         hook_failure: _FailureSnapshot | None = None
         propagation_failure: _FailureSnapshot | None = None
-
-        async def _before() -> Any:
-            if before_model_call is None:
-                return None
-            try:
-                return await before_model_call(decision, messages, tools)
-            except Exception as exc:
-                _mark_no_router_fallback(exc)
-                raise
+        send_messages = messages
+        send_tools = tools
+        provider_max_tokens = self._clamp_stream_max_tokens(decision, max_tokens)
 
         async def _after(
             response: ChatResponse | None,
@@ -1723,15 +2067,27 @@ class ModelRouter:
         # this Provider generation cannot be scrubbed safely.
         exact_scrubber = self._scrubber_for_registered_decision(decision)
         response_stream = _ProviderResponseStreamScrubber(exact_scrubber)
-        self._consume_model_permit(permit_grant, decision, messages, tools)
-        context = await _before()
+        send_messages, send_tools, provider_max_tokens, context = (
+            await self._authorize_egress_then_permit(
+                decision,
+                messages=messages,
+                tools=tools,
+                attachments=attachments,
+                provenance=provenance,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                attempt_kind=attempt_kind,
+                before_model_call=before_model_call,
+                permit_grant=permit_grant,
+            )
+        )
         before_completed = True
 
         try:
             async for raw_ev in decision.provider.chat_stream_events(
-                messages=messages,
+                messages=send_messages,
                 model=decision.model,
-                tools=tools,
+                tools=send_tools,
                 temperature=temperature,
                 max_tokens=provider_max_tokens,
             ):

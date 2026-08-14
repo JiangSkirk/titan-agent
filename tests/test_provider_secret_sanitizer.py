@@ -22,7 +22,11 @@ from js.agent import JSAgent
 from js.config import JSSettings, ModelConfig, ModelProviderConfig, SecurityConfig
 from js.echo.effect_interpreter import ModelEffect
 from js.echo.state import AgentState as EchoAgentState
-from js.echo.turn_context import reset_runtime_context, set_runtime_context
+from js.echo.turn_context import (
+    RuntimeContext,
+    reset_runtime_context,
+    set_runtime_context,
+)
 from js.echo.turn_loop import EchoTurnLoop
 from js.echo.turn_runtime import EchoRuntime, TurnRequest
 from js.models.capability import (
@@ -40,6 +44,24 @@ from js.web.routers.chat import router as chat_router
 # Arbitrary-format secret — must NOT match sk-/sk-ant- redaction regexes.
 _SECRET = "xYz-NOT_A_SK_PREFIX_9876543210!@#"
 _MODEL = ModelConfig(id="leak-model", name="Leak Model", context_window=4096)
+_LOOPBACK = "http://127.0.0.1:9/v1"
+
+
+def _bind_stub_identity(tmp_path: Path) -> Any:
+    return set_runtime_context(
+        RuntimeContext(
+            product_id="js-agent",
+            channel="chat",
+            owner_key_hash="owner",
+            session_id="session",
+            run_id="run",
+            role="user",
+            profile="default",
+            capabilities=(),
+            workspace=tmp_path,
+            state_dir=tmp_path,
+        )
+    )
 
 
 def _leaky_message(secret: str = _SECRET) -> str:
@@ -182,19 +204,22 @@ def _provider_with_failing_client(secret: str = _SECRET) -> OpenAICompatibleProv
     provider = object.__new__(OpenAICompatibleProvider)
     provider.config = ModelProviderConfig(
         name="gemini-like",
-        base_url="https://generativelanguage.googleapis.com/v1beta",
+        base_url=_LOOPBACK,
         api_key=secret,
         auth_adapter="query_param",
         query_param_name="key",
         default_model="leak-model",
         models=[_MODEL],
     )
+    provider._endpoint_snapshot = _LOOPBACK
     provider._is_local = False
     provider._last_stream_usage = None
     provider._stream_options_supported = True
     provider.circuit = _Circuit()
+    provider._test_transport_calls = 0
 
     async def fail_create(**_kwargs: Any) -> Any:
+        provider._test_transport_calls += 1
         raise RuntimeError(_leaky_message(secret))
 
     provider.client = SimpleNamespace(
@@ -283,19 +308,28 @@ async def test_router_chat_explicit_model_does_not_leak_query_param_secret(
     provider = _provider_with_failing_client()
     router.add_provider("gemini-like", provider, [_MODEL])
     before, after, grant = _echo_hooks(router)
-
-    with caplog.at_level(logging.DEBUG), pytest.raises(SafeProviderError) as raised:
-        await router.chat(
-            [ChatMessage(role="user", content="hi")],
-            model="leak-model",
-            before_model_call=before,
-            after_model_call=after,
-            permit_grant=grant,
-        )
+    issuer = router._permit_verifier
+    assert isinstance(issuer, ModelPermitIssuer)
+    spent_before = issuer.spent_nonce_count()
+    token = _bind_stub_identity(tmp_path)
+    try:
+        with caplog.at_level(logging.DEBUG), pytest.raises(SafeProviderError) as raised:
+            await router.chat(
+                [ChatMessage(role="user", content="hi")],
+                model="leak-model",
+                before_model_call=before,
+                after_model_call=after,
+                permit_grant=grant,
+            )
+    finally:
+        reset_runtime_context(token)
 
     _assert_exception_secret_free(raised.value, _SECRET)
     _assert_secret_absent(_SECRET, caplog.text)
     assert "Requested model" in str(raised.value)
+    assert "trusted owner required" not in str(raised.value)
+    assert provider._test_transport_calls >= 1
+    assert issuer.spent_nonce_count() >= spent_before + 1
 
 
 @pytest.mark.asyncio
@@ -338,21 +372,28 @@ async def test_router_fallback_aggregation_scrubs_query_param_secrets(
 
     router.select_model = select_primary  # type: ignore[method-assign]
     before, after, grant = _echo_hooks(router)
-
-    with caplog.at_level(logging.DEBUG), pytest.raises(SafeProviderError) as raised:
-        await router.chat(
-            [ChatMessage(role="user", content="hi")],
-            model=None,
-            before_model_call=before,
-            after_model_call=after,
-            permit_grant=grant,
-        )
+    issuer = router._permit_verifier
+    assert isinstance(issuer, ModelPermitIssuer)
+    spent_before = issuer.spent_nonce_count()
+    token = _bind_stub_identity(tmp_path)
+    try:
+        with caplog.at_level(logging.DEBUG), pytest.raises(SafeProviderError) as raised:
+            await router.chat(
+                [ChatMessage(role="user", content="hi")],
+                model=None,
+                before_model_call=before,
+                after_model_call=after,
+                permit_grant=grant,
+            )
+    finally:
+        reset_runtime_context(token)
 
     _assert_exception_secret_free(raised.value, _SECRET)
     _assert_exception_secret_free(raised.value, backup_secret)
     _assert_secret_absent(_SECRET, caplog.text)
     _assert_secret_absent(backup_secret, caplog.text)
     assert "All providers failed" in str(raised.value)
+    assert issuer.spent_nonce_count() >= spent_before + 1
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +623,7 @@ async def test_router_rescrubs_custom_provider_error_event(
     class _LeakyStreamProvider:
         config = ModelProviderConfig(
             name="custom",
-            base_url="https://example.test/v1",
+            base_url=_LOOPBACK,
             api_key=_SECRET,
             auth_adapter="query_param",
             query_param_name="key",
@@ -604,6 +645,9 @@ async def test_router_rescrubs_custom_provider_error_event(
     provider = _LeakyStreamProvider()
     router.add_provider("custom", provider, [_MODEL])  # type: ignore[arg-type]
     before, _after, grant = _echo_hooks(router)
+    issuer = router._permit_verifier
+    assert isinstance(issuer, ModelPermitIssuer)
+    spent_before = issuer.spent_nonce_count()
     after_errors: list[BaseException | None] = []
 
     async def tracking_after(
@@ -613,21 +657,26 @@ async def test_router_rescrubs_custom_provider_error_event(
     ) -> None:
         after_errors.append(error)
 
-    with caplog.at_level(logging.DEBUG):
-        events = [
-            event
-            async for event in router.chat_stream_events(
-                [ChatMessage(role="user", content="hi")],
-                model="leak-model",
-                before_model_call=before,
-                after_model_call=tracking_after,
-                permit_grant=grant,
-            )
-        ]
+    token = _bind_stub_identity(tmp_path)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            events = [
+                event
+                async for event in router.chat_stream_events(
+                    [ChatMessage(role="user", content="hi")],
+                    model="leak-model",
+                    before_model_call=before,
+                    after_model_call=tracking_after,
+                    permit_grant=grant,
+                )
+            ]
+    finally:
+        reset_runtime_context(token)
     assert events and events[0].kind == "error"
     _assert_secret_absent(_SECRET, events[0].error, events[0], caplog.text)
     assert after_errors and isinstance(after_errors[0], SafeProviderError)
     _assert_exception_secret_free(after_errors[0], _SECRET)
+    assert issuer.spent_nonce_count() >= spent_before + 1
 
 
 @pytest.mark.asyncio
@@ -641,7 +690,7 @@ async def test_router_rebuild_error_event_strips_free_form_meta(
     class _LeakyMetaStreamProvider:
         config = ModelProviderConfig(
             name="custom",
-            base_url="https://example.test/v1",
+            base_url=_LOOPBACK,
             api_key=_SECRET,
             auth_adapter="query_param",
             query_param_name="key",
@@ -674,17 +723,24 @@ async def test_router_rebuild_error_event_strips_free_form_meta(
     provider = _LeakyMetaStreamProvider()
     router.add_provider("custom", provider, [_MODEL])  # type: ignore[arg-type]
     before, _after, grant = _echo_hooks(router)
+    issuer = router._permit_verifier
+    assert isinstance(issuer, ModelPermitIssuer)
+    spent_before = issuer.spent_nonce_count()
 
-    events = [
-        event
-        async for event in router.chat_stream_events(
-            [ChatMessage(role="user", content="hi")],
-            model="leak-model",
-            before_model_call=before,
-            after_model_call=_after,
-            permit_grant=grant,
-        )
-    ]
+    token = _bind_stub_identity(tmp_path)
+    try:
+        events = [
+            event
+            async for event in router.chat_stream_events(
+                [ChatMessage(role="user", content="hi")],
+                model="leak-model",
+                before_model_call=before,
+                after_model_call=_after,
+                permit_grant=grant,
+            )
+        ]
+    finally:
+        reset_runtime_context(token)
     assert events and events[0].kind == "error"
     ev = events[0]
     _assert_secret_absent(_SECRET, ev.error, ev.meta, repr(ev.meta))
@@ -704,6 +760,7 @@ async def test_router_rebuild_error_event_strips_free_form_meta(
     assert ev.provider == "custom"
     assert ev.model == "leak-model"
     assert isinstance(ev.meta.get("completion_tokens"), int)
+    assert issuer.spent_nonce_count() >= spent_before + 1
 
 
 @pytest.mark.asyncio
@@ -717,7 +774,7 @@ async def test_router_raw_stream_exception_is_safe_before_after_hook(
     class _RaisingStreamProvider:
         config = ModelProviderConfig(
             name="raising",
-            base_url="https://example.test/v1",
+            base_url=_LOOPBACK,
             api_key=_SECRET,
             auth_adapter="query_param",
             query_param_name="key",
@@ -738,6 +795,9 @@ async def test_router_raw_stream_exception_is_safe_before_after_hook(
     provider = _RaisingStreamProvider()
     router.add_provider("raising", provider, [_MODEL])  # type: ignore[arg-type]
     before, _after, grant = _echo_hooks(router)
+    issuer = router._permit_verifier
+    assert isinstance(issuer, ModelPermitIssuer)
+    spent_before = issuer.spent_nonce_count()
     after_errors: list[BaseException | None] = []
 
     async def tracking_after(
@@ -749,19 +809,24 @@ async def test_router_raw_stream_exception_is_safe_before_after_hook(
         if error is not None:
             _assert_exception_secret_free(error, _SECRET)
 
-    with caplog.at_level(logging.DEBUG), pytest.raises(SafeProviderError) as raised:
-        async for _ in router.chat_stream_events(
-            [ChatMessage(role="user", content="hi")],
-            model="leak-model",
-            before_model_call=before,
-            after_model_call=tracking_after,
-            permit_grant=grant,
-        ):
-            pass
+    token = _bind_stub_identity(tmp_path)
+    try:
+        with caplog.at_level(logging.DEBUG), pytest.raises(SafeProviderError) as raised:
+            async for _ in router.chat_stream_events(
+                [ChatMessage(role="user", content="hi")],
+                model="leak-model",
+                before_model_call=before,
+                after_model_call=tracking_after,
+                permit_grant=grant,
+            ):
+                pass
+    finally:
+        reset_runtime_context(token)
 
     _assert_exception_secret_free(raised.value, _SECRET)
     _assert_secret_absent(_SECRET, caplog.text)
     assert after_errors and isinstance(after_errors[0], SafeProviderError)
+    assert issuer.spent_nonce_count() >= spent_before + 1
 
 
 @pytest.mark.asyncio

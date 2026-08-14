@@ -18,8 +18,15 @@ from js.models.stream_events import StreamEvent
 
 class _StreamingProvider(ModelProvider):
     def __init__(self, events: list[StreamEvent]) -> None:
+        from types import SimpleNamespace
+
         self.events = events
         self.max_tokens: list[int | None] = []
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     async def chat(
         self,

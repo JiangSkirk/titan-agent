@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -49,6 +50,11 @@ class MockModelProvider(ModelProvider):
         self._responses = responses or []
         self._index = 0
         self.calls: list[list[ChatMessage]] = []
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     def set_responses(self, responses: list[ChatResponse]) -> None:
         self._responses = responses

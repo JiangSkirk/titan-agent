@@ -658,7 +658,7 @@ class TestSharedPinnedTransport:
                 closed.set()
 
         embedder = LLMEmbedder(
-            "https://api.example.com/v1",
+            "http://127.0.0.1:1234/v1",
             "synthetic-key",
             max_retries=1,
         )
@@ -853,9 +853,11 @@ class TestSharedPinnedTransport:
             ]
             assert [event.kind for event in events] == ["text_delta", "done"]
             assert await provider.health_check() is True
-            assert await provider.embed(["x"], model="embed-model") == [[0.25, 0.75]]
+            with pytest.raises(PermissionError, match="remote embedding is disabled"):
+                await provider.embed(["x"], model="embed-model")
 
         resolver.assert_called_once()
+        assert resolver.call_args.args[0] == "https://api.example.com/v1"
         assert len(http_clients) == len(sdk_clients) == 1
         assert provider.client is sdk_clients[0]
         assert provider._http_client is http_clients[0]
@@ -869,8 +871,69 @@ class TestSharedPinnedTransport:
             ("stream", "legacy-model"),
             ("stream", "events-model"),
             ("health", None),
-            ("embed", "embed-model"),
         ]
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_loopback_embed_shares_one_injected_pinned_client(self) -> None:
+        from js.config import ModelProviderConfig
+        from js.models.providers import OpenAICompatibleProvider
+
+        http_clients: list[Any] = []
+        sdk_clients: list[Any] = []
+
+        class _FakeHTTPClient:
+            def __init__(self, **kwargs: Any) -> None:
+                self._transport = kwargs["transport"]
+
+            async def aclose(self) -> None:
+                return None
+
+        class _FakeSDK:
+            def __init__(self, http_client: _FakeHTTPClient) -> None:
+                self._client = http_client
+                self.embeddings = SimpleNamespace(create=self._embed_create)
+
+            async def _embed_create(self, **kwargs: Any) -> Any:
+                del kwargs
+                return SimpleNamespace(data=[SimpleNamespace(embedding=[0.25, 0.75])])
+
+            async def close(self) -> None:
+                return None
+
+        def make_http_client(**kwargs: Any) -> _FakeHTTPClient:
+            client = _FakeHTTPClient(**kwargs)
+            http_clients.append(client)
+            return client
+
+        def make_sdk(**kwargs: Any) -> _FakeSDK:
+            sdk = _FakeSDK(kwargs["http_client"])
+            sdk_clients.append(sdk)
+            return sdk
+
+        provider = OpenAICompatibleProvider(
+            ModelProviderConfig(
+                name="local",
+                base_url="http://127.0.0.1:1234/v1",
+            )
+        )
+        with (
+            patch(
+                "js.security.net_guard.resolve_and_validate_provider_endpoint",
+                return_value=["127.0.0.1"],
+            ) as resolver,
+            patch("js.models.providers.httpx.AsyncClient", side_effect=make_http_client),
+            patch("js.models.providers.AsyncOpenAI", side_effect=make_sdk),
+        ):
+            assert await provider.embed(["x"], model="embed-model") == [[0.25, 0.75]]
+            assert await provider.embed(["y"], model="embed-model") == [[0.25, 0.75]]
+
+        resolver.assert_called_once()
+        assert resolver.call_args.args[0] == "http://127.0.0.1:1234/v1"
+        assert len(http_clients) == len(sdk_clients) == 1
+        assert provider.client is sdk_clients[0]
+        assert provider._http_client is http_clients[0]
+        assert isinstance(provider._pinned_transport, PinnedTransport)
         await provider.close()
 
     @pytest.mark.asyncio
@@ -1532,6 +1595,27 @@ class TestClientSecurityAttributes:
 class TestSyncEmbeddingPin:
     """LLMEmbedder must use a pinned transport for its synchronous httpx.Client."""
 
+    def test_llm_embedder_remote_endpoint_fail_closed_before_dns(self) -> None:
+        from js.memory.embeddings import LLMEmbedder
+
+        with (
+            patch(
+                "js.security.net_guard.resolve_and_validate_provider_endpoint",
+                return_value=["93.184.216.34"],
+            ) as resolver,
+            patch("js.memory.embeddings.httpx.Client") as client_factory,
+        ):
+            emb = LLMEmbedder(
+                base_url="https://api.example.com/v1",
+                api_key="sk-test",
+            )
+            with pytest.raises(PermissionError, match="remote embedding is disabled"):
+                emb._ensure_client()
+            with pytest.raises(PermissionError, match="remote embedding is disabled"):
+                emb.embed("hello")
+            resolver.assert_not_called()
+            client_factory.assert_not_called()
+
     def test_llm_embedder_uses_pinned_transport(self) -> None:
         from js.memory.embeddings import LLMEmbedder
 
@@ -1542,7 +1626,7 @@ class TestSyncEmbeddingPin:
             ),
         ):
             emb = LLMEmbedder(
-                base_url="https://api.example.com/v1",
+                base_url="http://127.0.0.1:1234/v1",
                 api_key="sk-test",
             )
             assert emb.client is None
@@ -1562,7 +1646,7 @@ class TestSyncEmbeddingPin:
             patch("js.memory.embeddings.httpx.Client") as client_factory,
         ):
             emb = LLMEmbedder(
-                base_url="https://api.example.com/v1",
+                base_url="http://127.0.0.1:1234/v1",
                 api_key="sk-test",
             )
             resolver.assert_not_called()
@@ -1587,7 +1671,7 @@ class TestSyncEmbeddingPin:
             ),
         ):
             emb = LLMEmbedder(
-                base_url="https://api.example.com/v1",
+                base_url="http://127.0.0.1:1234/v1",
                 api_key="sk-test",
             )
             client = emb._ensure_client()
@@ -1603,7 +1687,7 @@ class TestSyncEmbeddingPin:
             return_value=["93.184.216.34"],
         ) as resolver:
             emb = LLMEmbedder(
-                base_url="https://api.example.com/v1",
+                base_url="http://127.0.0.1:1234/v1",
                 api_key="sk-test",
             )
             emb.close()

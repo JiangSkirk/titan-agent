@@ -9,6 +9,8 @@ attempt by the runtime-owned issuer; callback identity plays no role.
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,10 +21,37 @@ from js.models.providers import ChatMessage, ChatResponse, ModelProvider
 from js.models.router import ModelRouter
 
 
+@pytest.fixture(autouse=True)
+def _b2b_stub_identity(tmp_path: Path) -> Any:
+    from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runtime_context
+
+    token = set_runtime_context(
+        RuntimeContext(
+            product_id="js-agent",
+            channel="chat",
+            owner_key_hash="owner",
+            session_id="session",
+            run_id="run",
+            role="user",
+            profile="default",
+            capabilities=(),
+            workspace=tmp_path,
+            state_dir=tmp_path,
+        )
+    )
+    yield
+    reset_runtime_context(token)
+
+
 class _StubProvider(ModelProvider):
     def __init__(self, name: str = "stub") -> None:
         self.name = name
         self.calls = 0
+        self.config = SimpleNamespace(
+            name=name,
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     async def chat(
         self,
@@ -130,12 +159,35 @@ async def test_router_chat_accepts_valid_permit() -> None:
     assert resp.content == "stub"
 
 
+class _RecordingGrant:
+    def __init__(self, delegate: Any) -> None:
+        self.calls = 0
+        self._delegate = delegate
+
+    def __call__(self, decision: Any, messages: list[ChatMessage], tools: Any) -> Any:
+        self.calls += 1
+        return self._delegate(decision, messages, tools)
+
+
 @pytest.mark.asyncio
-async def test_router_chat_rejects_forged_permit() -> None:
-    """A permit signed by another issuer must fail closed."""
+async def test_untrusted_external_permit_grant_is_ignored_and_runtime_issues_bound_permit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller grant is ignored; the live router issuer binds and spends a new permit."""
     issuer = ModelPermitIssuer()
     attacker = ModelPermitIssuer()
     router = _router_with_stub_provider(issuer)
+    provider = router._providers["stub"]
+    issued: list[Any] = []
+    real = issuer.issue
+
+    def _spy_issue(**kwargs: Any) -> Any:
+        permit = real(**kwargs)
+        issued.append(permit)
+        return permit
+
+    monkeypatch.setattr(issuer, "issue", _spy_issue)
+    external = _RecordingGrant(_grant(attacker))
 
     async def _before(*_args: Any, **_kw: Any) -> Any:
         return None
@@ -143,14 +195,21 @@ async def test_router_chat_rejects_forged_permit() -> None:
     async def _after(*_args: Any, **_kw: Any) -> None:
         return None
 
-    with pytest.raises(ModelPermitError):
-        await router.chat(
-            [ChatMessage(role="user", content="hi")],
-            model="stub/m1",
-            before_model_call=_before,
-            after_model_call=_after,
-            permit_grant=_grant(attacker),
-        )
+    spent_before = issuer.spent_nonce_count()
+    resp = await router.chat(
+        [ChatMessage(role="user", content="hi")],
+        model="stub/m1",
+        before_model_call=_before,
+        after_model_call=_after,
+        permit_grant=external,
+    )
+    assert resp.content == "stub"
+    assert external.calls == 0
+    assert attacker.spent_nonce_count() == 0
+    assert len(issued) == 1
+    assert issued[0].attempt_hash
+    assert issuer.spent_nonce_count() == spent_before + 1
+    assert provider.calls == 1
 
 
 @pytest.mark.asyncio

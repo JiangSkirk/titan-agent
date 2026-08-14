@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,6 +18,11 @@ class _Provider(ModelProvider):
         self.response = response
         self.calls = 0
         self.max_tokens: list[int | None] = []
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     async def chat(
         self,
@@ -134,6 +140,7 @@ async def test_background_model_call_enforces_prompt_budget_before_provider(
             await agent.authorized_model_chat(
                 [ChatMessage(role="user", content="background payload")],
                 tenant_id="owner-a",
+                session_id="dreaming:test",
                 run_id="dreaming:test",
                 model="mock/model",
             )
@@ -313,6 +320,7 @@ async def test_background_completion_budget_is_provider_limit_and_hard_receipt_g
             await agent.authorized_model_chat(
                 [ChatMessage(role="user", content="background payload")],
                 tenant_id="owner-a",
+                session_id="dreaming:test",
                 run_id="dreaming:test",
                 model="mock/model",
             )

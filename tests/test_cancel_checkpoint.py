@@ -6,6 +6,7 @@ import asyncio
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,6 +30,11 @@ class SlowMockProvider(ModelProvider):
         self._index = 0
         self.delay = delay
         self.calls: list[list[ChatMessage]] = []
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     def set_responses(self, responses: list[ChatResponse]) -> None:
         self._responses = responses
@@ -81,6 +87,7 @@ class MockRouter(ModelRouter):
         self._providers: dict[str, ModelProvider] = {"mock": provider}
         self._model_map = {}
         self._permit_verifier = permit_verifier
+        self._egress_consent_broker = None
 
     async def select_model(self, task_complexity: str = "medium", preferred: str | None = None) -> Any:
         from js.models.router import RoutingDecision
@@ -101,19 +108,32 @@ class MockRouter(ModelRouter):
         before_model_call: Any = None,
         after_model_call: Any = None,
         permit_grant: Any = None,
+        **kwargs: Any,
     ) -> ChatResponse:
         if before_model_call is None or after_model_call is None or permit_grant is None:
             raise RuntimeError("test router requires Echo model callbacks and a permit grant")
         decision = await self.select_model(preferred=model)
-        self._consume_model_permit(permit_grant, decision, messages, tools)
-        context = await before_model_call(decision, messages, tools)
-        try:
-            response = await decision.provider.chat(
+        send_messages, send_tools, send_max_tokens, context = (
+            await self._authorize_egress_then_permit(
+                decision,
                 messages=messages,
-                model=decision.model,
                 tools=tools,
+                attachments=kwargs.get("attachments"),
+                provenance=kwargs.get("provenance"),
                 temperature=temperature,
                 max_tokens=max_tokens,
+                attempt_kind="initial",
+                before_model_call=before_model_call,
+                permit_grant=permit_grant,
+            )
+        )
+        try:
+            response = await decision.provider.chat(
+                messages=send_messages,
+                model=decision.model,
+                tools=send_tools,
+                temperature=temperature,
+                max_tokens=send_max_tokens,
             )
         except BaseException as exc:
             await after_model_call(context, None, exc)

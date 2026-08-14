@@ -273,8 +273,14 @@ class OpenAICompatibleProvider(ModelProvider):
         # A Provider object is one immutable credential generation.  Static
         # settings may be updated in place while an old operation is still
         # active; lazy SDK construction and response scrubbing must therefore
-        # never re-read the mutable config credential.
+        # never re-read the mutable config credential or endpoint.
         self._credential_snapshot = config.api_key
+        self._freeze_endpoint_generation(config.base_url)
+        self._provider_generation = f"{config.name}:{id(self)}"
+        try:
+            self._max_retries_snapshot = int(config.max_retries)
+        except (TypeError, ValueError):
+            self._max_retries_snapshot = 1
         self._is_local = _is_local_provider(config.base_url)
         self._allow_private = allow_private is True
         self._validated_ips: tuple[str, ...] = ()
@@ -408,15 +414,37 @@ class OpenAICompatibleProvider(ModelProvider):
                 if self._active_operations == 0:
                     condition.notify_all()
 
+    def _freeze_endpoint_generation(self, raw_url: Any) -> None:
+        from js.security.egress import canonical_provider_endpoint_url, endpoint_digest
+
+        canonical = canonical_provider_endpoint_url(raw_url)
+        if canonical is None:
+            raise PermissionError("provider endpoint is invalid")
+        self._endpoint_snapshot = canonical
+        self._endpoint_digest = endpoint_digest(canonical)
+
+    def _immutable_transport_endpoint(self) -> str:
+        from js.security.egress import endpoint_digest
+
+        snapshot = getattr(self, "_endpoint_snapshot", None)
+        if type(snapshot) is not str or not snapshot.strip():
+            raise PermissionError("provider endpoint is invalid")
+        endpoint = snapshot.strip()
+        digest = getattr(self, "_endpoint_digest", None)
+        if digest != endpoint_digest(endpoint):
+            raise PermissionError("provider endpoint generation mismatch")
+        return endpoint
+
     async def _initialise_client(self) -> AsyncOpenAI:
         """Build and publish one pinned SDK client for a concurrent wave."""
         from js.security.net_guard import resolve_and_validate_provider_endpoint
 
         api_key = self.response_secret_snapshot()
+        endpoint = self._immutable_transport_endpoint()
 
         validated = await asyncio.to_thread(
             resolve_and_validate_provider_endpoint,
-            self.config.base_url,
+            endpoint,
             allow_private=getattr(self, "_allow_private", False) is True,
         )
         if not validated:
@@ -440,7 +468,7 @@ class OpenAICompatibleProvider(ModelProvider):
             transport=transport,
         )
         client_kwargs: dict[str, Any] = {
-            "base_url": self.config.base_url,
+            "base_url": endpoint,
             "api_key": api_key or "not-needed",
             "http_client": http_client,
             "max_retries": 0,
@@ -994,6 +1022,10 @@ class OpenAICompatibleProvider(ModelProvider):
         model: str | None = None,
     ) -> list[list[float]]:
         """Generate embeddings for a batch of texts."""
+        endpoint = getattr(self, "_endpoint_snapshot", self.config.base_url)
+        hostname = (urlparse(endpoint).hostname or "").lower()
+        if not is_canonical_loopback_literal(hostname):
+            raise PermissionError("remote embedding is disabled")
         if not await self.circuit.can_execute():
             raise RuntimeError(f"Circuit breaker OPEN for {self.config.name}")
 

@@ -47,6 +47,7 @@ def _secure_str_eq(left: str | None, right: str | None) -> bool:
 
 DEFAULT_APPROVAL_TIMEOUT = 300.0  # 5 minutes
 APPROVAL_ARGUMENTS_HASH_SCHEME = "stable_payload_hash:v1"
+MODEL_EGRESS_KIND = "model_egress"
 
 # Approval inputs cross an authority boundary, so bound their in-memory and
 # serialized cost before hashing, callback projection, or durable persistence.
@@ -1183,6 +1184,37 @@ class ApprovalQueue:
         self._cleanup_stale()
 
         resolved_mode = mode or self.default_mode
+        if tool_name == MODEL_EGRESS_KIND:
+            if mode in {
+                ApprovalMode.AUTO_APPROVE,
+                ApprovalMode.AUTO_DENY,
+                ApprovalMode.CRON_DENY,
+            }:
+                denied = ApprovalRequest(
+                    id=self._next_id(),
+                    tool_name=tool_name,
+                    arguments=self.snapshot_arguments(arguments),
+                    timestamp=time.time(),
+                    context=context,
+                    timeout_seconds=timeout_seconds or self._default_timeout,
+                    session_id=session_id,
+                    run_id=run_id,
+                    owner_key_hash=owner_key_hash,
+                    approval_mode=ApprovalMode.MANUAL,
+                )
+                self._append_ledger("approval_requested", denied)
+                self._append_ledger(
+                    "approval_rejected",
+                    denied,
+                    reason="model_egress_manual_only",
+                )
+                self._audit_log(denied, "denied", "model_egress_manual_only")
+                return ApprovalDecision(
+                    ApprovalDecisionType.REJECT,
+                    request_id=denied.id,
+                    reason="model_egress_manual_only",
+                )
+            resolved_mode = ApprovalMode.MANUAL
 
         # JSON-safe bounded deep snapshot: rejects custom objects, NaN, Inf,
         # and isolates the queue from caller mutations.
@@ -1366,9 +1398,16 @@ class ApprovalQueue:
                         raise ValueError("approval callback cannot resolve to pending")
                     edited = None
                     if callback_result.action is ApprovalDecisionType.EDIT:
+                        if req.tool_name == MODEL_EGRESS_KIND:
+                            raise PermissionError("model_egress allows only APPROVE or REJECT")
                         if callback_result.edited_arguments is None:
                             raise ValueError("approval edit requires arguments")
                         edited = self.snapshot_arguments(callback_result.edited_arguments)
+                    if (
+                        callback_result.action is ApprovalDecisionType.RESPOND
+                        and req.tool_name == MODEL_EGRESS_KIND
+                    ):
+                        raise PermissionError("model_egress allows only APPROVE or REJECT")
                     if (
                         callback_result.action is ApprovalDecisionType.RESPOND
                         and (
@@ -1439,6 +1478,10 @@ class ApprovalQueue:
                 self._emit_metrics(tool_name, resolved_mode, approved)
                 self._audit_log(req, "approved" if approved else "denied", "callback")
                 return result
+
+        # model_egress never uses the CLI raw-argument prompt.
+        if tool_name == MODEL_EGRESS_KIND and context == "cli":
+            context = "headless"
 
         # CLI fallback: synchronous prompt
         if context == "cli":
@@ -1535,6 +1578,16 @@ class ApprovalQueue:
             raise ValueError("approval action is invalid")
         if action == ApprovalDecisionType.PENDING:
             raise ValueError("pending is not a resolution action")
+        with self._lock:
+            pending_tool = ""
+            existing = self._pending.get(request_id)
+            if existing is not None:
+                pending_tool = existing.tool_name
+        if pending_tool == MODEL_EGRESS_KIND and action in {
+            ApprovalDecisionType.EDIT,
+            ApprovalDecisionType.RESPOND,
+        }:
+            raise PermissionError("model_egress allows only APPROVE or REJECT")
         with self._lock:
             req = self._pending.get(request_id)
             if req and not req.resolved:
@@ -1871,10 +1924,15 @@ class ApprovalQueue:
     ) -> _ResolvedDecisionRecord:
         matches = record is not None and all(
             (
-                record.decision.action in {
-                    ApprovalDecisionType.APPROVE,
-                    ApprovalDecisionType.EDIT,
-                },
+                (
+                    record.decision.action is ApprovalDecisionType.APPROVE
+                    if record.tool_name == MODEL_EGRESS_KIND
+                    else record.decision.action
+                    in {
+                        ApprovalDecisionType.APPROVE,
+                        ApprovalDecisionType.EDIT,
+                    }
+                ),
                 _secure_str_eq(record.owner_key_hash, owner_key_hash),
                 _secure_str_eq(record.session_id, session_id),
                 _secure_str_eq(record.run_id, run_id),

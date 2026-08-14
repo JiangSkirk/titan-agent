@@ -38,6 +38,28 @@ _SECRET = 'B1C key +/="\\éî-safe-42'
 _MODEL = ModelConfig(id="safe-model", name="Safe model")
 
 
+@pytest.fixture(autouse=True)
+def _b2b_stub_identity(tmp_path: Path) -> Any:
+    from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runtime_context
+
+    token = set_runtime_context(
+        RuntimeContext(
+            product_id="js-agent",
+            channel="chat",
+            owner_key_hash="owner",
+            session_id="session",
+            run_id="run",
+            role="user",
+            profile="default",
+            capabilities=(),
+            workspace=tmp_path,
+            state_dir=tmp_path,
+        )
+    )
+    yield
+    reset_runtime_context(token)
+
+
 def _percent_lower(value: str) -> str:
     return re.sub(r"%[0-9A-Fa-f]{2}", lambda match: match.group(0).lower(), value)
 
@@ -137,7 +159,12 @@ class _SyntheticProvider(ModelProvider):
         response: ChatResponse | None = None,
         events: list[StreamEvent] | None = None,
     ) -> None:
-        self.config = SimpleNamespace(api_key=secret, max_retries=1)
+        self.config = SimpleNamespace(
+            api_key=secret,
+            max_retries=1,
+            name="synthetic",
+            base_url="http://127.0.0.1:9/v1",
+        )
         self.response = response
         self.events = list(events or [])
         self.chat_calls = 0

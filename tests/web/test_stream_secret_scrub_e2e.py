@@ -125,7 +125,40 @@ class _Circuit:
         return await coro
 
 
+def _attempt_bound_broker() -> Any:
+    from js.security.egress import EgressConsentReceiptV1, hash_egress_attempt
+
+    class _Broker:
+        def __init__(self) -> None:
+            self.attempts: list[Any] = []
+            self.claim_count = 0
+
+        async def request_and_claim(self, attempt: Any, safe_summary: Any) -> Any:
+            del safe_summary
+            self.attempts.append(attempt)
+            self.claim_count += 1
+            attempt_hash = getattr(attempt, "attempt_hash", None)
+            if not isinstance(attempt_hash, str) or not attempt_hash:
+                attempt_hash = hash_egress_attempt(attempt)
+            return EgressConsentReceiptV1(
+                attempt_hash=attempt_hash,
+                claim_receipt_hash=f"claim-{self.claim_count}",
+                expires_at=8_000_000_000.0,
+                nonce=f"nonce-{self.claim_count}",
+            )
+
+    return _Broker()
+
+
+def _install_remote_consent(agent: JSAgent) -> Any:
+    broker = _attempt_bound_broker()
+    agent.router._egress_consent_broker = broker
+    return broker
+
+
 def _leaky_stream_provider(secret: str = _SECRET) -> OpenAICompatibleProvider:
+    from js.security.egress import endpoint_digest
+
     provider = object.__new__(OpenAICompatibleProvider)
     provider.config = ModelProviderConfig(
         name="gemini-like",
@@ -136,6 +169,9 @@ def _leaky_stream_provider(secret: str = _SECRET) -> OpenAICompatibleProvider:
         default_model="leak-model",
         models=[_MODEL],
     )
+    provider._endpoint_snapshot = provider.config.base_url
+    provider._endpoint_digest = endpoint_digest(provider.config.base_url)
+    provider._provider_generation = f"{provider.config.name}:{id(provider)}"
     provider._is_local = False
     provider._last_stream_usage = None
     provider._stream_options_supported = True
@@ -216,6 +252,7 @@ async def test_ws_type_stream_scrubs_secrets_in_all_sinks(
 
     agent = JSAgent(settings)
     provider = _leaky_stream_provider()
+    broker = _install_remote_consent(agent)
     agent.router._providers = {"gemini-like": provider}
     agent.router._model_map = {
         "leak-model": ("gemini-like", _MODEL),
@@ -271,6 +308,11 @@ async def test_ws_type_stream_scrubs_secrets_in_all_sinks(
                         continue
 
     await agent.close()
+    assert broker.claim_count == 1
+    assert len(broker.attempts) == 1
+    from js.security.egress import classify_provider_endpoint
+
+    assert classify_provider_endpoint(provider) == "remote"
 
     raw_log_records = [
         (record.msg, record.args, record.exc_info, record.__dict__)
@@ -310,6 +352,7 @@ async def test_ws_success_stream_scrubs_before_state_audit_events_and_raw_logs(
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     agent = JSAgent(settings)
     provider = _successful_stream_provider()
+    broker = _install_remote_consent(agent)
     agent.router._providers = {"gemini-like": provider}
     agent.router._model_map = {
         "leak-model": ("gemini-like", _MODEL),
@@ -415,6 +458,11 @@ async def test_ws_success_stream_scrubs_before_state_audit_events_and_raw_logs(
                     break
 
     await agent.close()
+    assert broker.claim_count == 1
+    assert len(broker.attempts) == 1
+    from js.security.egress import classify_provider_endpoint
+
+    assert classify_provider_endpoint(provider) == "remote"
     assert ws_frames
     assert final_states
     assert audits

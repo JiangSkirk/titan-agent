@@ -44,7 +44,15 @@ from js.echo.durable_thread import (
 from js.echo.effect_interpreter import ModelEffect
 from js.echo.model_budget import EchoBudgetExceededError, EchoModelBudget
 from js.echo.primitives import BudgetLimits
-from js.echo.turn_context import RuntimeContext, current_owner_key_hash, current_runtime_context
+from js.echo.turn_context import (
+    RuntimeContext,
+    current_owner_key_hash,
+    current_runtime_context,
+    reset_current_owner_key_hash,
+    reset_runtime_context,
+    set_current_owner_key_hash,
+    set_runtime_context,
+)
 from js.echo.turn_loop import (
     _authorize_echo_model_call,
     _finish_echo_model_call,
@@ -67,6 +75,7 @@ from js.models.router import ModelRouter
 from js.provider_credential_types import ProductId
 from js.security.approvals import ApprovalMode, ApprovalQueue
 from js.security.audit import AuditEventType, AuditLogger
+from js.security.egress import EgressConsentError
 from js.security.guard import BehaviorGuard
 from js.security.provider_credentials import CredentialError
 from js.security.sandbox import SandboxExecutor
@@ -157,6 +166,7 @@ class JSAgent(
         # no public way to rebind authorization callbacks afterwards.
         self._model_permit_issuer = ModelPermitIssuer()
         self.router = ModelRouter(settings, permit_verifier=self._model_permit_issuer)
+        self._egress_consent_broker_bound = False
         from js.echo.ledger.service import EchoSafetyService
 
         self.echo_safety_service = EchoSafetyService.from_settings(settings)
@@ -291,6 +301,11 @@ class JSAgent(
             product_id=str(getattr(settings, "product_id", "js-agent")),
         )
         self.approvals.set_echo_authority(echo_authority)
+        from js.security.egress import ApprovalQueueEgressBroker
+
+        if not self._egress_consent_broker_bound:
+            self.router.bind_egress_consent_broker(ApprovalQueueEgressBroker(self.approvals))
+            self._egress_consent_broker_bound = True
         self.defense_strategies = build_default_strategies()
         self._setup_tools()
 
@@ -767,6 +782,37 @@ class JSAgent(
             if task is not None:
                 self._background_model_tasks.discard(task)
 
+    def _bind_background_model_identity(
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        run_id: str,
+    ) -> tuple[Any, Any] | None:
+        """Bind a complete RuntimeContext for public background model calls.
+
+        Echo turn / effect paths already install a trusted context. This
+        entry must not invent ``local`` / ``local-user`` / empty session.
+        """
+        if current_runtime_context() is not None:
+            return None
+        owner = tenant_id.strip()
+        session = session_id.strip()
+        run = run_id.strip()
+        if not owner or not session or not run:
+            raise EgressConsentError("trusted owner required for model egress")
+        context = self.echo_runtime.build_context(
+            channel="background_model",
+            owner_key_hash=owner,
+            session_id=session,
+            run_id=run,
+            capabilities=(),
+        )
+        return (
+            set_runtime_context(context),
+            set_current_owner_key_hash(owner),
+        )
+
     async def _authorized_model_chat_impl(
         self,
         messages: list[ChatMessage],
@@ -785,6 +831,48 @@ class JSAgent(
     ) -> ChatResponse:
         """Call the model through Echo's safety ledger."""
 
+        bound = self._bind_background_model_identity(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            run_id=run_id,
+        )
+        try:
+            return await self._authorized_model_chat_bound(
+                messages,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                session_id=session_id,
+                model=model,
+                tools=tools,
+                attachment_manifest=attachment_manifest,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                budget_callback=budget_callback,
+                completion_budget_callback=completion_budget_callback,
+                model_budget=model_budget,
+            )
+        finally:
+            if bound is not None:
+                context_token, owner_token = bound
+                reset_current_owner_key_hash(owner_token)
+                reset_runtime_context(context_token)
+
+    async def _authorized_model_chat_bound(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tenant_id: str,
+        run_id: str,
+        session_id: str,
+        model: str | None,
+        tools: list[dict[str, Any]] | None,
+        attachment_manifest: tuple[dict[str, Any], ...],
+        temperature: float,
+        max_tokens: int | None,
+        budget_callback: Callable[[], None] | None,
+        completion_budget_callback: Callable[[int], None] | None,
+        model_budget: EchoModelBudget | None,
+    ) -> ChatResponse:
         effective_budget = model_budget
         if budget_callback is None and effective_budget is None:
             effective_budget = self._new_echo_model_budget(model=model)
@@ -825,6 +913,7 @@ class JSAgent(
                         self,
                         tenant_id=tenant_id,
                         run_id=run_id,
+                        session_id=session_id or None,
                         provider_id=str(getattr(decision, "provider_name", "")),
                         model_id=str(getattr(decision, "model", model or "default")),
                         messages=call_messages,
@@ -921,6 +1010,7 @@ class JSAgent(
                 before_model_call=_before,
                 after_model_call=_after,
                 permit_grant=_permit_grant,
+                attachments=list(attachment_manifest) if attachment_manifest else None,
             )
 
         from js.echo.ledger.service import EchoUnavailableError
@@ -1025,8 +1115,15 @@ class JSAgent(
         HybridEmbedder wraps the primary so that runtime failures
         automatically fall back to KeywordEmbedder without crashing.
         """
+        from urllib.parse import urlparse
+
+        from js.security.net_guard import is_canonical_loopback_literal
+
         for cfg in self.settings.providers:
             if cfg.base_url and cfg.embedding_model:
+                hostname = (urlparse(cfg.base_url).hostname or "").lower()
+                if not is_canonical_loopback_literal(hostname):
+                    continue
                 primary = LLMEmbedder(
                     base_url=cfg.base_url,
                     api_key=cfg.api_key or "dummy",

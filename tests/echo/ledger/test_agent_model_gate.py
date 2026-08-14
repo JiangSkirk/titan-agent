@@ -59,9 +59,33 @@ def _grant(router: ModelRouter) -> Any:
     return grant
 
 
+def _bind_stub_identity(tmp_path: Path, **overrides: Any) -> Any:
+    values: dict[str, Any] = {
+        "product_id": "js-agent",
+        "channel": "chat",
+        "owner_key_hash": "owner",
+        "session_id": "session",
+        "run_id": "run",
+        "role": "user",
+        "profile": "default",
+        "capabilities": (),
+        "workspace": tmp_path,
+        "state_dir": tmp_path,
+    }
+    values.update(overrides)
+    return set_runtime_context(RuntimeContext(**values))
+
+
 class _Provider(ModelProvider):
     def __init__(self) -> None:
+        from types import SimpleNamespace
+
         self.calls: list[list[ChatMessage]] = []
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     async def chat(
         self,
@@ -107,6 +131,7 @@ class _Router(ModelRouter):
         self._providers = {"mock": provider}
         self._model_map = {}
         self._permit_verifier = permit_verifier
+        self._egress_consent_broker = None
 
     async def select_model(
         self,
@@ -130,21 +155,30 @@ class _Router(ModelRouter):
         before_model_call: Any = None,
         after_model_call: Any = None,
         permit_grant: Any = None,
+        **kwargs: Any,
     ) -> ChatResponse:
         decision = await self.select_model(preferred=model)
         if permit_grant is None:
             raise AssertionError("test router requires a runtime permit grant")
-        self._consume_model_permit(permit_grant, decision, messages, tools)
-        context = None
-        if before_model_call is not None:
-            context = await before_model_call(decision, messages, tools)
+        send_messages, send_tools, send_max_tokens, context = await self._authorize_egress_then_permit(
+            decision,
+            messages=messages,
+            tools=tools,
+            attachments=kwargs.get("attachments"),
+            provenance=kwargs.get("provenance"),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            attempt_kind="initial",
+            before_model_call=before_model_call,
+            permit_grant=permit_grant,
+        )
         try:
             response = await decision.provider.chat(
-                messages,
+                send_messages,
                 decision.model,
-                tools,
+                send_tools,
                 temperature,
-                max_tokens,
+                send_max_tokens,
             )
         except Exception as exc:
             if after_model_call is not None:
@@ -227,8 +261,15 @@ class _LegacySelectRouter:
 
 class _StreamEventsProvider(ModelProvider):
     def __init__(self, events: list[StreamEvent]) -> None:
+        from types import SimpleNamespace
+
         self.events = events
         self.calls: list[str] = []
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     async def chat(
         self,
@@ -733,15 +774,22 @@ async def test_router_stream_events_authorizes_and_finalizes_fallback_provider(
             )
         )
 
-    events = [
-        event
-        async for event in router.chat_stream_events(
-            [ChatMessage(role="user", content="hello")],
-            before_model_call=before,
-            after_model_call=after,
-            permit_grant=_grant(router),
-        )
-    ]
+    issuer = router._permit_verifier
+    assert isinstance(issuer, ModelPermitIssuer)
+    spent_before = issuer.spent_nonce_count()
+    token = _bind_stub_identity(tmp_path)
+    try:
+        events = [
+            event
+            async for event in router.chat_stream_events(
+                [ChatMessage(role="user", content="hello")],
+                before_model_call=before,
+                after_model_call=after,
+                permit_grant=_grant(router),
+            )
+        ]
+    finally:
+        reset_runtime_context(token)
 
     assert [event.kind for event in events] == ["text_delta", "text_delta", "usage", "done"]
     assert before_models == ["first-model", "fallback-model"]
@@ -749,6 +797,7 @@ async def test_router_stream_events_authorizes_and_finalizes_fallback_provider(
         ("first-model", None, "first failed"),
         ("fallback-model", "fallback ok", None),
     ]
+    assert issuer.spent_nonce_count() == spent_before + 2
 
 
 @pytest.mark.asyncio
@@ -790,18 +839,26 @@ async def test_router_stream_events_skips_failed_fallback_before_terminal_error(
     ) -> None:
         return None
 
-    events = [
-        event
-        async for event in router.chat_stream_events(
-            [ChatMessage(role="user", content="hello")],
-            before_model_call=before,
-            after_model_call=after,
-            permit_grant=_grant(router),
-        )
-    ]
+    issuer = router._permit_verifier
+    assert isinstance(issuer, ModelPermitIssuer)
+    spent_before = issuer.spent_nonce_count()
+    token = _bind_stub_identity(tmp_path)
+    try:
+        events = [
+            event
+            async for event in router.chat_stream_events(
+                [ChatMessage(role="user", content="hello")],
+                before_model_call=before,
+                after_model_call=after,
+                permit_grant=_grant(router),
+            )
+        ]
+    finally:
+        reset_runtime_context(token)
 
     assert [event.kind for event in events] == ["text_delta", "text_delta", "done"]
     assert [event.text for event in events if event.kind == "text_delta"] == ["second ", "ok"]
+    assert issuer.spent_nonce_count() == spent_before + 3
 
 
 @pytest.mark.asyncio
@@ -975,13 +1032,14 @@ async def test_authorized_background_chat_blocks_secret_before_provider_call(
 ) -> None:
     agent, provider = _agent(tmp_path)
 
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError, match="Secret"):
         await agent.authorized_model_chat(
             [
                 ChatMessage(role="system", content="Summarize safely."),
                 ChatMessage(role="user", content="token = sk-test-1234567890abcdef"),
             ],
             tenant_id="tenant-a",
+            session_id="background-secret",
             run_id="background-secret",
         )
 
@@ -1012,6 +1070,7 @@ async def test_authorized_background_chat_authorization_does_not_block_event_loo
         agent.authorized_model_chat(
             [ChatMessage(role="user", content="hello")],
             tenant_id="tenant-a",
+            session_id="background-responsive",
             run_id="background-responsive",
         ),
         ticker(),
@@ -1042,6 +1101,7 @@ async def test_background_completion_callback_failure_finalizes_claim(
         await agent.authorized_model_chat(
             [ChatMessage(role="user", content="hello")],
             tenant_id="tenant-a",
+            session_id="background-budget-callback",
             run_id="background-budget-callback",
             completion_budget_callback=fail_completion_budget,
         )
@@ -1078,6 +1138,7 @@ async def test_close_waits_for_unregistered_background_model_claim_cleanup(
         agent.authorized_model_chat(
             [ChatMessage(role="user", content="wait")],
             tenant_id="tenant-a",
+            session_id="background-close",
             run_id="background-close",
         )
     )
@@ -1177,6 +1238,7 @@ async def test_non_stream_model_cancel_finalizes_echo_claim_and_lock(
             agent.authorized_model_chat(
                 [ChatMessage(role="user", content="wait")],
                 tenant_id="local",
+                session_id=session_id,
                 run_id=session_id,
             )
         )
@@ -1583,38 +1645,47 @@ async def test_stream_done_event_waits_for_durable_model_finish(tmp_path: Path) 
             )
         ]
 
-    task = asyncio.create_task(consume())
-    assert await asyncio.to_thread(finish_started.wait, 1)
-    await asyncio.sleep(0)
-    assert not task.done()
-    finish_release.set()
-    events = await task
+    issuer = router._permit_verifier
+    assert isinstance(issuer, ModelPermitIssuer)
+    spent_before = issuer.spent_nonce_count()
+    token = _bind_stub_identity(tmp_path)
+    try:
+        task = asyncio.create_task(consume())
+        assert await asyncio.to_thread(finish_started.wait, 1)
+        await asyncio.sleep(0)
+        assert not task.done()
+        finish_release.set()
+        events = await task
 
-    assert [event.kind for event in events] == ["done"]
+        assert [event.kind for event in events] == ["done"]
+        assert issuer.spent_nonce_count() == spent_before + 1
 
-    class _FailingSafetyService:
-        def finish_chat_turn(self, _context: object, **_kwargs: Any) -> None:
-            raise OSError("journal unavailable")
+        class _FailingSafetyService:
+            def finish_chat_turn(self, _context: object, **_kwargs: Any) -> None:
+                raise OSError("journal unavailable")
 
-    failing_loop = _stream_loop_for_service(_FailingSafetyService())
+        failing_loop = _stream_loop_for_service(_FailingSafetyService())
 
-    async def failing_after(
-        context: object,
-        response: ChatResponse | None,
-        error: BaseException | None,
-    ) -> None:
-        await failing_loop._finish_model_call(context, response, error)
+        async def failing_after(
+            context: object,
+            response: ChatResponse | None,
+            error: BaseException | None,
+        ) -> None:
+            await failing_loop._finish_model_call(context, response, error)
 
-    delivered: list[StreamEvent] = []
-    with pytest.raises(EchoUnavailableError, match="failed to finalize"):
-        async for event in router.chat_stream_events(
-            [ChatMessage(role="user", content="hello")],
-            before_model_call=before,
-            after_model_call=failing_after,
-            permit_grant=_grant(router),
-        ):
-            delivered.append(event)
-    assert delivered == []
+        delivered: list[StreamEvent] = []
+        with pytest.raises(EchoUnavailableError, match="failed to finalize"):
+            async for event in router.chat_stream_events(
+                [ChatMessage(role="user", content="hello")],
+                before_model_call=before,
+                after_model_call=failing_after,
+                permit_grant=_grant(router),
+            ):
+                delivered.append(event)
+        assert delivered == []
+        assert issuer.spent_nonce_count() == spent_before + 2
+    finally:
+        reset_runtime_context(token)
 
 
 async def _append_async(items: list[str], value: str) -> None:

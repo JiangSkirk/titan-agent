@@ -68,6 +68,16 @@ class ModelPermit:
     nonce: str
     expires_at: float
     mac: str
+    attempt_hash: str = ""
+    consent_receipt_hash: str = ""
+    channel: str = ""
+    provider_generation: str = ""
+    endpoint_digest: str = ""
+    attachments_digest: str = ""
+    provenance_digest: str = ""
+    temperature: float = 0.0
+    effective_max_tokens: int | None = None
+    appshell_epoch: str | None = None
 
     def _payload(self) -> str:
         return _canonical_json(
@@ -81,6 +91,16 @@ class ModelPermit:
                 "run_id": self.run_id,
                 "nonce": self.nonce,
                 "expires_at": self.expires_at,
+                "attempt_hash": self.attempt_hash,
+                "consent_receipt_hash": self.consent_receipt_hash,
+                "channel": self.channel,
+                "provider_generation": self.provider_generation,
+                "endpoint_digest": self.endpoint_digest,
+                "attachments_digest": self.attachments_digest,
+                "provenance_digest": self.provenance_digest,
+                "temperature": self.temperature,
+                "effective_max_tokens": self.effective_max_tokens,
+                "appshell_epoch": self.appshell_epoch,
             }
         )
 
@@ -142,6 +162,16 @@ class ModelPermitIssuer:
         owner_key_hash: str,
         session_id: str,
         run_id: str,
+        attempt_hash: str = "",
+        consent_receipt_hash: str = "",
+        channel: str = "",
+        provider_generation: str = "",
+        endpoint_digest: str = "",
+        attachments_digest: str = "",
+        provenance_digest: str = "",
+        temperature: float = 0.0,
+        effective_max_tokens: int | None = None,
+        appshell_epoch: str | None = None,
     ) -> ModelPermit:
         permit = ModelPermit(
             provider_name=provider_name,
@@ -154,6 +184,16 @@ class ModelPermitIssuer:
             nonce=secrets.token_hex(16),
             expires_at=time.time() + self._ttl_seconds,
             mac="",
+            attempt_hash=attempt_hash,
+            consent_receipt_hash=consent_receipt_hash,
+            channel=channel,
+            provider_generation=provider_generation,
+            endpoint_digest=endpoint_digest,
+            attachments_digest=attachments_digest,
+            provenance_digest=provenance_digest,
+            temperature=temperature,
+            effective_max_tokens=effective_max_tokens,
+            appshell_epoch=appshell_epoch,
         )
         return replace(permit, mac=self._mac(permit))
 
@@ -168,6 +208,19 @@ class ModelPermitIssuer:
         model: str,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None,
+        owner_key_hash: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        attempt_hash: str | None = None,
+        consent_receipt_hash: str | None = None,
+        channel: str | None = None,
+        provider_generation: str | None = None,
+        endpoint_digest: str | None = None,
+        attachments_digest: str | None = None,
+        provenance_digest: str | None = None,
+        temperature: float | None = None,
+        effective_max_tokens: int | None = None,
+        appshell_epoch: str | None = None,
     ) -> None:
         """Verify a permit and permanently spend its nonce (fail-closed)."""
         if not isinstance(permit, ModelPermit):
@@ -184,6 +237,44 @@ class ModelPermitIssuer:
             raise ModelPermitError("model permit does not match the request messages")
         if not hmac.compare_digest(permit.tools_digest, hash_tools_schema(tools)):
             raise ModelPermitError("model permit does not match the request tools schema")
+        bound = bool(permit.attempt_hash) or attempt_hash is not None
+        if bound:
+            if owner_key_hash is None or not hmac.compare_digest(
+                permit.owner_key_hash, owner_key_hash
+            ):
+                raise ModelPermitError("model permit does not match the trusted owner")
+            if session_id is None or not hmac.compare_digest(permit.session_id, session_id):
+                raise ModelPermitError("model permit does not match the session")
+            if run_id is None or not hmac.compare_digest(permit.run_id, run_id):
+                raise ModelPermitError("model permit does not match the run")
+            if attempt_hash is None or not hmac.compare_digest(permit.attempt_hash, attempt_hash):
+                raise ModelPermitError("model permit does not match the egress attempt")
+            if consent_receipt_hash is None or not hmac.compare_digest(
+                permit.consent_receipt_hash, consent_receipt_hash
+            ):
+                raise ModelPermitError("model permit does not match the consent receipt")
+            if channel is None or permit.channel != channel:
+                raise ModelPermitError("model permit does not match the channel")
+            if provider_generation is None or permit.provider_generation != provider_generation:
+                raise ModelPermitError("model permit does not match the provider generation")
+            if endpoint_digest is None or not hmac.compare_digest(
+                permit.endpoint_digest, endpoint_digest
+            ):
+                raise ModelPermitError("model permit does not match the endpoint")
+            if attachments_digest is None or not hmac.compare_digest(
+                permit.attachments_digest, attachments_digest
+            ):
+                raise ModelPermitError("model permit does not match the attachments")
+            if provenance_digest is None or not hmac.compare_digest(
+                permit.provenance_digest, provenance_digest
+            ):
+                raise ModelPermitError("model permit does not match the provenance")
+            if temperature is None or permit.temperature != temperature:
+                raise ModelPermitError("model permit does not match the temperature")
+            if permit.effective_max_tokens != effective_max_tokens:
+                raise ModelPermitError("model permit does not match effective max_tokens")
+            if (permit.appshell_epoch or "") != (appshell_epoch or ""):
+                raise ModelPermitError("model permit does not match the AppShell epoch")
         with self._lock:
             now = time.time()
             # Recheck expiry under the lock so a permit that expired while

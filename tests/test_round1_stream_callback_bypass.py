@@ -9,20 +9,49 @@ from __future__ import annotations
 
 import pathlib
 from collections.abc import AsyncGenerator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from js.config import JSSettings, ModelConfig
+from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runtime_context
 from js.models.permit import ModelPermitIssuer
 from js.models.providers import ChatMessage, ChatResponse, ModelProvider
 from js.models.router import ModelRouter
 from js.models.stream_events import StreamEvent
 
+_LOOPBACK = "http://127.0.0.1:9/v1"
+
+
+@pytest.fixture(autouse=True)
+def _b2b_stub_identity(tmp_path: pathlib.Path) -> Any:
+    token = set_runtime_context(
+        RuntimeContext(
+            product_id="js-agent",
+            channel="chat",
+            owner_key_hash="owner",
+            session_id="session",
+            run_id="run",
+            role="user",
+            profile="default",
+            capabilities=(),
+            workspace=tmp_path,
+            state_dir=tmp_path,
+        )
+    )
+    yield
+    reset_runtime_context(token)
+
 
 class _StubStreamProvider(ModelProvider):
     def __init__(self, name: str = "stub") -> None:
         self.name = name
+        self.config = SimpleNamespace(
+            name=name,
+            base_url=_LOOPBACK,
+            max_retries=1,
+        )
 
     async def chat(
         self,
@@ -144,6 +173,7 @@ async def test_chat_stream_events_accepts_runtime_permit() -> None:
     async def _real_after(*_a: Any, **_kw: Any) -> None:
         return None
 
+    spent_before = issuer.spent_nonce_count()
     events = []
     async for ev in router.chat_stream_events(
         messages=[ChatMessage(role="user", content="hi")],
@@ -156,3 +186,4 @@ async def test_chat_stream_events_accepts_runtime_permit() -> None:
     kinds = [e.kind for e in events]
     assert "text_delta" in kinds
     assert "done" in kinds
+    assert issuer.spent_nonce_count() == spent_before + 1

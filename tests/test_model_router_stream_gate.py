@@ -14,11 +14,41 @@ from js.models.router import ModelRouter
 from js.models.stream_events import StreamEvent
 
 
+@pytest.fixture(autouse=True)
+def _b2b_stub_identity(tmp_path: Any) -> Any:
+    from pathlib import Path
+
+    from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runtime_context
+
+    workspace = tmp_path if isinstance(tmp_path, Path) else Path("/tmp/x")
+    token = set_runtime_context(
+        RuntimeContext(
+            product_id="js-agent",
+            channel="chat",
+            owner_key_hash="owner",
+            session_id="session",
+            run_id="run",
+            role="user",
+            profile="default",
+            capabilities=(),
+            workspace=workspace,
+            state_dir=workspace,
+        )
+    )
+    yield
+    reset_runtime_context(token)
+
+
 class _StreamingProvider(ModelProvider):
     def __init__(self) -> None:
         self.stream_calls = 0
         self.chat_calls = 0
         self.event_calls = 0
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     async def chat(
         self,
@@ -214,7 +244,11 @@ async def test_each_stream_reconnect_gets_a_fresh_echo_gate(
     class _ReconnectProvider(_StreamingProvider):
         def __init__(self) -> None:
             super().__init__()
-            self.config = SimpleNamespace(max_retries=3)
+            self.config = SimpleNamespace(
+                name="mock",
+                base_url="http://127.0.0.1:9/v1",
+                max_retries=3,
+            )
 
         async def chat_stream_events(self, **_kwargs: Any) -> AsyncIterator[StreamEvent]:
             self.event_calls += 1

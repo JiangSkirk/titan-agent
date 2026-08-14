@@ -20,7 +20,7 @@ from typing import cast
 
 import httpx
 
-from js.security.net_guard import PinnedSyncTransport
+from js.security.net_guard import PinnedSyncTransport, is_canonical_loopback_literal
 from js.utils.log import get_logger
 
 logger = get_logger("js.memory.embeddings")
@@ -135,7 +135,18 @@ class LLMEmbedder(Embedder):
         self._last_failure: float | None = None
         self._last_success: float | None = None
 
+    def _require_literal_loopback(self) -> None:
+        from urllib.parse import urlparse
+
+        try:
+            hostname = (urlparse(self._base_url).hostname or "").lower()
+        except ValueError as exc:
+            raise PermissionError("remote embedding is disabled") from exc
+        if not is_canonical_loopback_literal(hostname):
+            raise PermissionError("remote embedding is disabled")
+
     def _ensure_client(self) -> httpx.Client:
+        self._require_literal_loopback()
         with self._client_lock:
             if self._closed:
                 raise RuntimeError("embedder is closed")
@@ -198,6 +209,7 @@ class LLMEmbedder(Embedder):
                     condition.notify_all()
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self._require_literal_loopback()
         with self._operation_lease():
             return self._embed_batch_with_lease(texts)
 
@@ -352,6 +364,10 @@ class HybridEmbedder(Embedder):
 
         Returns True if recovery succeeded.
         """
+        from js.security.egress import embedder_endpoint_is_remote
+
+        if embedder_endpoint_is_remote(self.primary):
+            return False
         try:
             self.primary.embed("ping")
             with self._lock:
