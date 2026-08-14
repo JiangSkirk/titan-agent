@@ -21,7 +21,9 @@ import asyncio
 import ssl
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -170,6 +172,13 @@ class _SyncTLSBackend(httpcore.NetworkBackend):
 
 class TestRemoteHttpRejected:
     """HTTP to non-loopback must be rejected at every entry point."""
+
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
 
     def test_config_rejects_remote_http(self) -> None:
         from js.config import ModelProviderConfig
@@ -1342,6 +1351,13 @@ class TestPublicIPv6:
 class TestRedirectsForbidden:
     """Provider HTTP clients must have follow_redirects=False."""
 
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
+
     @pytest.mark.asyncio
     async def test_provider_http_client_no_redirects(self) -> None:
         from js.config import ModelProviderConfig
@@ -1486,6 +1502,13 @@ class TestRedirectsForbidden:
 
 class TestClientSecurityAttributes:
     """All HTTP clients must have trust_env=False, verify=True, follow_redirects=False."""
+
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
 
     @pytest.mark.asyncio
     async def test_provider_http_client_attributes(self) -> None:

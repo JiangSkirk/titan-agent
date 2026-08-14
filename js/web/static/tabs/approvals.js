@@ -208,6 +208,56 @@ function isModelEgress(approval) {
   return approval.tool_name === 'model_egress' || approval.kind === 'model_egress';
 }
 
+function isNetworkEgress(approval) {
+  const kind = approval.tool_name || approval.kind || '';
+  return (
+    kind === 'web_search_egress' ||
+    kind === 'connector_egress' ||
+    kind === 'provider_discovery_egress' ||
+    kind === 'browser_fetch_egress' ||
+    kind === 'skill_registry_egress' ||
+    (approval.arguments && approval.arguments.network_kind === 'connector_egress')
+  );
+}
+
+function renderNetworkEgress(approval) {
+  const card = element('article', 'bg-gray-900 border border-amber-800 rounded-lg p-4');
+  const header = element('div', 'flex flex-wrap items-start justify-between gap-3');
+  const identity = element('div', 'min-w-0');
+  const titleKind = approval.tool_name || approval.kind || 'network_egress';
+  const title = element('h3', 'font-mono text-sm font-semibold text-amber-300 break-all', titleKind);
+  identity.append(
+    title,
+    element(
+      'p',
+      'text-xs text-gray-500 mt-1',
+      `${safeText(approval.context, '未知上下文')} · ${formatTimestamp(approval.timestamp)}`,
+    ),
+  );
+  const actions = element('div', 'flex gap-1 shrink-0');
+  actions.append(
+    createIconButton('fa-check', '批准外发', () => submitDecision(card, approval.id, { action: 'approve' }), 'bg-green-900/50 hover:bg-green-800 text-green-300'),
+    createIconButton('fa-times', '拒绝外发', () => submitDecision(card, approval.id, { action: 'reject' }), 'bg-red-900/50 hover:bg-red-800 text-red-300'),
+  );
+  header.append(identity, actions);
+  const summary = approval.safe_summary || approval.arguments || {};
+  const lines = [
+    `请求: ${safeText(approval.id)}`,
+    `过期: ${formatTimestamp(approval.expires_at)}`,
+    `种类: ${safeText(summary.kind || titleKind)}`,
+    `目标: ${safeText(summary.target)}`,
+    `目的地: ${safeText(summary.endpoint)}`,
+    `方法: ${safeText(summary.method)}`,
+    `attempt_hash: ${safeText(summary.attempt_hash)}`,
+  ];
+  const meta = element('p', 'text-xs text-gray-500 mt-3 break-all', `会话: ${safeText(approval.session_id)} · 运行: ${safeText(approval.run_id)}`);
+  const summaryLabel = element('div', 'text-xs text-gray-400 mt-3 mb-1', '安全摘要 (不含原文)');
+  const summaryPre = element('pre', 'bg-gray-950 border border-gray-800 rounded p-3 text-xs text-gray-300 font-mono whitespace-pre-wrap break-words max-h-64 overflow-auto');
+  summaryPre.textContent = lines.join('\n');
+  card.append(header, meta, summaryLabel, summaryPre);
+  return card;
+}
+
 function renderModelEgress(approval) {
   const card = element('article', 'bg-gray-900 border border-amber-800 rounded-lg p-4');
   const header = element('div', 'flex flex-wrap items-start justify-between gap-3');
@@ -248,6 +298,7 @@ function renderModelEgress(approval) {
 
 function renderApproval(approval) {
   if (isModelEgress(approval)) return renderModelEgress(approval);
+  if (isNetworkEgress(approval)) return renderNetworkEgress(approval);
   const card = element('article', 'bg-gray-900 border border-gray-800 rounded-lg p-4');
   const header = element('div', 'flex flex-wrap items-start justify-between gap-3');
   const identity = element('div', 'min-w-0');

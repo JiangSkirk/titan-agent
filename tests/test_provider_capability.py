@@ -21,6 +21,8 @@ synthetic hostnames used here.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -142,6 +144,12 @@ def _install_stub(
 
 @pytest.mark.asyncio
 class TestProbeProviderHappyPaths:
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
     async def test_openai_compatible_returns_models_with_api_context(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -254,6 +262,12 @@ class TestProbeProviderHappyPaths:
 
 @pytest.mark.asyncio
 class TestProbeProviderErrorPaths:
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
     async def test_401_returns_authentication_failed_and_no_key_in_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

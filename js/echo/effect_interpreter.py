@@ -28,6 +28,7 @@ from js.echo.turn_context import (
 )
 from js.models.providers import ChatMessage, ChatResponse
 from js.security.approvals import ApprovalClaimProof, ApprovalQueue
+from js.security.egress import reset_network_egress_runtime, set_network_egress_runtime
 from js.tools.registry import ToolResult
 
 if TYPE_CHECKING:
@@ -311,6 +312,10 @@ class EffectInterpreter:
         }
         owner_token = set_current_owner_key_hash(context.owner_key_hash)
         context_token = set_runtime_context(context)
+        net_token = set_network_egress_runtime(
+            getattr(self._agent, "_egress_consent_broker", None),
+            getattr(self._agent, "_network_permit_issuer", None),
+        )
         try:
             result = await self._call_before_deadline(
                 lambda: execute(
@@ -333,6 +338,7 @@ class EffectInterpreter:
                 raise TypeError("leased tool adapter returned an invalid result")
             return result
         finally:
+            reset_network_egress_runtime(net_token)
             reset_runtime_context(context_token)
             reset_current_owner_key_hash(owner_token)
 
@@ -347,6 +353,12 @@ class EffectInterpreter:
 
         self._validate_context(context, effect_kind="connector")
         operation = self._begin_effect_operation(context, effect_kind="connector")
+        owner_token = set_current_owner_key_hash(context.owner_key_hash)
+        context_token = set_runtime_context(context)
+        net_token = set_network_egress_runtime(
+            getattr(self._agent, "_egress_consent_broker", None),
+            getattr(self._agent, "_network_permit_issuer", None),
+        )
         try:
             return await self._execute_connector_admitted(
                 request,
@@ -355,6 +367,9 @@ class EffectInterpreter:
                 operation=operation,
             )
         finally:
+            reset_network_egress_runtime(net_token)
+            reset_runtime_context(context_token)
+            reset_current_owner_key_hash(owner_token)
             self._finish_effect_operation(operation)
 
     async def _execute_connector_admitted(
@@ -389,6 +404,8 @@ class EffectInterpreter:
             raise ValueError("connector params must be a JSON-safe bounded object") from None
         if canonical_params_digest(actual_params) != request.params_digest:
             raise PermissionError("connector params do not match authority binding")
+        frozen_params = ApprovalQueue.snapshot_arguments(actual_params)
+        frozen_digest = canonical_params_digest(frozen_params)
         grant = request.directory_grant
         if request.connection.ref.connector_type in {"local_import", "local_publish"}:
             if grant is None:
@@ -420,6 +437,17 @@ class EffectInterpreter:
             f"connection:{request.connection.ref.connection_id}:{request.scope}"
         )
         expected_fs_roots = () if grant is None else (grant.root,)
+        local_connectors = {"local_import", "local_publish"}
+        if request.connection.ref.connector_type in local_connectors:
+            expected_network_policy = "deny"
+            expected_network_hosts: tuple[str, ...] = ()
+            would_network = False
+        else:
+            expected_network_policy = str(request.lease.network_policy)
+            expected_network_hosts = tuple(request.lease.network_hosts)
+            would_network = (
+                expected_network_policy == "allow" and len(expected_network_hosts) > 0
+            )
         approvals: ApprovalQueue | None = None
         approval_kwargs: dict[str, Any] | None = None
         approval_claim: ApprovalClaimProof | None = None
@@ -427,10 +455,27 @@ class EffectInterpreter:
             approvals = getattr(self._agent, "approvals", None)
             if type(approvals) is not ApprovalQueue or request.approval_id is None:
                 raise PermissionError("connector write approval authority is unavailable")
-            approval_arguments = {
+            approval_arguments: dict[str, Any] = {
                 "authority_binding_hash": request.authority_binding_hash(),
                 "scope": request.scope,
             }
+            if would_network:
+                from js.security.egress import endpoint_generation_of
+
+                host = expected_network_hosts[0]
+                raw_url = frozen_params.get("url")
+                if type(raw_url) is not str or not raw_url.strip():
+                    raw_url = f"https://{host}/"
+                approval_arguments.update(
+                    {
+                        "network_kind": "connector_egress",
+                        "endpoint": host if ":" in host else f"{host}:443",
+                        "payload_digest": canonical_params_digest(frozen_params).removeprefix(
+                            "sha256:"
+                        ),
+                        "endpoint_generation": endpoint_generation_of(raw_url),
+                    }
+                )
             approval_kwargs = {
                 "owner_key_hash": request.task_ref.owner,
                 "session_id": request.task_ref.session,
@@ -451,8 +496,8 @@ class EffectInterpreter:
             expected_args_schema=request.authority_binding_hash(),
             expected_resource_scope=expected_scope,
             expected_fs_roots=expected_fs_roots,
-            expected_network_policy="deny",
-            expected_network_hosts=(),
+            expected_network_policy=expected_network_policy,
+            expected_network_hosts=expected_network_hosts,
             expected_max_bytes=10 * 1024 * 1024,
             expected_max_duration_ms=30_000,
             now=now,
@@ -480,6 +525,146 @@ class EffectInterpreter:
                 is None
             ):
                 raise PermissionError("connector approval claim proof is invalid")
+
+        dispatch_params = ApprovalQueue.snapshot_arguments(frozen_params)
+        if would_network and request.operation == "write":
+            from js.models.permit import NetworkEgressPermitError, NetworkEgressPermitIssuer
+            from js.security.egress import (
+                EgressConsentError,
+                EgressIdentityV1,
+                NetworkEgressKind,
+                build_network_egress_attempt,
+                digest_jsonable,
+                endpoint_generation_of,
+            )
+
+            if canonical_params_digest(frozen_params) != frozen_digest:
+                raise PermissionError("connector params changed after approval claim")
+            if approval_claim is None or approval_kwargs is None:
+                raise PermissionError("connector write approval claim proof is invalid")
+            issuer = getattr(self._agent, "_network_permit_issuer", None)
+            if type(issuer) is not NetworkEgressPermitIssuer:
+                raise PermissionError("connector network egress permit issuer required")
+            host = expected_network_hosts[0]
+            raw_url = frozen_params.get("url")
+            if type(raw_url) is not str or not raw_url.strip():
+                raw_url = f"https://{host}/"
+            epoch = None
+            binding = getattr(context, "appshell_epoch_binding", None)
+            if binding is not None:
+                epoch = str(getattr(binding, "epoch", "") or "") or None
+            identity = EgressIdentityV1(
+                product_id=str(context.product_id),
+                channel=str(context.channel),
+                owner_key_hash=str(context.owner_key_hash),
+                session_id=str(context.session_id),
+                run_id=str(context.run_id),
+                appshell_epoch=epoch,
+            )
+            effect_id = str(getattr(operation, "operation_id", "") or "")
+            if not effect_id:
+                effect_id = f"connector:{request.lease.lease_id}:{request.operation}"
+            arguments_hash = str(approval_kwargs["arguments_hash"])
+            try:
+                attempt = build_network_egress_attempt(
+                    identity=identity,
+                    kind=NetworkEgressKind.CONNECTOR,
+                    target_identity=request.connection.ref.connector_type,
+                    endpoint_url=raw_url,
+                    method="POST",
+                    payload=dispatch_params,
+                    provenance={
+                        "schema": "network-egress-provenance-v1",
+                        "kind": "connector_egress",
+                        "source": "connector",
+                        "tool_name": expected_tool,
+                    },
+                    credential_generation="none",
+                )
+                endpoint_digest = digest_jsonable(raw_url)
+                permit = issuer.issue(
+                    kind=attempt.kind,
+                    attempt_id=attempt.attempt_id,
+                    attempt_hash=attempt.attempt_hash,
+                    owner_key_hash=attempt.owner_key_hash,
+                    session_id=attempt.session_id,
+                    run_id=attempt.run_id,
+                    channel=attempt.channel,
+                    product_id=attempt.product_id,
+                    endpoint_generation=attempt.endpoint_generation,
+                    credential_generation=attempt.credential_generation,
+                    payload_digest=attempt.payload_digest,
+                    provenance_digest=attempt.provenance_digest,
+                    consent_receipt_hash=approval_claim.journal_record_hash,
+                    appshell_epoch=attempt.appshell_epoch,
+                    effect_id=effect_id,
+                    arguments_hash=arguments_hash,
+                    endpoint_digest=endpoint_digest,
+                )
+                issuer.verify_and_consume(
+                    permit,
+                    kind=attempt.kind,
+                    attempt_id=attempt.attempt_id,
+                    attempt_hash=attempt.attempt_hash,
+                    owner_key_hash=attempt.owner_key_hash,
+                    session_id=attempt.session_id,
+                    run_id=attempt.run_id,
+                    channel=attempt.channel,
+                    product_id=attempt.product_id,
+                    endpoint_generation=attempt.endpoint_generation,
+                    credential_generation=attempt.credential_generation,
+                    payload_digest=attempt.payload_digest,
+                    provenance_digest=attempt.provenance_digest,
+                    consent_receipt_hash=approval_claim.journal_record_hash,
+                    appshell_epoch=attempt.appshell_epoch,
+                    effect_id=effect_id,
+                    arguments_hash=arguments_hash,
+                    endpoint_digest=endpoint_digest,
+                )
+            except (NetworkEgressPermitError, EgressConsentError) as exc:
+                raise PermissionError("connector network egress permit is invalid") from exc
+            if endpoint_generation_of(raw_url) != attempt.endpoint_generation:
+                raise PermissionError("connector endpoint changed after approval claim")
+            if digest_jsonable(dispatch_params) != attempt.payload_digest:
+                raise PermissionError("connector payload changed after approval claim")
+            if canonical_params_digest(frozen_params) != frozen_digest:
+                raise PermissionError("connector params changed after approval claim")
+            dispatch_params = ApprovalQueue.snapshot_arguments(dispatch_params)
+
+        if would_network and request.operation == "read":
+            from js.security.egress import (
+                EgressConsentError,
+                NetworkEgressKind,
+                assert_network_authorization_fresh,
+                authorize_network_egress,
+                digest_jsonable,
+            )
+
+            try:
+                auth = await authorize_network_egress(
+                    kind=NetworkEgressKind.CONNECTOR,
+                    target_identity=request.connection.ref.connector_type,
+                    endpoint_url=f"https://{expected_network_hosts[0]}/",
+                    method="GET",
+                    payload=actual_params,
+                    provenance={
+                        "schema": "network-egress-provenance-v1",
+                        "kind": "connector_egress",
+                        "source": "connector",
+                        "tool_name": expected_tool,
+                    },
+                    credential_generation="none",
+                )
+                assert_network_authorization_fresh(auth)
+            except EgressConsentError as exc:
+                raise PermissionError("connector network egress consent required") from exc
+            payload = auth.snapshot.payload
+            if type(payload) is not dict:
+                raise PermissionError("connector network snapshot is invalid")
+            dispatch_params = ApprovalQueue.snapshot_arguments(payload)
+            if digest_jsonable(dispatch_params) != auth.attempt.payload_digest:
+                raise PermissionError("connector payload changed after consent")
+            dispatch_params = ApprovalQueue.snapshot_arguments(dispatch_params)
 
         # Two-phase Echo anchor: record pending intent before consume.
         # First, check if Echo already has a finalized anchor for this lease
@@ -526,8 +711,8 @@ class EffectInterpreter:
             expected_args_schema=request.authority_binding_hash(),
             expected_resource_scope=expected_scope,
             expected_fs_roots=expected_fs_roots,
-            expected_network_policy="deny",
-            expected_network_hosts=(),
+            expected_network_policy=expected_network_policy,
+            expected_network_hosts=expected_network_hosts,
             expected_max_bytes=10 * 1024 * 1024,
             expected_max_duration_ms=30_000,
             now=now,
@@ -572,9 +757,12 @@ class EffectInterpreter:
             connector_type=request.connection.ref.connector_type,
             operation=request.operation,
         )
+        if would_network and canonical_params_digest(frozen_params) != frozen_digest:
+            raise PermissionError("connector params changed before dispatch")
+        handler_params = ApprovalQueue.snapshot_arguments(dispatch_params)
         result = await manager._dispatch_authorized(
             request,
-            params=actual_params,
+            params=handler_params,
             capability=capability,
         )
         error_code = None if result.success else (result.error or "connector_failed")

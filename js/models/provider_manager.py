@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from js.config import ModelProviderConfig
 from js.provider_credential_types import ProductId, ProviderCredentialRefV1
@@ -31,6 +32,24 @@ def _secret_key_name(provider_name: str) -> str:
     Used only during B1A migration; new credentials go through the Keychain.
     """
     return f"provider_apikey_{provider_name}"
+
+
+def _is_lmstudio_openai_base(url: Any) -> bool:
+    """True only for a structured loopback/localhost OpenAI base on port 1234."""
+
+    if type(url) is not str:
+        return False
+    stripped = url.strip()
+    if not stripped:
+        return False
+    try:
+        parsed = urlparse(stripped)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return False
+    return parsed.port == 1234
 
 
 def static_provider_secret_key_name(provider_name: str) -> str:
@@ -825,15 +844,58 @@ class ProviderManager:
         """
         import httpx
 
+        from js.security import egress as network_egress
         from js.security.net_guard import (
             OutboundURLError,
             PinnedTransport,
             resolve_and_validate_provider_endpoint,
         )
 
+        raw_base = base_url if type(base_url) is str else ""
+        normalized_base = raw_base.rstrip("/")
+        discovery_gets: list[tuple[str, str]] = [
+            (f"{normalized_base}/models", "/models"),
+        ]
+        if _is_lmstudio_openai_base(raw_base):
+            root = normalized_base.rsplit("/v1", 1)[0]
+            discovery_gets = [
+                (f"{root}/api/v0/models", "/api/v0/models"),
+                (f"{normalized_base}/models", "/models"),
+            ]
+
+        async def _authorized_model_discovery_get(
+            endpoint_url: str,
+            path: str,
+        ) -> Any:
+            auth = await network_egress.authorize_network_egress(
+                kind=network_egress.NetworkEgressKind.PROVIDER_DISCOVERY,
+                target_identity="provider_discover",
+                endpoint_url=endpoint_url,
+                method="GET",
+                payload={"path": path},
+                provenance={
+                    "schema": network_egress.NETWORK_PROVENANCE_SCHEMA,
+                    "kind": "provider_discovery_egress",
+                    "source": "provider_discovery",
+                    "tool_name": "control_provider_discover",
+                },
+                credential_generation=network_egress.credential_generation_of(api_key),
+            )
+            network_egress.assert_network_authorization_fresh(auth)
+            if network_egress.credential_generation_of(api_key) != auth.attempt.credential_generation:
+                raise network_egress.EgressConsentError("network egress consent required")
+            return auth
+
+        first_url, first_path = discovery_gets[0]
+        try:
+            first_auth = await _authorized_model_discovery_get(first_url, first_path)
+        except network_egress.EgressConsentError:
+            return {"error": "network egress consent required"}
+        frozen_first = first_auth.snapshot.endpoint_url
+
         try:
             validated_ips = resolve_and_validate_provider_endpoint(
-                base_url,
+                frozen_first,
                 allow_private=allow_private,
             )
         except OutboundURLError as exc:
@@ -854,14 +916,12 @@ class ProviderManager:
                 trust_env=False,
                 follow_redirects=False,
             ) as client:
-                # Enhanced LM Studio metadata must use the same DNS-validated,
-                # IP-pinned transport as the authoritative /v1/models call.
                 context_overrides: dict[str, int] = {}
-                if "127.0.0.1:1234" in base_url or "localhost:1234" in base_url:
+                models_auth = first_auth
+                if first_path == "/api/v0/models":
                     try:
-                        root = base_url.rstrip("/").rsplit("/v1", 1)[0]
                         metadata = await client.get(
-                            f"{root}/api/v0/models",
+                            first_auth.snapshot.endpoint_url,
                             timeout=httpx.Timeout(5.0),
                         )
                         if metadata.status_code == 200:
@@ -873,8 +933,16 @@ class ProviderManager:
                                     context_overrides[item["id"]] = int(context)
                     except Exception:
                         pass
+                    models_url, models_path = discovery_gets[1]
+                    try:
+                        models_auth = await _authorized_model_discovery_get(
+                            models_url,
+                            models_path,
+                        )
+                    except network_egress.EgressConsentError:
+                        return {"error": "network egress consent required"}
 
-                resp = await client.get(f"{base_url.rstrip('/')}/models", headers=headers)
+                resp = await client.get(models_auth.snapshot.endpoint_url, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
                 models = data.get("data", [])

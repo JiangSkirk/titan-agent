@@ -790,6 +790,25 @@ class SkillManager:
             or parsed.fragment
         ):
             raise ValueError("Remote skill download destination is not allowlisted")
+        from js.security import egress as network_egress
+
+        try:
+            await network_egress.authorize_network_egress(
+                kind=network_egress.NetworkEgressKind.SKILL_REGISTRY,
+                target_identity="skill_install",
+                endpoint_url=url,
+                method="GET",
+                payload={"path": "skill_download"},
+                provenance={
+                    "schema": network_egress.NETWORK_PROVENANCE_SCHEMA,
+                    "kind": "skill_registry_egress",
+                    "source": "skill_registry",
+                    "tool_name": "control_skill_install",
+                },
+                credential_generation="none",
+            )
+        except network_egress.EgressConsentError as exc:
+            raise PermissionError("network egress consent required") from exc
         validated_ips = await asyncio.to_thread(
             resolve_and_validate,
             url,

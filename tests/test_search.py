@@ -1,5 +1,6 @@
 """Tests for search engines."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
@@ -41,6 +42,7 @@ class TestDuckDuckGoEngine:
         self,
         engine: DuckDuckGoEngine,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         resolved_urls: list[str] = []
 
@@ -57,8 +59,11 @@ class TestDuckDuckGoEngine:
         monkeypatch.setattr("js.search.engines.asyncio.sleep", AsyncMock())
         monkeypatch.setattr("httpx.AsyncClient.get", AsyncMock(return_value=response))
 
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
         try:
-            await engine._search_via_lite("echo", 1)
+            with adjacent_network_consent(tmp_path):
+                await engine._search_via_lite("echo", 1)
         finally:
             await engine.close()
 

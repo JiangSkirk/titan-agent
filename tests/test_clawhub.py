@@ -17,8 +17,11 @@ _INDEX_URL = "https://raw.githubusercontent.com/example/skills/main/clawhub.json
 
 class TestClawHubClient:
     @pytest.fixture(autouse=True)
-    def _no_live_dns(self) -> Any:
+    def _no_live_dns(self, tmp_path: Path) -> Any:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
         with (
+            adjacent_network_consent(tmp_path),
             patch(
                 "js.skills.clawhub.resolve_and_validate",
                 return_value=["203.0.113.10"],

@@ -53,8 +53,40 @@ class BrowserTool:
         # (*.nip.io) and DNS-rebinding bypasses that a literal-only check misses.
         # We CAPTURE the validated IPs and pin the connection to them so the
         # hostname is NOT re-resolved between validation and the actual request.
+        from js.security import egress as network_egress
+
+        if network_egress.classify_network_endpoint_url(url if type(url) is str else "") == "invalid":
+            return ToolResult(
+                success=False,
+                error="URL blocked: URL must start with http:// or https://",
+            )
         try:
-            validated_ips = resolve_and_validate(url, allow_loopback=False, allow_private=False)
+            auth = await network_egress.authorize_network_egress(
+                kind=network_egress.NetworkEgressKind.BROWSER_FETCH,
+                target_identity="browser_fetch",
+                endpoint_url=url if type(url) is str else "",
+                method="GET",
+                payload={"url_digest": network_egress.digest_jsonable(url if type(url) is str else "")},
+                provenance={
+                    "schema": network_egress.NETWORK_PROVENANCE_SCHEMA,
+                    "kind": "browser_fetch_egress",
+                    "source": "browser_fetch",
+                    "tool_name": "browser_fetch",
+                },
+                credential_generation="none",
+            )
+        except network_egress.EgressConsentError:
+            return ToolResult(success=False, error="network egress consent required")
+        try:
+            network_egress.assert_network_authorization_fresh(auth)
+        except network_egress.EgressConsentError:
+            return ToolResult(success=False, error="network egress consent required")
+        fetch_url = auth.snapshot.endpoint_url
+
+        try:
+            validated_ips = resolve_and_validate(
+                fetch_url, allow_loopback=False, allow_private=False
+            )
         except OutboundURLError as exc:
             return ToolResult(success=False, error=f"URL blocked: {exc}")
 
@@ -70,7 +102,7 @@ class BrowserTool:
                     "User-Agent": f"JS-Agent/{__version__} (Research Bot)",
                 },
             ) as client:
-                response = await client.get(url)
+                response = await client.get(fetch_url)
                 if response.is_redirect:
                     return ToolResult(success=False, error="Redirects are not followed for security")
                 response.raise_for_status()

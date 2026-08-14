@@ -49,7 +49,33 @@ def _secure_str_eq(left: str | None, right: str | None) -> bool:
 DEFAULT_APPROVAL_TIMEOUT = 300.0  # 5 minutes
 APPROVAL_ARGUMENTS_HASH_SCHEME = "stable_payload_hash:v1"
 MODEL_EGRESS_KIND = "model_egress"
+NETWORK_EGRESS_KINDS = frozenset(
+    {
+        "web_search_egress",
+        "connector_egress",
+        "provider_discovery_egress",
+        "browser_fetch_egress",
+        "skill_registry_egress",
+    }
+)
 _MODEL_EGRESS_REQUEST_RE = re.compile(r"^meg:[0-9a-f]{32}$")
+_NETWORK_EGRESS_REQUEST_RE = re.compile(r"^neg:(wse|cne|pde|bfe|sre):[0-9a-f]{32}$")
+
+
+def is_one_shot_egress_kind(tool_name: str) -> bool:
+    return type(tool_name) is str and (
+        tool_name == MODEL_EGRESS_KIND or tool_name in NETWORK_EGRESS_KINDS
+    )
+
+
+def arguments_are_one_shot_egress(tool_name: str, arguments: Any) -> bool:
+    if is_one_shot_egress_kind(tool_name):
+        return True
+    if type(arguments) is dict:
+        kind = arguments.get("network_kind")
+        if type(kind) is str and kind in NETWORK_EGRESS_KINDS:
+            return True
+    return False
 
 # Approval inputs cross an authority boundary, so bound their in-memory and
 # serialized cost before hashing, callback projection, or durable persistence.
@@ -1187,7 +1213,7 @@ class ApprovalQueue:
         self._cleanup_stale()
 
         resolved_mode = mode or self.default_mode
-        if tool_name == MODEL_EGRESS_KIND:
+        if is_one_shot_egress_kind(tool_name):
             if mode in {
                 ApprovalMode.AUTO_APPROVE,
                 ApprovalMode.AUTO_DENY,
@@ -1209,13 +1235,13 @@ class ApprovalQueue:
                 self._append_ledger(
                     "approval_rejected",
                     denied,
-                    reason="model_egress_manual_only",
+                    reason="egress_manual_only",
                 )
-                self._audit_log(denied, "denied", "model_egress_manual_only")
+                self._audit_log(denied, "denied", "egress_manual_only")
                 return ApprovalDecision(
                     ApprovalDecisionType.REJECT,
                     request_id=denied.id,
-                    reason="model_egress_manual_only",
+                    reason="egress_manual_only",
                 )
             resolved_mode = ApprovalMode.MANUAL
 
@@ -1224,8 +1250,18 @@ class ApprovalQueue:
         arguments = self.snapshot_arguments(arguments)
 
         stable_request_id = ""
-        if tool_name == MODEL_EGRESS_KIND and request_id is not None:
-            if type(request_id) is not str or not _MODEL_EGRESS_REQUEST_RE.fullmatch(request_id):
+        if is_one_shot_egress_kind(tool_name) and request_id is not None:
+            identity_pattern = (
+                _MODEL_EGRESS_REQUEST_RE
+                if tool_name == MODEL_EGRESS_KIND
+                else _NETWORK_EGRESS_REQUEST_RE
+            )
+            identity_reason = (
+                "model_egress_request_identity"
+                if tool_name == MODEL_EGRESS_KIND
+                else "network_egress_request_identity"
+            )
+            if type(request_id) is not str or not identity_pattern.fullmatch(request_id):
                 denied = ApprovalRequest(
                     id=self._next_id(),
                     tool_name=tool_name,
@@ -1242,13 +1278,13 @@ class ApprovalQueue:
                 self._append_ledger(
                     "approval_rejected",
                     denied,
-                    reason="model_egress_request_identity",
+                    reason=identity_reason,
                 )
-                self._audit_log(denied, "denied", "model_egress_request_identity")
+                self._audit_log(denied, "denied", identity_reason)
                 return ApprovalDecision(
                     ApprovalDecisionType.REJECT,
                     request_id=denied.id,
-                    reason="model_egress_request_identity",
+                    reason=identity_reason,
                 )
             stable_request_id = request_id
             with self._lock:
@@ -1441,17 +1477,16 @@ class ApprovalQueue:
                     if callback_result.action is ApprovalDecisionType.PENDING:
                         raise ValueError("approval callback cannot resolve to pending")
                     edited = None
+                    one_shot = arguments_are_one_shot_egress(req.tool_name, req.arguments)
+                    if one_shot and callback_result.action in {
+                        ApprovalDecisionType.EDIT,
+                        ApprovalDecisionType.RESPOND,
+                    }:
+                        raise PermissionError("egress consent allows only APPROVE or REJECT")
                     if callback_result.action is ApprovalDecisionType.EDIT:
-                        if req.tool_name == MODEL_EGRESS_KIND:
-                            raise PermissionError("model_egress allows only APPROVE or REJECT")
                         if callback_result.edited_arguments is None:
                             raise ValueError("approval edit requires arguments")
                         edited = self.snapshot_arguments(callback_result.edited_arguments)
-                    if (
-                        callback_result.action is ApprovalDecisionType.RESPOND
-                        and req.tool_name == MODEL_EGRESS_KIND
-                    ):
-                        raise PermissionError("model_egress allows only APPROVE or REJECT")
                     if (
                         callback_result.action is ApprovalDecisionType.RESPOND
                         and (
@@ -1523,8 +1558,8 @@ class ApprovalQueue:
                 self._audit_log(req, "approved" if approved else "denied", "callback")
                 return result
 
-        # model_egress never uses the CLI raw-argument prompt.
-        if tool_name == MODEL_EGRESS_KIND and context == "cli":
+        # One-shot egress never uses the CLI raw-argument prompt.
+        if is_one_shot_egress_kind(tool_name) and context == "cli":
             context = "headless"
 
         # CLI fallback: synchronous prompt
@@ -1627,11 +1662,14 @@ class ApprovalQueue:
             existing = self._pending.get(request_id)
             if existing is not None:
                 pending_tool = existing.tool_name
-        if pending_tool == MODEL_EGRESS_KIND and action in {
+        if pending_tool and arguments_are_one_shot_egress(
+            pending_tool,
+            existing.arguments if existing is not None else {},
+        ) and action in {
             ApprovalDecisionType.EDIT,
             ApprovalDecisionType.RESPOND,
         }:
-            raise PermissionError("model_egress allows only APPROVE or REJECT")
+            raise PermissionError("egress consent allows only APPROVE or REJECT")
         with self._lock:
             req = self._pending.get(request_id)
             if req and not req.resolved:
@@ -1966,11 +2004,16 @@ class ApprovalQueue:
         arguments_hash: str,
         require_manual: bool,
     ) -> _ResolvedDecisionRecord:
+        record_arguments = getattr(record, "arguments", None)
+        one_shot_network = is_one_shot_egress_kind(record.tool_name if record is not None else "") or (
+            type(record_arguments) is dict
+            and record_arguments.get("network_kind") in NETWORK_EGRESS_KINDS
+        )
         matches = record is not None and all(
             (
                 (
                     record.decision.action is ApprovalDecisionType.APPROVE
-                    if record.tool_name == MODEL_EGRESS_KIND
+                    if one_shot_network
                     else record.decision.action
                     in {
                         ApprovalDecisionType.APPROVE,

@@ -282,6 +282,25 @@ class ClawHubClient:
         if network_error is not None:
             raise PermissionError(network_error)
         self._validate_outbound_url(url)
+        from js.security import egress as network_egress
+
+        try:
+            await network_egress.authorize_network_egress(
+                kind=network_egress.NetworkEgressKind.SKILL_REGISTRY,
+                target_identity="clawhub",
+                endpoint_url=url,
+                method="GET",
+                payload={"path": "clawhub"},
+                provenance={
+                    "schema": network_egress.NETWORK_PROVENANCE_SCHEMA,
+                    "kind": "skill_registry_egress",
+                    "source": "skill_registry",
+                    "tool_name": "control_clawhub_discover",
+                },
+                credential_generation="none",
+            )
+        except network_egress.EgressConsentError as exc:
+            raise PermissionError("network egress consent required") from exc
         validated_ips = await asyncio.to_thread(
             resolve_and_validate,
             url,

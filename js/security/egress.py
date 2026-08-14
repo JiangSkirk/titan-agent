@@ -1,14 +1,14 @@
-"""One-use manual consent for real model Provider payload egress.
+"""One-use manual consent for model and non-model network egress.
 
-This module is the B2B-A data plane. It does not implement a Web modal.
-Human consent is requested through :class:`EgressConsentBroker`; production
-wires that to B2A ``ApprovalQueue`` / Echo authority with kind
-``model_egress``.
+B2B-A/B cover ``model_egress``. B2B-C covers versioned network kinds:
+``web_search_egress``, ``connector_egress``, ``provider_discovery_egress``,
+``browser_fetch_egress``, and ``skill_registry_egress``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import math
@@ -18,11 +18,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
 from js.models.providers import ChatMessage
 from js.security.approvals import (
+    NETWORK_EGRESS_KINDS,
     ApprovalDecisionType,
     ApprovalMode,
     ApprovalQueue,
@@ -32,6 +34,26 @@ from js.security.net_guard import is_canonical_loopback_literal
 MODEL_EGRESS_KIND = "model_egress"
 LOOPBACK_EXEMPTION_RECEIPT = "loopback-exemption"
 EGRESS_PROVENANCE_SCHEMA = "egress-provenance-v1"
+NETWORK_PROVENANCE_SCHEMA = "network-egress-provenance-v1"
+NETWORK_PROVENANCE_SOURCES = frozenset(
+    {
+        "echo_tool",
+        "web_search",
+        "connector",
+        "provider_discovery",
+        "browser_fetch",
+        "skill_registry",
+        "direct_user",
+    }
+)
+_NETWORK_KIND_CODES = {
+    "web_search_egress": "wse",
+    "connector_egress": "cne",
+    "provider_discovery_egress": "pde",
+    "browser_fetch_egress": "bfe",
+    "skill_registry_egress": "sre",
+}
+_NETWORK_EGRESS_REQUEST_RE = re.compile(r"^neg:(wse|cne|pde|bfe|sre):[0-9a-f]{32}$")
 EGRESS_SOURCE_KINDS = frozenset(
     {
         "direct_user",
@@ -52,6 +74,14 @@ _WEB_EGRESS_CHANNELS = frozenset(
     {"api_chat", "ws_message", "ws_stream"}
 )
 _WEB_EGRESS_SUFFIXES = ("_api_chat", "_ws_message", "_ws_stream")
+_WEB_NETWORK_ADAPTER_CHANNELS = frozenset(
+    {"search", "provider_test_cloud", "provider_add_cloud"}
+)
+_WEB_NETWORK_ADAPTER_SUFFIXES = (
+    "_search",
+    "_provider_test_cloud",
+    "_provider_add_cloud",
+)
 _DIGEST_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{64}$")
 _ATTEMPT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _MODEL_EGRESS_REQUEST_RE = re.compile(r"^meg:[0-9a-f]{32}$")
@@ -68,6 +98,12 @@ _SNAPSHOT_MAX_KEY_UTF8_BYTES = 512
 
 _spent_receipts: set[tuple[str, str, str]] = set()
 _spent_lock = threading.Lock()
+_network_broker: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "js_network_egress_broker", default=None
+)
+_network_issuer: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "js_network_egress_issuer", default=None
+)
 
 
 class EgressConsentError(PermissionError):
@@ -116,6 +152,56 @@ class EgressConsentReceiptV1:
     claim_receipt_hash: str
     expires_at: float
     nonce: str
+
+
+class NetworkEgressKind(Enum):
+    WEB_SEARCH = "web_search_egress"
+    CONNECTOR = "connector_egress"
+    PROVIDER_DISCOVERY = "provider_discovery_egress"
+    BROWSER_FETCH = "browser_fetch_egress"
+    SKILL_REGISTRY = "skill_registry_egress"
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkEgressAttemptV1:
+    version: int
+    attempt_id: str
+    kind: str
+    product_id: str
+    channel: str
+    owner_key_hash: str
+    session_id: str
+    run_id: str
+    target_identity: str
+    endpoint_generation: str
+    credential_generation: str
+    method: str
+    payload_digest: str
+    extra_digest: str
+    provenance_digest: str
+    appshell_epoch: str | None
+
+    @property
+    def attempt_hash(self) -> str:
+        return hash_network_egress_attempt(self)
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkEgressSnapshotV1:
+    endpoint_url: str
+    method: str
+    payload: Any
+    extra: Any
+    endpoint_generation: str
+    credential_generation: str
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkEgressAuthorizationV1:
+    attempt: NetworkEgressAttemptV1
+    receipt: EgressConsentReceiptV1
+    permit: Any
+    snapshot: NetworkEgressSnapshotV1
 
 
 class EgressConsentBroker(Protocol):
@@ -583,6 +669,33 @@ def channel_has_egress_adapter(channel: str) -> bool:
     return channel == "cli" and cli_is_interactive()
 
 
+def channel_has_network_egress_adapter(channel: str) -> bool:
+    if channel_has_egress_adapter(channel):
+        return True
+    if type(channel) is not str or not channel:
+        return False
+    if channel in _WEB_NETWORK_ADAPTER_CHANNELS:
+        return True
+    return channel.endswith(_WEB_NETWORK_ADAPTER_SUFFIXES)
+
+
+def set_network_egress_runtime(broker: Any, issuer: Any) -> tuple[Any, Any]:
+    return (_network_broker.set(broker), _network_issuer.set(issuer))
+
+
+def reset_network_egress_runtime(tokens: tuple[Any, Any]) -> None:
+    _network_broker.reset(tokens[0])
+    _network_issuer.reset(tokens[1])
+
+
+def current_network_egress_broker() -> Any:
+    return _network_broker.get()
+
+
+def current_network_egress_issuer() -> Any:
+    return _network_issuer.get()
+
+
 def prompt_cli_model_egress(safe_summary: dict[str, Any]) -> bool:
     """TTY-only yes/no prompt. Never prints raw prompt, tools, or paths."""
 
@@ -638,13 +751,17 @@ def make_product_egress_resolver(queue: ApprovalQueue) -> Any:
         if context is None:
             raise EgressConsentError("trusted owner required for model egress")
         if context.channel == "cli" and cli_is_interactive():
-            approved = await asyncio.to_thread(prompt_cli_model_egress, safe_summary)
+            kind = safe_summary.get("kind") if type(safe_summary) is dict else None
+            if type(kind) is str and kind in NETWORK_EGRESS_KINDS:
+                approved = await asyncio.to_thread(prompt_cli_network_egress, safe_summary)
+            else:
+                approved = await asyncio.to_thread(prompt_cli_model_egress, safe_summary)
             return queue.decide(
                 request_id,
                 ApprovalDecisionType.APPROVE if approved else ApprovalDecisionType.REJECT,
                 owner_key_hash=context.owner_key_hash,
             )
-        if channel_has_egress_adapter(context.channel):
+        if channel_has_network_egress_adapter(context.channel):
             return await poll_egress_decision(
                 queue,
                 request_id,
@@ -912,6 +1029,397 @@ def consume_egress_receipt(receipt: EgressConsentReceiptV1) -> None:
         _spent_receipts.add(key)
 
 
+def classify_network_endpoint_url(url: Any) -> str:
+    if type(url) is not str:
+        return "invalid"
+    stripped = url.strip()
+    if not stripped:
+        return "invalid"
+    try:
+        parsed = urlparse(stripped)
+        hostname = (parsed.hostname or "").lower()
+        scheme = (parsed.scheme or "").lower()
+    except ValueError:
+        return "invalid"
+    if scheme not in _VALID_ENDPOINT_SCHEMES or not hostname:
+        return "invalid"
+    if is_canonical_loopback_literal(hostname):
+        return "literal_loopback"
+    return "remote"
+
+
+def endpoint_generation_of(url: str) -> str:
+    classification = classify_network_endpoint_url(url)
+    if classification == "invalid":
+        raise EgressConsentError("network endpoint is invalid")
+    parsed = urlparse(url.strip())
+    hostname = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "").lower()
+    port = parsed.port
+    path = parsed.path or "/"
+    material = {
+        "scheme": scheme,
+        "host": hostname,
+        "port": port,
+        "path": path,
+    }
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def credential_generation_of(secret: Any) -> str:
+    if secret is None or secret == "":
+        return "none"
+    if type(secret) is not str:
+        raise EgressConsentError("credential generation is invalid")
+    return hashlib.sha256(b"js.network_egress.cred.v1\0" + secret.encode("utf-8")).hexdigest()
+
+
+def normalize_network_provenance(value: Any) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise EgressConsentError("network provenance is not a JSON object")
+    schema = value.get("schema")
+    if schema != NETWORK_PROVENANCE_SCHEMA:
+        raise EgressConsentError("network provenance schema is invalid")
+    kind = value.get("kind")
+    if type(kind) is not str or kind not in NETWORK_EGRESS_KINDS:
+        raise EgressConsentError("network provenance kind is invalid")
+    source = value.get("source")
+    if type(source) is not str or source not in NETWORK_PROVENANCE_SOURCES:
+        raise EgressConsentError("network provenance source is invalid")
+    tool_name = value.get("tool_name")
+    if type(tool_name) is not str or not tool_name or len(tool_name) > 128:
+        raise EgressConsentError("network provenance tool name is invalid")
+    frozen = snapshot_jsonable(
+        {
+            "schema": NETWORK_PROVENANCE_SCHEMA,
+            "kind": kind,
+            "source": source,
+            "tool_name": tool_name,
+        }
+    )
+    if type(frozen) is not dict:
+        raise EgressConsentError("network provenance snapshot is invalid")
+    return frozen
+
+
+def hash_network_egress_attempt(attempt: NetworkEgressAttemptV1) -> str:
+    payload = {
+        "mac_domain": "js.network_egress.attempt.v1",
+        "version": attempt.version,
+        "attempt_id": attempt.attempt_id,
+        "kind": attempt.kind,
+        "product_id": attempt.product_id,
+        "channel": attempt.channel,
+        "owner_key_hash": attempt.owner_key_hash,
+        "session_id": attempt.session_id,
+        "run_id": attempt.run_id,
+        "target_identity": attempt.target_identity,
+        "endpoint_generation": attempt.endpoint_generation,
+        "credential_generation": attempt.credential_generation,
+        "method": attempt.method,
+        "payload_digest": attempt.payload_digest,
+        "extra_digest": attempt.extra_digest,
+        "provenance_digest": attempt.provenance_digest,
+        "appshell_epoch": attempt.appshell_epoch,
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _coerce_network_kind(kind: NetworkEgressKind | str) -> str:
+    if isinstance(kind, NetworkEgressKind):
+        return kind.value
+    if type(kind) is str and kind in NETWORK_EGRESS_KINDS:
+        return kind
+    raise EgressConsentError("network egress kind is invalid")
+
+
+def build_network_egress_attempt(
+    *,
+    identity: EgressIdentityV1,
+    kind: NetworkEgressKind | str,
+    target_identity: str,
+    endpoint_url: str,
+    method: str,
+    payload: Any,
+    provenance: Any,
+    credential_generation: str,
+    extra: Any = None,
+) -> NetworkEgressAttemptV1:
+    kind_value = _coerce_network_kind(kind)
+    if type(target_identity) is not str or not target_identity or len(target_identity) > 128:
+        raise EgressConsentError("network target identity is invalid")
+    if type(method) is not str or method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
+        raise EgressConsentError("network method is invalid")
+    if type(credential_generation) is not str or not credential_generation:
+        raise EgressConsentError("credential generation is invalid")
+    frozen_payload = snapshot_jsonable(payload)
+    frozen_extra = snapshot_jsonable(extra or {})
+    frozen_provenance = normalize_network_provenance(provenance)
+    if frozen_provenance["kind"] != kind_value:
+        raise EgressConsentError("network provenance kind mismatch")
+    return NetworkEgressAttemptV1(
+        version=1,
+        attempt_id=uuid.uuid4().hex,
+        kind=kind_value,
+        product_id=identity.product_id,
+        channel=identity.channel,
+        owner_key_hash=identity.owner_key_hash,
+        session_id=identity.session_id,
+        run_id=identity.run_id,
+        target_identity=target_identity,
+        endpoint_generation=endpoint_generation_of(endpoint_url),
+        credential_generation=credential_generation,
+        method=method,
+        payload_digest=digest_jsonable(frozen_payload),
+        extra_digest=digest_jsonable(frozen_extra),
+        provenance_digest=digest_jsonable(frozen_provenance),
+        appshell_epoch=identity.appshell_epoch,
+    )
+
+
+def network_egress_request_id(attempt: NetworkEgressAttemptV1) -> str:
+    if type(attempt.attempt_id) is not str or not _ATTEMPT_ID_RE.fullmatch(attempt.attempt_id):
+        raise EgressConsentError("network attempt identity is invalid")
+    code = _NETWORK_KIND_CODES.get(attempt.kind)
+    if code is None:
+        raise EgressConsentError("network egress kind is invalid")
+    request_id = f"neg:{code}:{attempt.attempt_id}"
+    if not _NETWORK_EGRESS_REQUEST_RE.fullmatch(request_id):
+        raise EgressConsentError("network attempt identity is invalid")
+    return request_id
+
+
+def closed_network_egress_arguments(
+    attempt: NetworkEgressAttemptV1,
+    safe_summary: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "attempt_hash": attempt.attempt_hash,
+        "kind": attempt.kind,
+        "target": safe_summary.get("target", attempt.target_identity),
+        "endpoint": safe_summary.get("endpoint", ""),
+        "method": attempt.method,
+        "source": safe_summary.get("source", attempt.kind),
+        "attempt_id_prefix": attempt.attempt_id[:8],
+    }
+
+
+def safe_network_egress_summary(
+    attempt: NetworkEgressAttemptV1,
+    *,
+    endpoint_url: str,
+    source: str,
+) -> dict[str, Any]:
+    return {
+        "kind": attempt.kind,
+        "target": attempt.target_identity,
+        "endpoint": sanitize_host_port(endpoint_url),
+        "method": attempt.method,
+        "source": source,
+        "attempt_hash": attempt.attempt_hash,
+    }
+
+
+def prompt_cli_network_egress(safe_summary: dict[str, Any]) -> bool:
+    print("Network egress consent required")
+    for key in ("kind", "target", "endpoint", "method", "source", "attempt_hash"):
+        if key in safe_summary:
+            print(f"  {key}: {safe_summary[key]}")
+    answer = input("Approve remote network egress? [y/N] ").strip().lower()
+    return answer in {"y", "yes"}
+
+
+def _runtime_identity() -> EgressIdentityV1:
+    from js.echo.turn_context import current_runtime_context
+
+    context = current_runtime_context()
+    if context is None:
+        raise EgressConsentError("trusted owner required for network egress")
+    epoch = None
+    binding = getattr(context, "appshell_epoch_binding", None)
+    if binding is not None:
+        epoch = str(getattr(binding, "epoch", "") or "") or None
+    identity = EgressIdentityV1(
+        product_id=str(context.product_id),
+        channel=str(context.channel),
+        owner_key_hash=str(context.owner_key_hash),
+        session_id=str(context.session_id),
+        run_id=str(context.run_id),
+        appshell_epoch=epoch,
+    )
+    if not identity.owner_key_hash or not identity.session_id or not identity.run_id:
+        raise EgressConsentError("trusted owner required for network egress")
+    return identity
+
+
+def _raise_if_network_cancelled() -> None:
+    from js.echo.turn_context import current_runtime_context
+
+    context = current_runtime_context()
+    cancel = getattr(context, "cancel_token", None) if context is not None else None
+    if cancel is not None and bool(getattr(cancel, "is_set", lambda: False)()):
+        raise EgressConsentError("egress consent cancelled")
+
+
+async def authorize_network_egress(
+    *,
+    kind: NetworkEgressKind | str,
+    target_identity: str,
+    endpoint_url: str,
+    method: str,
+    payload: Any,
+    provenance: Any,
+    credential_generation: str,
+    extra: Any = None,
+    broker: Any | None = None,
+    permit_issuer: Any | None = None,
+) -> NetworkEgressAuthorizationV1:
+    from js.models.permit import NetworkEgressPermitIssuer
+
+    _raise_if_network_cancelled()
+    frozen_payload = snapshot_jsonable(payload)
+    frozen_extra = snapshot_jsonable(extra or {})
+    classification = classify_network_endpoint_url(endpoint_url)
+    if classification == "invalid":
+        raise EgressConsentError("network endpoint is invalid")
+    identity = _runtime_identity()
+    attempt = build_network_egress_attempt(
+        identity=identity,
+        kind=kind,
+        target_identity=target_identity,
+        endpoint_url=endpoint_url,
+        method=method,
+        payload=frozen_payload,
+        provenance=provenance,
+        credential_generation=credential_generation,
+        extra=frozen_extra,
+    )
+    snapshot = NetworkEgressSnapshotV1(
+        endpoint_url=endpoint_url.strip() if type(endpoint_url) is str else "",
+        method=attempt.method,
+        payload=frozen_payload,
+        extra=frozen_extra,
+        endpoint_generation=attempt.endpoint_generation,
+        credential_generation=attempt.credential_generation,
+    )
+    bound_broker = broker if broker is not None else current_network_egress_broker()
+    issuer = permit_issuer if permit_issuer is not None else current_network_egress_issuer()
+    if not isinstance(issuer, NetworkEgressPermitIssuer):
+        raise EgressConsentError("network egress permit issuer required")
+    receipt: EgressConsentReceiptV1
+    if classification == "literal_loopback":
+        receipt = EgressConsentReceiptV1(
+            attempt_hash=attempt.attempt_hash,
+            claim_receipt_hash=LOOPBACK_EXEMPTION_RECEIPT,
+            expires_at=time.time() + 60.0,
+            nonce=f"loopback-{attempt.attempt_id}",
+        )
+    else:
+        if bound_broker is None:
+            raise EgressConsentError("egress consent broker required")
+        if not channel_has_network_egress_adapter(identity.channel):
+            raise EgressConsentError("egress consent adapter missing")
+        summary = safe_network_egress_summary(
+            attempt,
+            endpoint_url=snapshot.endpoint_url,
+            source=attempt.kind,
+        )
+        claim = getattr(bound_broker, "request_and_claim_network", None)
+        if not callable(claim):
+            claim = bound_broker.request_and_claim
+        receipt = await claim(attempt, summary)
+        if (
+            not isinstance(receipt, EgressConsentReceiptV1)
+            or receipt.attempt_hash != attempt.attempt_hash
+            or not receipt.claim_receipt_hash
+            or not receipt.nonce
+        ):
+            raise EgressConsentError("egress consent receipt does not match the attempt")
+        consume_egress_receipt(receipt)
+    current = _runtime_identity()
+    if (
+        current.owner_key_hash != attempt.owner_key_hash
+        or current.session_id != attempt.session_id
+        or current.run_id != attempt.run_id
+        or current.channel != attempt.channel
+        or current.product_id != attempt.product_id
+        or (current.appshell_epoch or "") != (attempt.appshell_epoch or "")
+    ):
+        raise EgressConsentError("network egress identity changed after consent")
+    if endpoint_generation_of(snapshot.endpoint_url) != attempt.endpoint_generation:
+        raise EgressConsentError("network endpoint generation mismatch")
+    if digest_jsonable(snapshot.payload) != attempt.payload_digest:
+        raise EgressConsentError("network payload changed after consent")
+    permit = issuer.issue(
+        kind=attempt.kind,
+        attempt_id=attempt.attempt_id,
+        attempt_hash=attempt.attempt_hash,
+        owner_key_hash=attempt.owner_key_hash,
+        session_id=attempt.session_id,
+        run_id=attempt.run_id,
+        channel=attempt.channel,
+        product_id=attempt.product_id,
+        endpoint_generation=attempt.endpoint_generation,
+        credential_generation=attempt.credential_generation,
+        payload_digest=attempt.payload_digest,
+        provenance_digest=attempt.provenance_digest,
+        consent_receipt_hash=receipt.claim_receipt_hash,
+        appshell_epoch=attempt.appshell_epoch,
+        endpoint_digest=digest_jsonable(snapshot.endpoint_url),
+    )
+    issuer.verify_and_consume(
+        permit,
+        kind=attempt.kind,
+        attempt_id=attempt.attempt_id,
+        attempt_hash=attempt.attempt_hash,
+        owner_key_hash=attempt.owner_key_hash,
+        session_id=attempt.session_id,
+        run_id=attempt.run_id,
+        channel=attempt.channel,
+        product_id=attempt.product_id,
+        endpoint_generation=attempt.endpoint_generation,
+        credential_generation=attempt.credential_generation,
+        payload_digest=attempt.payload_digest,
+        provenance_digest=attempt.provenance_digest,
+        consent_receipt_hash=receipt.claim_receipt_hash,
+        appshell_epoch=attempt.appshell_epoch,
+        endpoint_digest=digest_jsonable(snapshot.endpoint_url),
+    )
+    _raise_if_network_cancelled()
+    return NetworkEgressAuthorizationV1(
+        attempt=attempt,
+        receipt=receipt,
+        permit=permit,
+        snapshot=snapshot,
+    )
+
+
+def assert_network_authorization_fresh(auth: NetworkEgressAuthorizationV1) -> None:
+    if not isinstance(auth, NetworkEgressAuthorizationV1):
+        raise EgressConsentError("network authorization is invalid")
+    identity = _runtime_identity()
+    attempt = auth.attempt
+    snapshot = auth.snapshot
+    if (
+        identity.owner_key_hash != attempt.owner_key_hash
+        or identity.session_id != attempt.session_id
+        or identity.run_id != attempt.run_id
+        or identity.channel != attempt.channel
+        or identity.product_id != attempt.product_id
+        or (identity.appshell_epoch or "") != (attempt.appshell_epoch or "")
+    ):
+        raise EgressConsentError("network egress identity changed after consent")
+    if snapshot.endpoint_generation != attempt.endpoint_generation:
+        raise EgressConsentError("network endpoint generation mismatch")
+    if endpoint_generation_of(snapshot.endpoint_url) != attempt.endpoint_generation:
+        raise EgressConsentError("network endpoint generation mismatch")
+    if snapshot.credential_generation != attempt.credential_generation:
+        raise EgressConsentError("network credential generation mismatch")
+    if digest_jsonable(snapshot.payload) != attempt.payload_digest:
+        raise EgressConsentError("network payload changed after consent")
+    _raise_if_network_cancelled()
+
+
 def closed_model_egress_arguments(
     attempt: EgressAttemptV1,
     safe_summary: dict[str, Any],
@@ -988,6 +1496,68 @@ class ApprovalQueueEgressBroker:
                 session_id=attempt.session_id,
                 run_id=attempt.run_id,
                 tool_name=MODEL_EGRESS_KIND,
+                arguments_hash=ApprovalQueue.arguments_hash(arguments),
+                require_manual=True,
+            )
+        except PermissionError as exc:
+            raise EgressConsentError("egress consent claim failed") from exc
+        if not proof.claimed_now or proof.action is not ApprovalDecisionType.APPROVE:
+            raise EgressConsentError("egress consent claim failed")
+        return EgressConsentReceiptV1(
+            attempt_hash=attempt.attempt_hash,
+            claim_receipt_hash=proof.journal_record_hash or proof.binding_hash,
+            expires_at=time.time() + 60.0,
+            nonce=proof.request_id,
+        )
+
+    async def request_and_claim_network(
+        self,
+        attempt: NetworkEgressAttemptV1,
+        safe_summary: dict[str, Any],
+    ) -> EgressConsentReceiptV1:
+        if not isinstance(attempt, NetworkEgressAttemptV1):
+            raise EgressConsentError("network egress attempt is invalid")
+        if attempt.kind not in NETWORK_EGRESS_KINDS:
+            raise EgressConsentError("network egress kind is invalid")
+        if not attempt.owner_key_hash or not attempt.session_id or not attempt.run_id:
+            raise EgressConsentError("trusted owner required for network egress")
+        can_queue = self._resolver is not None
+        if callable(self._allow_queue):
+            can_queue = can_queue and bool(self._allow_queue(attempt))
+        if self._resolver is not None and not can_queue:
+            raise EgressConsentError("egress consent adapter missing")
+        arguments = closed_network_egress_arguments(attempt, safe_summary)
+        request_id = network_egress_request_id(attempt)
+        try:
+            decision = self._queue.request_decision(
+                attempt.kind,
+                arguments,
+                context="web",
+                mode=ApprovalMode.MANUAL,
+                session_id=attempt.session_id,
+                run_id=attempt.run_id,
+                owner_key_hash=attempt.owner_key_hash,
+                queue_if_unhandled=can_queue,
+                request_id=request_id,
+            )
+        except TypeError:
+            raise EgressConsentError("egress consent request identity is unavailable") from None
+        if decision.action is ApprovalDecisionType.PENDING:
+            if self._resolver is None:
+                raise EgressConsentError("egress consent adapter missing")
+            resolved = await self._resolver(decision.request_id, safe_summary)
+            if type(resolved) is not type(decision) and not hasattr(resolved, "action"):
+                raise EgressConsentError("egress consent resolver is invalid")
+            decision = resolved
+        if decision.action is not ApprovalDecisionType.APPROVE:
+            raise EgressConsentError("egress consent rejected")
+        try:
+            proof = self._queue.consume_approved_binding(
+                decision.request_id,
+                owner_key_hash=attempt.owner_key_hash,
+                session_id=attempt.session_id,
+                run_id=attempt.run_id,
+                tool_name=attempt.kind,
                 arguments_hash=ApprovalQueue.arguments_hash(arguments),
                 require_manual=True,
             )

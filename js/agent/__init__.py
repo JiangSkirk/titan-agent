@@ -65,7 +65,7 @@ from js.evolution.optimizer import PromptOptimizer
 from js.memory.embeddings import Embedder, HybridEmbedder, KeywordEmbedder, LLMEmbedder
 from js.memory.scheduler import DreamScheduler
 from js.memory.store import MemoryStore
-from js.models.permit import ModelPermitIssuer
+from js.models.permit import ModelPermitIssuer, NetworkEgressPermitIssuer
 from js.models.provider_manager import (
     ProviderManager,
     hydrate_provider_credentials,
@@ -79,7 +79,7 @@ from js.security.egress import (
     ApprovalQueueEgressBroker,
     EgressConsentError,
     build_model_egress_provenance,
-    channel_has_egress_adapter,
+    channel_has_network_egress_adapter,
     make_product_egress_resolver,
 )
 from js.security.guard import BehaviorGuard
@@ -171,8 +171,10 @@ class JSAgent(
         # The router receives it as a verifier at construction time; there is
         # no public way to rebind authorization callbacks afterwards.
         self._model_permit_issuer = ModelPermitIssuer()
+        self._network_permit_issuer = NetworkEgressPermitIssuer()
         self.router = ModelRouter(settings, permit_verifier=self._model_permit_issuer)
         self._egress_consent_broker_bound = False
+        self._egress_consent_broker = None
         from js.echo.ledger.service import EchoSafetyService
 
         self.echo_safety_service = EchoSafetyService.from_settings(settings)
@@ -308,13 +310,12 @@ class JSAgent(
         )
         self.approvals.set_echo_authority(echo_authority)
         if not self._egress_consent_broker_bound:
-            self.router.bind_egress_consent_broker(
-                ApprovalQueueEgressBroker(
-                    self.approvals,
-                    resolver=make_product_egress_resolver(self.approvals),
-                    allow_queue=lambda attempt: channel_has_egress_adapter(attempt.channel),
-                )
+            self._egress_consent_broker = ApprovalQueueEgressBroker(
+                self.approvals,
+                resolver=make_product_egress_resolver(self.approvals),
+                allow_queue=lambda attempt: channel_has_network_egress_adapter(attempt.channel),
             )
+            self.router.bind_egress_consent_broker(self._egress_consent_broker)
             self._egress_consent_broker_bound = True
         self.defense_strategies = build_default_strategies()
         self._setup_tools()

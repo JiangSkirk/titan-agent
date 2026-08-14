@@ -9,6 +9,8 @@ IP before the actual HTTP request.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpcore
@@ -143,6 +145,13 @@ class TestCreatePinnedClient:
 
 class TestDNSRebindingDefense:
     """End-to-end: validated IP is actually used for the connection."""
+
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
 
     @pytest.mark.asyncio
     async def test_pinned_connection_uses_validated_ip(self) -> None:

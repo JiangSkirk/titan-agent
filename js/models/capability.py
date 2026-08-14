@@ -434,10 +434,55 @@ async def probe_provider(
             transport=transport_kind,
         )
 
+    from js.security import egress as network_egress
+
+    try:
+        auth = await network_egress.authorize_network_egress(
+            kind=network_egress.NetworkEgressKind.PROVIDER_DISCOVERY,
+            target_identity="probe_provider",
+            endpoint_url=base_url if type(base_url) is str else "",
+            method="GET",
+            payload={"path": "/models"},
+            provenance={
+                "schema": network_egress.NETWORK_PROVENANCE_SCHEMA,
+                "kind": "provider_discovery_egress",
+                "source": "provider_discovery",
+                "tool_name": "probe_provider",
+            },
+            credential_generation=network_egress.credential_generation_of(api_key),
+        )
+    except network_egress.EgressConsentError:
+        return ProbeResult(
+            ok=False,
+            status=0,
+            latency_ms=(time.perf_counter() - start) * 1000,
+            error="network egress consent required",
+            transport=transport_kind,
+        )
+    try:
+        network_egress.assert_network_authorization_fresh(auth)
+        if network_egress.credential_generation_of(api_key) != auth.attempt.credential_generation:
+            return ProbeResult(
+                ok=False,
+                status=0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+                error="network egress consent required",
+                transport=transport_kind,
+            )
+    except network_egress.EgressConsentError:
+        return ProbeResult(
+            ok=False,
+            status=0,
+            latency_ms=(time.perf_counter() - start) * 1000,
+            error="network egress consent required",
+            transport=transport_kind,
+        )
+    frozen_base = auth.snapshot.endpoint_url
+
     # SSRF / private-IP / metadata-IP guard (mirror provider_manager.discover_models).
     try:
         validated_ips = resolve_and_validate_provider_endpoint(
-            base_url,
+            frozen_base,
             allow_private=allow_private,
         )
     except OutboundURLError as exc:
@@ -457,7 +502,7 @@ async def probe_provider(
         }
         # Anthropic root is https://api.anthropic.com/v1, but callers sometimes
         # pass the bare host. Normalise to .../v1/models.
-        normalised = base_url.rstrip("/")
+        normalised = frozen_base.rstrip("/")
         if not normalised.endswith("/v1") and "/v1/" not in normalised + "/":
             normalised = f"{normalised}/v1"
         url = f"{normalised}/models"
@@ -465,7 +510,7 @@ async def probe_provider(
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        url = f"{base_url.rstrip('/')}/models"
+        url = f"{frozen_base.rstrip('/')}/models"
 
     try:
         async with httpx.AsyncClient(

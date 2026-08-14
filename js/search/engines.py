@@ -48,26 +48,84 @@ class _PinnedSearchClient:
         return await self._request("post", url, **kwargs)
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        from js.security import egress as network_egress
+
+        frozen_url = url if type(url) is str else ""
+        frozen_method = str(method or "").upper()
+        request_headers = dict(self.headers)
+        extra_headers = kwargs.get("headers")
+        if isinstance(extra_headers, dict):
+            request_headers.update({str(key): str(value) for key, value in extra_headers.items()})
+        payload = {
+            "params": kwargs.get("params"),
+            "json": kwargs.get("json"),
+            "data": kwargs.get("data"),
+        }
+        credential = request_headers.get("Authorization") or request_headers.get("api-key") or ""
+        try:
+            auth = await network_egress.authorize_network_egress(
+                kind=network_egress.NetworkEgressKind.WEB_SEARCH,
+                target_identity="web_search",
+                endpoint_url=frozen_url,
+                method=frozen_method,
+                payload=payload,
+                provenance={
+                    "schema": network_egress.NETWORK_PROVENANCE_SCHEMA,
+                    "kind": "web_search_egress",
+                    "source": "web_search",
+                    "tool_name": "web_search",
+                },
+                credential_generation=network_egress.credential_generation_of(credential),
+                extra={"header_names": sorted(request_headers), "headers": dict(request_headers)},
+            )
+        except network_egress.EgressConsentError:
+            logger.error("web search network egress denied")
+            raise
+        try:
+            network_egress.assert_network_authorization_fresh(auth)
+            send_url = auth.snapshot.endpoint_url
+            send_method = auth.snapshot.method.lower()
+            if send_url != frozen_url.strip() or send_method != str(method).lower():
+                raise network_egress.EgressConsentError("search request changed after consent")
+            live_payload = {
+                "params": kwargs.get("params"),
+                "json": kwargs.get("json"),
+                "data": kwargs.get("data"),
+            }
+            if network_egress.digest_jsonable(live_payload) != auth.attempt.payload_digest:
+                raise network_egress.EgressConsentError("search payload changed after consent")
+        except network_egress.EgressConsentError:
+            logger.error("web search network egress denied")
+            raise
+        frozen_body = auth.snapshot.payload if type(auth.snapshot.payload) is dict else {}
+        send_kwargs: dict[str, Any] = {}
+        if frozen_body.get("params") is not None:
+            send_kwargs["params"] = frozen_body["params"]
+        if frozen_body.get("json") is not None:
+            send_kwargs["json"] = frozen_body["json"]
+        if frozen_body.get("data") is not None:
+            send_kwargs["data"] = frozen_body["data"]
+        timeout = kwargs.get("timeout", self.timeout)
+        send_headers = {}
+        if type(auth.snapshot.extra) is dict:
+            frozen_headers = auth.snapshot.extra.get("headers")
+            if type(frozen_headers) is dict:
+                send_headers = {str(key): str(value) for key, value in frozen_headers.items()}
         validated_ips = await asyncio.to_thread(
             resolve_and_validate,
-            url,
+            send_url,
             allow_loopback=False,
             allow_private=False,
         )
-        request_headers = dict(self.headers)
-        extra_headers = kwargs.pop("headers", None)
-        if isinstance(extra_headers, dict):
-            request_headers.update({str(key): str(value) for key, value in extra_headers.items()})
-        timeout = kwargs.pop("timeout", self.timeout)
         async with httpx.AsyncClient(
             transport=PinnedTransport(validated_ips[0], verify=True),
             timeout=httpx.Timeout(timeout),
             follow_redirects=False,
             trust_env=False,
-            headers=request_headers,
+            headers=send_headers,
         ) as client:
-            request = getattr(client, method)
-            response: httpx.Response = await request(url, **kwargs)
+            request = getattr(client, send_method)
+            response: httpx.Response = await request(send_url, **send_kwargs)
             return response
 
     async def aclose(self) -> None:
@@ -148,8 +206,8 @@ class DuckDuckGoEngine(SearchEngine):
                 raise RuntimeError(f"DuckDuckGo Lite returned {resp.status_code}")
             return self._parse_html(resp.text, max_results)
         except Exception as e:
-            logger.error(f"DuckDuckGo lite fallback failed: {type(e).__name__}: {e}")
-            raise RuntimeError(f"DuckDuckGo search failed: {e}") from e
+            logger.error("DuckDuckGo lite fallback failed: %s", type(e).__name__)
+            raise RuntimeError("DuckDuckGo search failed") from e
 
     def _parse_html(self, html: str, max_results: int) -> list[SearchResult]:
         import re
@@ -312,8 +370,8 @@ class TavilyEngine(SearchEngine):
                 )
             return results
         except Exception as e:
-            logger.error(f"Tavily search failed: {e}")
-            raise RuntimeError(f"Tavily search failed: {e}") from e
+            logger.error("Tavily search failed: %s", type(e).__name__)
+            raise RuntimeError("Tavily search failed") from e
 
     async def health_check(self) -> bool:
         try:
@@ -621,7 +679,7 @@ class SearchManager:
         # Check cache first
         cached = self._cache.get(query, max_results)
         if cached is not None:
-            logger.debug(f"Search cache hit for query: {query[:40]}")
+            logger.debug("Search cache hit")
             return cached
 
         errors: list[str] = []

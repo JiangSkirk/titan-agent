@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from collections.abc import Iterator
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -79,6 +81,13 @@ class TestLocalModelContextDetection:
 class TestCloudModelDiscovery:
     """Verify cloud provider model lists can be refreshed from API."""
 
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
+
     @pytest.mark.asyncio
     async def test_provider_manager_discovers_with_context(self) -> None:
         """ProviderManager.discover_models returns context_window when available."""
@@ -122,9 +131,19 @@ class TestCloudModelDiscovery:
             ]
         }
 
-        with patch("httpx.AsyncClient.get", return_value=v1_response):
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(return_value=v1_response)
+        with (
+            patch(
+                "js.security.net_guard.resolve_and_validate_provider_endpoint",
+                return_value=["203.0.113.10"],
+            ),
+            patch("httpx.AsyncClient", return_value=mock_client),
+        ):
             result = await ProviderManager.discover_models(
-                "http://example.com/v1", api_key="test"
+                "https://example.com/v1", api_key="test"
             )
 
         assert result["models"][0]["context_window"] == 131072

@@ -17,8 +17,11 @@ class TestBrowserTool:
         return BrowserTool(limits, guard)
 
     @pytest.mark.asyncio
-    async def test_private_url_blocked(self, browser: BrowserTool) -> None:
-        result = await browser.fetch("http://127.0.0.1:8080/admin")
+    async def test_private_url_blocked(self, browser: BrowserTool, tmp_path: Path) -> None:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            result = await browser.fetch("http://127.0.0.1:8080/admin")
         assert not result.success
         assert "blocked" in result.error.lower()
 
