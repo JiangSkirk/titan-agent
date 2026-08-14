@@ -233,6 +233,7 @@ class EchoRuntime:
             context.control_scope,
             task_ref_hash,
             appshell_binding_scope,
+            context.parent_turn_id,
         )
         return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
@@ -475,6 +476,16 @@ class EchoRuntime:
             resolved_cancel_token = asyncio.Event()
         cancel_token = resolved_cancel_token
         resolved_run_id = run_id or str(uuid.uuid4())
+        parent_context = current_runtime_context()
+        if (
+            parent_context is not None
+            and type(parent_context.run_id) is str
+            and parent_context.run_id.strip()
+            and parent_context.run_id != resolved_run_id
+        ):
+            inherited_parent_turn_id = parent_context.run_id
+        else:
+            inherited_parent_turn_id = "root"
         mode = mode_from_product_id(product_id)
         ws_handle = None if mode is AppMode.PERSONAL else _workspace_handle(workspace)
         appshell_binding = current_appshell_epoch_binding()
@@ -519,6 +530,7 @@ class EchoRuntime:
                 control_scope=("provider_discovery" if control_arguments is not None else ""),
                 task_ref=task_ref,
                 appshell_epoch_binding=appshell_binding,
+                parent_turn_id=inherited_parent_turn_id,
             )
         )
         if control_arguments is not None:

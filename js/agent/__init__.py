@@ -75,7 +75,13 @@ from js.models.router import ModelRouter
 from js.provider_credential_types import ProductId
 from js.security.approvals import ApprovalMode, ApprovalQueue
 from js.security.audit import AuditEventType, AuditLogger
-from js.security.egress import EgressConsentError
+from js.security.egress import (
+    ApprovalQueueEgressBroker,
+    EgressConsentError,
+    build_model_egress_provenance,
+    channel_has_egress_adapter,
+    make_product_egress_resolver,
+)
 from js.security.guard import BehaviorGuard
 from js.security.provider_credentials import CredentialError
 from js.security.sandbox import SandboxExecutor
@@ -301,10 +307,14 @@ class JSAgent(
             product_id=str(getattr(settings, "product_id", "js-agent")),
         )
         self.approvals.set_echo_authority(echo_authority)
-        from js.security.egress import ApprovalQueueEgressBroker
-
         if not self._egress_consent_broker_bound:
-            self.router.bind_egress_consent_broker(ApprovalQueueEgressBroker(self.approvals))
+            self.router.bind_egress_consent_broker(
+                ApprovalQueueEgressBroker(
+                    self.approvals,
+                    resolver=make_product_egress_resolver(self.approvals),
+                    allow_queue=lambda attempt: channel_has_egress_adapter(attempt.channel),
+                )
+            )
             self._egress_consent_broker_bound = True
         self.defense_strategies = build_default_strategies()
         self._setup_tools()
@@ -751,6 +761,7 @@ class JSAgent(
         model: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         attachment_manifest: tuple[dict[str, Any], ...] = (),
+        provenance: dict[str, Any] | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
         budget_callback: Callable[[], None] | None = None,
@@ -772,6 +783,7 @@ class JSAgent(
                 model=model,
                 tools=tools,
                 attachment_manifest=attachment_manifest,
+                provenance=provenance,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 budget_callback=budget_callback,
@@ -823,6 +835,7 @@ class JSAgent(
         model: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         attachment_manifest: tuple[dict[str, Any], ...] = (),
+        provenance: dict[str, Any] | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
         budget_callback: Callable[[], None] | None = None,
@@ -845,6 +858,7 @@ class JSAgent(
                 model=model,
                 tools=tools,
                 attachment_manifest=attachment_manifest,
+                provenance=provenance,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 budget_callback=budget_callback,
@@ -867,6 +881,7 @@ class JSAgent(
         model: str | None,
         tools: list[dict[str, Any]] | None,
         attachment_manifest: tuple[dict[str, Any], ...],
+        provenance: dict[str, Any] | None,
         temperature: float,
         max_tokens: int | None,
         budget_callback: Callable[[], None] | None,
@@ -1001,6 +1016,17 @@ class JSAgent(
                     run_id=run_id,
                 )
 
+            bound_provenance = provenance
+            if bound_provenance is None:
+                runtime = current_runtime_context()
+                if runtime is None:
+                    raise EgressConsentError("trusted owner required for model egress")
+                bound_provenance = build_model_egress_provenance(
+                    messages=messages,
+                    attachments=attachment_manifest,
+                    context=runtime,
+                )
+
             return await self.router.chat(
                 messages=messages,
                 model=model,
@@ -1011,6 +1037,7 @@ class JSAgent(
                 after_model_call=_after,
                 permit_grant=_permit_grant,
                 attachments=list(attachment_manifest) if attachment_manifest else None,
+                provenance=bound_provenance,
             )
 
         from js.echo.ledger.service import EchoUnavailableError

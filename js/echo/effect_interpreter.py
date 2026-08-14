@@ -44,6 +44,7 @@ class ModelEffect:
     model: str | None = None
     tools_schema: tuple[dict[str, Any], ...] = ()
     attachment_manifest: tuple[dict[str, Any], ...] = ()
+    provenance: dict[str, Any] | None = None
     temperature: float = 0.7
     max_tokens: int | None = None
     before_model_attempt: Callable[[], None] | None = None
@@ -133,6 +134,7 @@ class EffectInterpreter:
                     model=effect.model,
                     tools=list(effect.tools_schema) or None,
                     attachment_manifest=effect.attachment_manifest,
+                    provenance=effect.provenance,
                     temperature=effect.temperature,
                     max_tokens=effect.max_tokens,
                     budget_callback=effect.before_model_attempt,
@@ -227,6 +229,8 @@ class EffectInterpreter:
             before_model_call=before_model_call,
             after_model_call=after_model_call,
             permit_grant=_permit_grant,
+            attachments=list(effect.attachment_manifest) if effect.attachment_manifest else None,
+            provenance=effect.provenance,
         )
         iterator = aiter(stream)
         primary_failure = False

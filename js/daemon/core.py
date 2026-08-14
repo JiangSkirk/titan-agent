@@ -10,6 +10,7 @@ Runs the agent as a persistent process with:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -273,7 +274,17 @@ class JSDaemon:
 
     async def _cb_chat(self, job: ScheduledJob) -> str:
         prompt = job.payload.get("prompt", "")
-        logger.info(f"[cron] Chat task: {prompt[:50]}")
+        prompt_text = prompt if type(prompt) is str else ""
+        prompt_bytes = len(prompt_text.encode("utf-8"))
+        prompt_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        logger.info(
+            "cron_chat_dispatch job_id=%s owner=%s session=%s prompt_sha256=%s prompt_bytes=%s",
+            job.id,
+            job.owner_key_hash,
+            job.session_id or "",
+            prompt_sha256,
+            prompt_bytes,
+        )
         if not prompt:
             raise ValueError("cron chat task requires a prompt")
         state = await run_echo_turn(

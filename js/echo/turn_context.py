@@ -69,6 +69,7 @@ class RuntimeContext:
     authority_mac: str = ""
     task_ref: TaskRef | None = None
     appshell_epoch_binding: AppShellEpochBindingV1 | None = None
+    parent_turn_id: str = "root"
 
 
 def runtime_context_error(context: RuntimeContext) -> str | None:
@@ -157,6 +158,13 @@ def runtime_context_error(context: RuntimeContext) -> str | None:
         return "Echo runtime context cancel token is required"
     if bool(token.is_set()):
         return "Echo runtime context is cancelled"
+    parent_turn_id = context.parent_turn_id
+    if type(parent_turn_id) is not str or not parent_turn_id.strip():
+        return "Echo runtime context parent_turn_id is invalid"
+    if len(parent_turn_id) > _MAX_RUNTIME_IDENTITY_CHARS:
+        return "Echo runtime context parent_turn_id exceeds limit"
+    if any(ord(char) < 32 for char in parent_turn_id):
+        return "Echo runtime context parent_turn_id is invalid"
     return None
 
 

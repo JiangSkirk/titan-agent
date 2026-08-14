@@ -14,6 +14,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import threading
@@ -48,6 +49,7 @@ def _secure_str_eq(left: str | None, right: str | None) -> bool:
 DEFAULT_APPROVAL_TIMEOUT = 300.0  # 5 minutes
 APPROVAL_ARGUMENTS_HASH_SCHEME = "stable_payload_hash:v1"
 MODEL_EGRESS_KIND = "model_egress"
+_MODEL_EGRESS_REQUEST_RE = re.compile(r"^meg:[0-9a-f]{32}$")
 
 # Approval inputs cross an authority boundary, so bound their in-memory and
 # serialized cost before hashing, callback projection, or durable persistence.
@@ -1178,6 +1180,7 @@ class ApprovalQueue:
         run_id: str | None = None,
         owner_key_hash: str | None = None,
         queue_if_unhandled: bool = False,
+        request_id: str | None = None,
     ) -> ApprovalDecision:
         """Request an Echo approval decision for a dangerous operation."""
         # Periodic cleanup of stale requests
@@ -1219,6 +1222,47 @@ class ApprovalQueue:
         # JSON-safe bounded deep snapshot: rejects custom objects, NaN, Inf,
         # and isolates the queue from caller mutations.
         arguments = self.snapshot_arguments(arguments)
+
+        stable_request_id = ""
+        if tool_name == MODEL_EGRESS_KIND and request_id is not None:
+            if type(request_id) is not str or not _MODEL_EGRESS_REQUEST_RE.fullmatch(request_id):
+                denied = ApprovalRequest(
+                    id=self._next_id(),
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    timestamp=time.time(),
+                    context=context,
+                    timeout_seconds=timeout_seconds or self._default_timeout,
+                    session_id=session_id,
+                    run_id=run_id,
+                    owner_key_hash=owner_key_hash,
+                    approval_mode=ApprovalMode.MANUAL,
+                )
+                self._append_ledger("approval_requested", denied)
+                self._append_ledger(
+                    "approval_rejected",
+                    denied,
+                    reason="model_egress_request_identity",
+                )
+                self._audit_log(denied, "denied", "model_egress_request_identity")
+                return ApprovalDecision(
+                    ApprovalDecisionType.REJECT,
+                    request_id=denied.id,
+                    reason="model_egress_request_identity",
+                )
+            stable_request_id = request_id
+            with self._lock:
+                existing_pending = self._pending.get(stable_request_id)
+            if existing_pending is not None:
+                return ApprovalDecision(
+                    ApprovalDecisionType.PENDING,
+                    request_id=stable_request_id,
+                )
+            existing_resolved = self._resolved_decisions.get(stable_request_id)
+            if existing_resolved is None:
+                existing_resolved = self._durable_resolved_record(stable_request_id)
+            if existing_resolved is not None:
+                return self._clone_decision(existing_resolved.decision)
 
         if resolved_mode == ApprovalMode.AUTO_APPROVE:
             auto_req = ApprovalRequest(
@@ -1342,7 +1386,7 @@ class ApprovalQueue:
 
         # MANUAL mode: check for callback or block
         req = ApprovalRequest(
-            id=self._next_id(),
+            id=stable_request_id or self._next_id(),
             tool_name=tool_name,
             arguments=arguments,
             timestamp=time.time(),

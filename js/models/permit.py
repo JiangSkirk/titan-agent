@@ -69,6 +69,7 @@ class ModelPermit:
     expires_at: float
     mac: str
     attempt_hash: str = ""
+    attempt_id: str = ""
     consent_receipt_hash: str = ""
     channel: str = ""
     provider_generation: str = ""
@@ -92,6 +93,7 @@ class ModelPermit:
                 "nonce": self.nonce,
                 "expires_at": self.expires_at,
                 "attempt_hash": self.attempt_hash,
+                "attempt_id": self.attempt_id,
                 "consent_receipt_hash": self.consent_receipt_hash,
                 "channel": self.channel,
                 "provider_generation": self.provider_generation,
@@ -163,6 +165,7 @@ class ModelPermitIssuer:
         session_id: str,
         run_id: str,
         attempt_hash: str = "",
+        attempt_id: str = "",
         consent_receipt_hash: str = "",
         channel: str = "",
         provider_generation: str = "",
@@ -185,6 +188,7 @@ class ModelPermitIssuer:
             expires_at=time.time() + self._ttl_seconds,
             mac="",
             attempt_hash=attempt_hash,
+            attempt_id=attempt_id,
             consent_receipt_hash=consent_receipt_hash,
             channel=channel,
             provider_generation=provider_generation,
@@ -212,6 +216,7 @@ class ModelPermitIssuer:
         session_id: str | None = None,
         run_id: str | None = None,
         attempt_hash: str | None = None,
+        attempt_id: str | None = None,
         consent_receipt_hash: str | None = None,
         channel: str | None = None,
         provider_generation: str | None = None,
@@ -249,6 +254,10 @@ class ModelPermitIssuer:
                 raise ModelPermitError("model permit does not match the run")
             if attempt_hash is None or not hmac.compare_digest(permit.attempt_hash, attempt_hash):
                 raise ModelPermitError("model permit does not match the egress attempt")
+            if (permit.attempt_id or attempt_id) and (
+                attempt_id is None or not hmac.compare_digest(permit.attempt_id, attempt_id)
+            ):
+                raise ModelPermitError("model permit does not match the attempt identity")
             if consent_receipt_hash is None or not hmac.compare_digest(
                 permit.consent_receipt_hash, consent_receipt_hash
             ):

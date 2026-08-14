@@ -204,7 +204,50 @@ function showRespondEditor(card, approval) {
   input.focus();
 }
 
+function isModelEgress(approval) {
+  return approval.tool_name === 'model_egress' || approval.kind === 'model_egress';
+}
+
+function renderModelEgress(approval) {
+  const card = element('article', 'bg-gray-900 border border-amber-800 rounded-lg p-4');
+  const header = element('div', 'flex flex-wrap items-start justify-between gap-3');
+  const identity = element('div', 'min-w-0');
+  const title = element('h3', 'font-mono text-sm font-semibold text-amber-300 break-all', 'model_egress');
+  identity.append(
+    title,
+    element(
+      'p',
+      'text-xs text-gray-500 mt-1',
+      `${safeText(approval.context, '未知上下文')} · ${formatTimestamp(approval.timestamp)}`,
+    ),
+  );
+  const actions = element('div', 'flex gap-1 shrink-0');
+  actions.append(
+    createIconButton('fa-check', '批准外发', () => submitDecision(card, approval.id, { action: 'approve' }), 'bg-green-900/50 hover:bg-green-800 text-green-300'),
+    createIconButton('fa-times', '拒绝外发', () => submitDecision(card, approval.id, { action: 'reject' }), 'bg-red-900/50 hover:bg-red-800 text-red-300'),
+  );
+  header.append(identity, actions);
+  const summary = approval.safe_summary || approval.arguments || {};
+  const lines = [
+    `请求: ${safeText(approval.id)}`,
+    `过期: ${formatTimestamp(approval.expires_at)}`,
+    `提供方: ${safeText(summary.provider)}`,
+    `模型: ${safeText(summary.model)}`,
+    `目的地: ${safeText(summary.endpoint)}`,
+    `来源类别: ${safeText(summary.source_kinds)}`,
+    `消息/工具/附件: ${safeText(summary.message_count)} / ${safeText(summary.tool_count)} / ${safeText(summary.attachment_count)}`,
+    `attempt_hash: ${safeText(summary.attempt_hash)}`,
+  ];
+  const meta = element('p', 'text-xs text-gray-500 mt-3 break-all', `会话: ${safeText(approval.session_id)} · 运行: ${safeText(approval.run_id)}`);
+  const summaryLabel = element('div', 'text-xs text-gray-400 mt-3 mb-1', '安全摘要 (不含原文)');
+  const summaryPre = element('pre', 'bg-gray-950 border border-gray-800 rounded p-3 text-xs text-gray-300 font-mono whitespace-pre-wrap break-words max-h-64 overflow-auto');
+  summaryPre.textContent = lines.join('\n');
+  card.append(header, meta, summaryLabel, summaryPre);
+  return card;
+}
+
 function renderApproval(approval) {
+  if (isModelEgress(approval)) return renderModelEgress(approval);
   const card = element('article', 'bg-gray-900 border border-gray-800 rounded-lg p-4');
   const header = element('div', 'flex flex-wrap items-start justify-between gap-3');
   const identity = element('div', 'min-w-0');

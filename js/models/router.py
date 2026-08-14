@@ -41,6 +41,7 @@ from js.security.egress import (
     endpoint_digest,
     freeze_messages,
     freeze_tools,
+    normalize_egress_provenance,
     provider_endpoint_digest,
     provider_endpoint_url,
     provider_generation_of,
@@ -1024,6 +1025,7 @@ class ModelRouter:
                 session_id=attempt.session_id,
                 run_id=attempt.run_id,
                 attempt_hash=attempt.attempt_hash,
+                attempt_id=attempt.attempt_id,
                 consent_receipt_hash=consent_hash,
                 channel=attempt.channel,
                 provider_generation=attempt.provider_generation,
@@ -1036,6 +1038,7 @@ class ModelRouter:
             )
             if (
                 getattr(permit, "attempt_hash", "") != attempt.attempt_hash
+                or getattr(permit, "attempt_id", "") != attempt.attempt_id
                 or getattr(permit, "endpoint_digest", "") != attempt.endpoint_digest
                 or getattr(permit, "provider_generation", "") != attempt.provider_generation
             ):
@@ -1050,6 +1053,7 @@ class ModelRouter:
                 session_id=attempt.session_id,
                 run_id=attempt.run_id,
                 attempt_hash=attempt.attempt_hash,
+                attempt_id=attempt.attempt_id,
                 consent_receipt_hash=consent_hash,
                 channel=attempt.channel,
                 provider_generation=attempt.provider_generation,
@@ -1174,7 +1178,12 @@ class ModelRouter:
         frozen_messages = freeze_messages(messages)
         frozen_tools = freeze_tools(tools)
         frozen_attachments = digest_jsonable(attachments or [])
-        frozen_provenance = digest_jsonable(provenance or {})
+        try:
+            frozen_provenance_obj = normalize_egress_provenance(provenance)
+        except EgressConsentError as exc:
+            _mark_no_router_fallback(exc)
+            raise
+        frozen_provenance = digest_jsonable(frozen_provenance_obj)
         effective_max_tokens = self._clamp_stream_max_tokens(decision, max_tokens)
         identity = self._current_egress_identity()
         if identity is None:
@@ -1189,7 +1198,7 @@ class ModelRouter:
             messages=frozen_messages,
             tools=frozen_tools,
             attachments=attachments or [],
-            provenance=provenance or {},
+            provenance=frozen_provenance_obj,
             temperature=temperature,
             effective_max_tokens=effective_max_tokens,
         )
@@ -1206,6 +1215,8 @@ class ModelRouter:
                         endpoint_url=provider_endpoint_url(decision.provider),
                         message_count=len(frozen_messages),
                         tool_count=len(frozen_tools or []),
+                        provenance=frozen_provenance_obj,
+                        attachment_count=len(attachments or []),
                     ),
                 )
             except BaseException as exc:
@@ -1227,9 +1238,14 @@ class ModelRouter:
             except Exception as exc:
                 _mark_no_router_fallback(exc)
                 raise
+        try:
+            current_provenance = normalize_egress_provenance(provenance)
+        except EgressConsentError as exc:
+            _mark_no_router_fallback(exc)
+            raise
         if (
             digest_jsonable(attachments or []) != frozen_attachments
-            or digest_jsonable(provenance or {}) != frozen_provenance
+            or digest_jsonable(current_provenance) != frozen_provenance
         ):
             raise EgressConsentError("egress attachments or provenance changed after consent")
         self._reverify_egress_attempt(
@@ -1239,7 +1255,7 @@ class ModelRouter:
             messages=frozen_messages,
             tools=frozen_tools,
             attachments=attachments,
-            provenance=provenance,
+            provenance=current_provenance,
             temperature=temperature,
             effective_max_tokens=effective_max_tokens,
         )

@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from js.security.approvals import ApprovalDecisionType
+from js.security.egress import MODEL_EGRESS_KIND
 from js.web.auth import memory_owner, require_auth_dep, require_user_write
 from js.web.deps import get_agent
 
@@ -34,15 +35,42 @@ def _redact_arguments(value: Any, secrets: Any) -> Any:
 
 
 def _request_payload(request: Any, secrets: Any) -> dict[str, Any]:
-    return {
+    arguments = _redact_arguments(request.arguments, secrets)
+    payload = {
         "id": request.id,
         "tool_name": request.tool_name,
-        "arguments": _redact_arguments(request.arguments, secrets),
+        "arguments": arguments,
         "timestamp": request.timestamp,
         "context": request.context,
         "session_id": request.session_id,
         "run_id": request.run_id,
     }
+    if request.tool_name == MODEL_EGRESS_KIND:
+        timestamp = request.timestamp
+        if type(timestamp) is bool or not isinstance(timestamp, int | float):
+            timestamp = 0.0
+        timeout = getattr(request, "timeout_seconds", 0.0)
+        if type(timeout) is bool or not isinstance(timeout, int | float):
+            timeout = 0.0
+        payload["kind"] = MODEL_EGRESS_KIND
+        payload["expires_at"] = timestamp + timeout
+        if isinstance(arguments, dict):
+            payload["safe_summary"] = {
+                key: arguments.get(key)
+                for key in (
+                    "provider",
+                    "model",
+                    "endpoint",
+                    "source",
+                    "attempt_kind",
+                    "message_count",
+                    "tool_count",
+                    "attachment_count",
+                    "source_kinds",
+                    "attempt_hash",
+                )
+            }
+    return payload
 
 
 def _parse_decision_payload(payload: Any) -> tuple[ApprovalDecisionType, dict[str, Any]]:
@@ -117,6 +145,11 @@ async def decide_approval(
     )
     if request is None:
         raise HTTPException(404, "approval request not found")
+    if request.tool_name == MODEL_EGRESS_KIND and action not in {
+        ApprovalDecisionType.APPROVE,
+        ApprovalDecisionType.REJECT,
+    }:
+        raise HTTPException(400, "model_egress allows only approve or reject")
 
     decision = await asyncio.to_thread(
         agent.approvals.decide,

@@ -31,6 +31,10 @@ from js.echo.state import AgentState
 from js.echo.turn_context import current_runtime_context, runtime_partition_key
 from js.models.providers import ChatMessage, ChatResponse
 from js.security.audit import AuditEventType
+from js.security.egress import (
+    build_model_egress_provenance,
+    memory_records_from_working,
+)
 from js.security.guard import SecurityDecisionType
 from js.security.secrets import StreamingSecretRedactor
 from js.tools.registry import ParallelToolExecutor, ToolResult
@@ -276,6 +280,10 @@ class EchoTurnLoop:
         self._budget_elapsed_reserved_ms = 0
         self._pending_model_prompt_tokens = 0
         self._prompt_token_counter: TokenCounter | None = None
+        self._capsule_meta: dict[str, Any] = {}
+        self._capsule_text: str = ""
+        self._capsule_user_index: int | None = None
+        self._memory_lineage: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -653,6 +661,9 @@ class EchoTurnLoop:
                 # The synthetic context message is not a new user turn and must
                 # never be written back into conversation history.
                 self.history_ua_count += 1
+                self._capsule_text = capsule_text
+                self._capsule_meta = dict(_capsule_meta)
+                self._capsule_user_index = 1
 
             # Build user message: support multimodal for vision models
             model_config = agent.router.get_model_config(self.model or "")
@@ -692,6 +703,17 @@ class EchoTurnLoop:
             )
         except sqlite3.OperationalError:
             agent.logger.warning("Failed to store working memory", exc_info=True)
+        try:
+            working = await asyncio.to_thread(
+                agent.memory.get_working,
+                self.session_id,
+                10,
+                owner,
+            )
+            self._memory_lineage = memory_records_from_working(working)
+        except Exception:
+            agent.logger.warning("Failed to load memory lineage", exc_info=True)
+            self._memory_lineage = []
 
         # Expose the cancellable task only after setup has completed.  Before
         # this point a cancellation event is enough; cancelling the lane worker
@@ -1109,6 +1131,21 @@ class EchoTurnLoop:
     # Model call
     # ------------------------------------------------------------------
 
+    def _model_egress_provenance(
+        self,
+        messages: list[ChatMessage],
+        runtime_context: Any,
+    ) -> dict[str, Any]:
+        return build_model_egress_provenance(
+            messages=messages,
+            attachments=self.attachment_manifest,
+            context=runtime_context,
+            capsule=self._capsule_meta if self._capsule_text else None,
+            capsule_text=self._capsule_text,
+            memory_records=self._memory_lineage,
+            capsule_user_index=self._capsule_user_index,
+        )
+
     async def _get_response(
         self, compressed_messages: list[ChatMessage], tools_schema: list[dict[str, Any]] | None
     ) -> ChatResponse:
@@ -1160,6 +1197,10 @@ class EchoTurnLoop:
                     model=self.model,
                     tools_schema=tuple(tools_schema or ()),
                     attachment_manifest=self.attachment_manifest,
+                    provenance=self._model_egress_provenance(
+                        compressed_messages,
+                        runtime_context,
+                    ),
                     max_tokens=self._remaining_completion_tokens(),
                 ),
                 runtime_context,
@@ -1303,6 +1344,10 @@ class EchoTurnLoop:
                 model=self.model,
                 tools_schema=tuple(tools_schema or ()),
                 attachment_manifest=self.attachment_manifest,
+                provenance=self._model_egress_provenance(
+                    compressed_messages,
+                    runtime_context,
+                ),
                 max_tokens=self._remaining_completion_tokens(),
                 before_model_attempt=self._reserve_model_attempt,
                 completion_budget_callback=self._reserve_model_completion,
