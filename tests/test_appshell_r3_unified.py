@@ -137,6 +137,9 @@ def appshell_harness(tmp_path: Path) -> Any:
         headers={"Origin": "http://localhost"},
         client=("127.0.0.1", 50124),
     ) as client:
+        from tests.conftest import wait_appshell_work_ready
+
+        wait_appshell_work_ready(client)
         yield _Harness(
             client=client,
             app=app,

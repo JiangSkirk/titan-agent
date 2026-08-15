@@ -250,10 +250,26 @@ def _identity_test_app(personal_state: Path, work_state: Path) -> FastAPI:
     parent = FastAPI()
     parent.state.personal_app = child(personal_state)
     parent.state.work_app = child(work_state)
+    parent.state.work_ready = True
     parent.state.appshell_session_store = AppShellSessionStore(
         personal_state / "appshell_sessions.db"
     )
     return parent
+
+
+def test_desktop_identity_is_personal_only_until_work_is_ready(
+    tmp_path: Path,
+) -> None:
+    from desktop.sidecar.host import EphemeralDesktopIdentity
+
+    personal_state = tmp_path / "personal-state"
+    app = _identity_test_app(personal_state, tmp_path / "work-state")
+    app.state.work_app = None
+    app.state.work_ready = False
+    identity = EphemeralDesktopIdentity(app)
+    _token, principal = identity.create_parent_session()
+    assert principal.mode_roles == {"personal": "admin"}
+    assert identity._pending_work_key  # noqa: SLF001
 
 
 def _auth_identity_rows(state_dir: Path) -> dict[str, list[tuple[object, ...]]]:

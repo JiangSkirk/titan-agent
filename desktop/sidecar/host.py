@@ -112,14 +112,20 @@ class EphemeralDesktopIdentity:
         self._app = app
         self._owner_hash: str | None = None
         self._parent_session_token: str | None = None
+        self._pending_work_key: str | None = None
+        self._work_state_dir: Path | None = None
         self._generation = secrets.token_hex(16)
         self._lock = threading.Lock()
         personal_state = app.state.personal_app.state.runtime_settings.state_dir
-        work_state = app.state.work_app.state.runtime_settings.state_dir
         personal_auth = AuthManager(personal_state)
-        work_auth = AuthManager(work_state)
         legacy_owners = self._managed_owner_hashes(personal_state)
-        legacy_owners.update(self._managed_owner_hashes(work_state))
+        work_app = getattr(app.state, "work_app", None)
+        work_state: Path | None = None
+        if work_app is not None:
+            work_state = work_app.state.runtime_settings.state_dir
+            AuthManager(work_state)
+            legacy_owners.update(self._managed_owner_hashes(work_state))
+            self._work_state_dir = work_state
 
         # Revoke browser authority before removing its backing keys. Each store
         # mutation is transactional; any failure aborts Host startup, while a
@@ -129,13 +135,26 @@ class EphemeralDesktopIdentity:
             legacy_owner_hashes=legacy_owners,
         )
         personal_auth.purge_managed_keys(issuer=_DESKTOP_MANAGED_ISSUER)
-        work_auth.purge_managed_keys(issuer=_DESKTOP_MANAGED_ISSUER)
+        if work_state is not None:
+            AuthManager(work_state).purge_managed_keys(issuer=_DESKTOP_MANAGED_ISSUER)
+        app.state.desktop_identity = self
 
     @staticmethod
     def _managed_owner_hashes(state_dir: Path) -> set[str]:
         from js.utils.db import db_connection
 
-        with db_connection(state_dir / "api_keys.db") as connection:
+        database = state_dir / "api_keys.db"
+        if not database.is_file():
+            return set()
+        with db_connection(database) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "managed_api_keys" not in tables:
+                return set()
             return {
                 str(row[0])
                 for row in connection.execute(
@@ -161,9 +180,16 @@ class EphemeralDesktopIdentity:
                 raise RuntimeError("desktop identity was already exchanged")
             key = _generate_key()
             personal_settings = self._app.state.personal_app.state.runtime_settings
-            work_settings = self._app.state.work_app.state.runtime_settings
             personal_auth = AuthManager(personal_settings.state_dir)
-            work_auth = AuthManager(work_settings.state_dir)
+            work_app = getattr(self._app.state, "work_app", None)
+            work_ready = bool(
+                getattr(self._app.state, "work_ready", False) and work_app is not None
+            )
+            work_auth = (
+                AuthManager(work_app.state.runtime_settings.state_dir)
+                if work_ready and work_app is not None
+                else None
+            )
             personal_identity: dict[str, Any] | None = None
             work_identity: dict[str, Any] | None = None
             try:
@@ -173,20 +199,24 @@ class EphemeralDesktopIdentity:
                     role="admin",
                     issuer=_DESKTOP_MANAGED_ISSUER,
                 )
-                work_identity = work_auth.provision_managed_key(
-                    key,
-                    name=_EPHEMERAL_IDENTITY_NAME,
-                    role="admin",
-                    issuer=_DESKTOP_MANAGED_ISSUER,
-                )
                 owner = str(personal_identity["key_hash"])
-                if work_identity.get("key_hash") != owner:
-                    raise RuntimeError("desktop identity binding mismatch")
+                mode_roles = {"personal": "admin"}
+                if work_auth is not None and work_app is not None:
+                    work_identity = work_auth.provision_managed_key(
+                        key,
+                        name=_EPHEMERAL_IDENTITY_NAME,
+                        role="admin",
+                        issuer=_DESKTOP_MANAGED_ISSUER,
+                    )
+                    if work_identity.get("key_hash") != owner:
+                        raise RuntimeError("desktop identity binding mismatch")
+                    mode_roles["work"] = "admin"
+                    self._work_state_dir = work_app.state.runtime_settings.state_dir
                 session = cast(
                     "tuple[str, AppShellPrincipalV1]",
                     self._app.state.appshell_session_store.create(
                         owner=owner,
-                        mode_roles={"personal": "admin", "work": "admin"},
+                        mode_roles=mode_roles,
                         issuer=_DESKTOP_MANAGED_ISSUER,
                         generation=self._generation,
                     ),
@@ -196,7 +226,7 @@ class EphemeralDesktopIdentity:
                     (personal_auth, personal_identity),
                     (work_auth, work_identity),
                 ):
-                    if provisioned is None:
+                    if auth is None or provisioned is None:
                         continue
                     try:
                         auth.revoke_managed_key(
@@ -206,11 +236,41 @@ class EphemeralDesktopIdentity:
                     except Exception:
                         pass
                 raise
-            finally:
-                key = ""
             self._owner_hash = owner
             self._parent_session_token = session[0]
+            self._pending_work_key = None if work_auth is not None else key
             return session
+
+    def on_work_attached(self) -> None:
+        """Provision Work admin and grant the live parent session a Work role."""
+        with self._lock:
+            work_app = getattr(self._app.state, "work_app", None)
+            if work_app is None:
+                return
+            work_auth = AuthManager(work_app.state.runtime_settings.state_dir)
+            self._work_state_dir = work_app.state.runtime_settings.state_dir
+            work_auth.purge_managed_keys(issuer=_DESKTOP_MANAGED_ISSUER)
+            key = self._pending_work_key
+            owner = self._owner_hash
+            token = self._parent_session_token
+            if not key or owner is None or token is None:
+                return
+            try:
+                work_identity = work_auth.provision_managed_key(
+                    key,
+                    name=_EPHEMERAL_IDENTITY_NAME,
+                    role="admin",
+                    issuer=_DESKTOP_MANAGED_ISSUER,
+                )
+                if work_identity.get("key_hash") != owner:
+                    raise RuntimeError("desktop identity binding mismatch")
+                self._app.state.appshell_session_store.grant_mode_role(
+                    token,
+                    mode="work",
+                    role="admin",
+                )
+            finally:
+                self._pending_work_key = None
 
     def close(self) -> None:
         with self._lock:
@@ -237,10 +297,19 @@ class EphemeralDesktopIdentity:
                 return
 
             keys_clean = True
-            for child_name in ("personal_app", "work_app"):
-                settings = getattr(self._app.state, child_name).state.runtime_settings
+            self._pending_work_key = None
+            state_dirs = [
+                self._app.state.personal_app.state.runtime_settings.state_dir
+            ]
+            if self._work_state_dir is not None:
+                state_dirs.append(self._work_state_dir)
+            else:
+                work_app = getattr(self._app.state, "work_app", None)
+                if work_app is not None:
+                    state_dirs.append(work_app.state.runtime_settings.state_dir)
+            for state_dir in state_dirs:
                 try:
-                    AuthManager(settings.state_dir).revoke_managed_key(
+                    AuthManager(state_dir).revoke_managed_key(
                         owner,
                         issuer=_DESKTOP_MANAGED_ISSUER,
                     )

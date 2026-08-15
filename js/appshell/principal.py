@@ -325,6 +325,50 @@ class AppShellSessionStore:
             connection.commit()
         return token, principal
 
+    def grant_mode_role(
+        self,
+        token: str,
+        *,
+        mode: str,
+        role: str,
+    ) -> AppShellPrincipalV1:
+        """CAS-add one mode role without changing the active mode or epoch."""
+        if mode not in {"personal", "work"} or not isinstance(role, str) or not role:
+            raise ValueError("AppShell mode role is invalid")
+        token_digest = _token_hash(token)
+        with db_connection(self._db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT owner, session, active_mode, mode_roles_json,
+                       workspace, expires_at, epoch
+                FROM appshell_sessions WHERE token_hash = ?
+                """,
+                (token_digest,),
+            ).fetchone()
+            if row is None or float(row[5]) <= time.time():
+                connection.rollback()
+                raise AppShellSessionError("AppShell session is missing or expired")
+            principal = self._from_row(row)
+            roles = dict(principal.mode_roles)
+            if roles.get(mode) == role:
+                connection.commit()
+                return principal
+            roles[mode] = role
+            encoded = json.dumps(roles, sort_keys=True, separators=(",", ":"))
+            cursor = connection.execute(
+                "UPDATE appshell_sessions SET mode_roles_json = ? "
+                "WHERE token_hash = ? AND session = ? AND epoch = ?",
+                (encoded, token_digest, principal.session, principal.epoch),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                raise AppShellSessionConflictError(
+                    "AppShell mode-role grant lost its authoritative session"
+                )
+            connection.commit()
+        return replace(principal, mode_roles=roles)
+
     def revoke_issuer_sessions(
         self,
         *,

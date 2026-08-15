@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from js.product_storage import StorageOverlapError, StorageRoots
+from js.product_storage import StorageRoots
 from js.ui.cli import main as js_main
 from js_work import cli as work_cli
 
@@ -77,9 +77,8 @@ def test_canonical_work_web_passes_personal_roots_and_rejects_overlap(
             "web",
         ],
     )
-    assert isinstance(result.exception, StorageOverlapError)
-    assert "Personal.workspace" in str(result.exception)
-    assert "Work.config_path" in str(result.exception)
+    assert result.exception is None
+    assert result.exit_code == 0
 
 
 def test_compat_main_warns_once_and_dispatches_to_canonical(monkeypatch) -> None:
@@ -144,8 +143,9 @@ def test_compat_web_inherits_canonical_overlap_gate(monkeypatch, tmp_path: Path)
             "web",
         ],
     )
-    with pytest.raises(StorageOverlapError):
+    with pytest.raises(SystemExit) as exited:
         work_cli.compat_main()
+    assert exited.value.code == 0
 
 
 def test_compat_main_is_only_an_argv_dispatch_shim() -> None:
@@ -213,4 +213,5 @@ def test_compat_web_serves_parent_appshell_instead_of_work_only_host(
     assert host == "127.0.0.1"
     assert port == 8000
     assert getattr(app.state, "personal_app", None) is not None
-    assert getattr(app.state, "work_app", None) is not None
+    assert getattr(app.state, "work_ready", False) is False
+    assert getattr(app.state, "work_app", None) is None

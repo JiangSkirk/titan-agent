@@ -130,6 +130,9 @@ def appshell(tmp_path: Path) -> Any:
         headers={"Origin": "http://localhost"},
         client=("127.0.0.1", 50123),
     ) as client:
+        from tests.conftest import wait_appshell_work_ready
+
+        wait_appshell_work_ready(client)
         yield _Harness(
             client=client,
             app=app,
@@ -285,6 +288,9 @@ def test_fresh_loopback_bootstrap_creates_one_shared_recovery_identity(
         headers={"Origin": "http://localhost"},
         client=("127.0.0.1", 50123),
     ) as client:
+        from tests.conftest import wait_appshell_work_ready
+
+        wait_appshell_work_ready(client)
         response = client.post("/api/appshell/bootstrap")
         assert response.status_code == 200, response.text
         assert response.json()["principal"]["mode_roles"] == {

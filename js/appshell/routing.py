@@ -268,6 +268,15 @@ class AppShellRoutingMiddleware:
         self.personal_app = personal_app
         self.work_app = work_app
 
+    def _resolved_work_app(self) -> Any:
+        return getattr(self.owner_app.state, "work_app", None) or self.work_app
+
+    def _work_ready(self) -> bool:
+        return bool(
+            getattr(self.owner_app.state, "work_ready", False)
+            and self._resolved_work_app() is not None
+        )
+
     def _principal(self, scope: dict[str, Any]) -> AppShellPrincipalV1 | None:
         token = HTTPConnection(scope).cookies.get(APPSHELL_SESSION_COOKIE)
         store = cast("AppShellSessionStore", self.owner_app.state.appshell_session_store)
@@ -298,7 +307,26 @@ class AppShellRoutingMiddleware:
             await self.app(routed_scope, receive, send)
             return
 
-        target = self.work_app if principal and principal.active_mode == "work" else self.personal_app
+        if principal is not None and principal.active_mode == "work":
+            if not self._work_ready() or self._resolved_work_app() is None:
+                if scope.get("type") == "http":
+                    response = JSONResponse(
+                        {"detail": {"code": "work_runtime_unavailable"}},
+                        status_code=503,
+                    )
+                    await response(routed_scope, receive, send)
+                else:
+                    await send(
+                        {
+                            "type": "websocket.close",
+                            "code": 1013,
+                            "reason": "work runtime unavailable",
+                        }
+                    )
+                return
+            target = self._resolved_work_app()
+        else:
+            target = self.personal_app
         if principal is None:
             await target(routed_scope, receive, send)
             return

@@ -42,6 +42,13 @@ from js.web.auth import (
 router = APIRouter(prefix="/api/appshell", tags=["appshell"])
 
 
+def _work_runtime_ready(request: Request) -> bool:
+    return bool(
+        getattr(request.app.state, "work_ready", False)
+        and getattr(request.app.state, "work_app", None) is not None
+    )
+
+
 class AppShellSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -96,6 +103,12 @@ def _projection_authority(
             headers={"Cache-Control": "no-store"},
         )
     if principal.active_mode == "work":
+        if not _work_runtime_ready(request):
+            raise HTTPException(
+                503,
+                {"code": "work_runtime_unavailable"},
+                headers={"Cache-Control": "no-store"},
+            )
         mode = AppMode.WORK
         workspace = request.app.state.work_workspace_handle
         if principal.workspace != workspace:
@@ -208,7 +221,6 @@ async def _exchange_session(
         raise HTTPException(401, "X-API-Key header is required")
 
     personal_settings = request.app.state.personal_app.state.runtime_settings
-    work_settings = request.app.state.work_app.state.runtime_settings
     try:
         personal_identity = AuthManager(personal_settings.state_dir).verify(api_key)
     except Exception as exc:
@@ -219,19 +231,21 @@ async def _exchange_session(
         raise
 
     roles = {"personal": str(personal_identity["role"])}
-    try:
-        work_identity = AuthManager(work_settings.state_dir).verify(api_key)
-    except Exception as exc:
-        from js.exceptions import AuthRequiredError
+    if _work_runtime_ready(request):
+        work_settings = request.app.state.work_app.state.runtime_settings
+        try:
+            work_identity = AuthManager(work_settings.state_dir).verify(api_key)
+        except Exception as exc:
+            from js.exceptions import AuthRequiredError
 
-        if not isinstance(exc, AuthRequiredError):
-            raise
-    else:
-        # The same plaintext credential produces the same physical owner hash.
-        # Refuse any future verifier that claims otherwise.
-        if work_identity.get("key_hash") != personal_identity.get("key_hash"):
-            raise HTTPException(409, "Personal and Work identity binding mismatch")
-        roles["work"] = str(work_identity["role"])
+            if not isinstance(exc, AuthRequiredError):
+                raise
+        else:
+            # The same plaintext credential produces the same physical owner hash.
+            # Refuse any future verifier that claims otherwise.
+            if work_identity.get("key_hash") != personal_identity.get("key_hash"):
+                raise HTTPException(409, "Personal and Work identity binding mismatch")
+            roles["work"] = str(work_identity["role"])
 
     token, principal = request.app.state.appshell_session_store.create(
         owner=str(personal_identity["key_hash"]),
@@ -293,9 +307,13 @@ async def bootstrap_appshell_session(
     if not api_key and body is not None:
         api_key = body.api_key
     personal_settings = request.app.state.personal_app.state.runtime_settings
-    work_settings = request.app.state.work_app.state.runtime_settings
     personal_auth = AuthManager(personal_settings.state_dir)
-    work_auth = AuthManager(work_settings.state_dir)
+    work_ready = _work_runtime_ready(request)
+    work_auth = (
+        AuthManager(request.app.state.work_app.state.runtime_settings.state_dir)
+        if work_ready
+        else None
+    )
 
     if not api_key:
         if personal_auth.has_admin():
@@ -310,21 +328,23 @@ async def bootstrap_appshell_session(
             role="admin",
         )
         try:
-            work_auth.provision_existing_key(
-                api_key,
-                name="appshell-bootstrap",
-                role="admin",
-            )
+            if work_auth is not None:
+                work_auth.provision_existing_key(
+                    api_key,
+                    name="appshell-bootstrap",
+                    role="admin",
+                )
             _persist_bootstrap_admin_key(
                 personal_settings.state_dir / "bootstrap_admin_key.txt",
                 api_key,
             )
         except Exception:
             personal_auth.revoke_key(str(personal_identity["key_hash"]))
-            try:
-                work_auth.revoke_key(str(personal_identity["key_hash"]))
-            except Exception:
-                pass
+            if work_auth is not None:
+                try:
+                    work_auth.revoke_key(str(personal_identity["key_hash"]))
+                except Exception:
+                    pass
             raise
     else:
         try:
@@ -335,20 +355,23 @@ async def bootstrap_appshell_session(
             if isinstance(exc, AuthRequiredError):
                 raise HTTPException(401, str(exc)) from exc
             raise
-        try:
-            work_auth.verify(api_key)
-        except Exception as exc:
-            from js.exceptions import AuthRequiredError
+        if work_auth is not None:
+            try:
+                work_auth.verify(api_key)
+            except Exception as exc:
+                from js.exceptions import AuthRequiredError
 
-            if not isinstance(exc, AuthRequiredError):
-                raise
-            if personal_identity.get("role") != "admin":
-                raise HTTPException(403, "Personal admin role is required to grant Work") from exc
-            work_auth.provision_existing_key(
-                api_key,
-                name=str(personal_identity.get("name") or "appshell-admin"),
-                role="admin",
-            )
+                if not isinstance(exc, AuthRequiredError):
+                    raise
+                if personal_identity.get("role") != "admin":
+                    raise HTTPException(
+                        403, "Personal admin role is required to grant Work"
+                    ) from exc
+                work_auth.provision_existing_key(
+                    api_key,
+                    name=str(personal_identity.get("name") or "appshell-admin"),
+                    role="admin",
+                )
 
     assert api_key is not None
     return await _exchange_session(request, AppShellSessionRequest(api_key=api_key))
@@ -359,16 +382,22 @@ async def appshell_capabilities(
     request: Request,
     principal: AppShellPrincipalV1 = Depends(_trusted_principal),
 ) -> dict[str, Any]:
+    work_ready = _work_runtime_ready(request)
+    available_modes = [
+        mode
+        for mode in principal.mode_roles
+        if mode != "work" or work_ready
+    ]
     return {
         "schema": "AppShellCapabilitiesV1",
         "active_mode": principal.active_mode,
-        "available_modes": list(principal.mode_roles),
+        "available_modes": available_modes,
         "mode_roles": dict(principal.mode_roles),
         "workspace": principal.workspace,
         "workspace_handles": {
             "personal": None,
             "work": request.app.state.work_workspace_handle
-            if "work" in principal.mode_roles
+            if "work" in principal.mode_roles and work_ready
             else None,
         },
         "session": principal.session,
@@ -396,6 +425,8 @@ async def switch_appshell_mode(
     if body.to_mode == principal.active_mode:
         raise HTTPException(409, {"code": "mode_already_active"})
     if body.to_mode == "work":
+        if not _work_runtime_ready(request):
+            raise HTTPException(503, {"code": "work_runtime_unavailable"})
         if "work" not in principal.mode_roles:
             raise HTTPException(403, {"code": "work_role_required"})
         if body.workspace_handle != request.app.state.work_workspace_handle:
@@ -695,6 +726,12 @@ async def get_work_context(
         raise HTTPException(
             403,
             {"code": "work_context_requires_work_mode"},
+            headers={"Cache-Control": "no-store"},
+        )
+    if not _work_runtime_ready(request):
+        raise HTTPException(
+            503,
+            {"code": "work_runtime_unavailable"},
             headers={"Cache-Control": "no-store"},
         )
     if session_id is None:

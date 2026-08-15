@@ -5,6 +5,8 @@ Uses synthetic configs and fake keys only — no real API keys, no Accessibility
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +88,15 @@ def _loopback_client(app: Any) -> TestClient:
     )
 
 
+@contextmanager
+def _ready_client(app: Any) -> Iterator[TestClient]:
+    from tests.conftest import wait_appshell_work_ready
+
+    with _loopback_client(app) as client:
+        wait_appshell_work_ready(client)
+        yield client
+
+
 @pytest.fixture()
 def fresh_appshell(tmp_path: Path) -> Any:
     return _build_appshell(tmp_path, first_run=False)
@@ -97,7 +108,7 @@ class TestAppShellBootstrapOnboardingE2E:
     ) -> None:
         app = fresh_appshell
 
-        with _loopback_client(app) as client:
+        with _ready_client(app) as client:
             # Live settings exist only after child lifespans run (TestClient enter).
             personal = app.state.personal_app.state.web_runtime.settings
             work = app.state.work_app.state.web_runtime.settings
@@ -191,7 +202,7 @@ class TestAppShellBootstrapOnboardingE2E:
         self, fresh_appshell: Any
     ) -> None:
         app = fresh_appshell
-        with _loopback_client(app) as client:
+        with _ready_client(app) as client:
             assert client.post("/api/appshell/bootstrap").status_code == 200
 
             def _pending_and_leases(agent: Any) -> tuple[list[Any], list[Any]]:
@@ -238,7 +249,7 @@ class TestAppShellRestartPersistence:
         work_cfg = tmp_path / "work.yaml"
         work_home = tmp_path / "work-home"
 
-        with _loopback_client(app1) as client:
+        with _ready_client(app1) as client:
             assert client.post("/api/appshell/bootstrap").status_code == 200
             skip = client.post("/api/setup/skip")
             assert skip.status_code == 200
@@ -257,13 +268,13 @@ class TestAppShellRestartPersistence:
             port=8000,
         )
         personal = app2.state.personal_app.state.runtime_settings
-        work = app2.state.work_app.state.runtime_settings
         assert personal.onboarding_status == "skipped"
-        assert work.onboarding_status == "skipped"
         assert personal.first_run_completed is True
-        assert work.first_run_completed is True
 
-        with _loopback_client(app2) as client:
+        with _ready_client(app2) as client:
+            work = app2.state.work_app.state.runtime_settings
+            assert work.onboarding_status == "skipped"
+            assert work.first_run_completed is True
             # Existing admin from prior bootstrap — login via session exchange.
             # Bootstrap refuses when personal admin already exists without key.
             # Use the persisted bootstrap key file if present.
@@ -291,7 +302,7 @@ class TestSkipWriteFailureNoFakeDismiss:
 
         app = _build_appshell(tmp_path, first_run=False)
 
-        with _loopback_client(app) as client:
+        with _ready_client(app) as client:
             personal = app.state.personal_app.state.web_runtime.settings
             work = app.state.work_app.state.web_runtime.settings
             assert client.post("/api/appshell/bootstrap").status_code == 200
@@ -333,7 +344,7 @@ class TestOwnerSessionIsolation:
     ) -> None:
         app = _build_appshell(tmp_path, first_run=False)
 
-        with _loopback_client(app) as client:
+        with _ready_client(app) as client:
             personal = app.state.personal_app.state.web_runtime.settings
             work = app.state.work_app.state.web_runtime.settings
             personal_ws = personal.workspace.resolve()
@@ -396,7 +407,7 @@ class TestOwnerSessionIsolation:
 
     def test_reopen_from_settings_after_skip(self, tmp_path: Path) -> None:
         app = _build_appshell(tmp_path, first_run=False)
-        with _loopback_client(app) as client:
+        with _ready_client(app) as client:
             assert client.post("/api/appshell/bootstrap").status_code == 200
             assert client.post("/api/setup/skip").status_code == 200
             assert client.get("/api/setup/first-start").json()["wizard_blocking"] is False

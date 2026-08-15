@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -23,6 +24,28 @@ def _shared_consume_context(execution_context: ToolExecutionContext) -> str | No
     except Exception as exc:
         return f"Echo execution context lease denied: {type(exc).__name__}"
     return None
+
+
+def wait_appshell_work(client: Any, *, timeout: float = 15.0) -> dict[str, Any]:
+    """Poll AppShell health until Work attach finishes (ready or unavailable)."""
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        response = client.get("/api/appshell/health")
+        last = response.json()
+        status = (last.get("work") or {}).get("status")
+        if status in {"ready", "unavailable"}:
+            return last
+        time.sleep(0.02)
+    raise TimeoutError(f"Work attach did not finish: {last}")
+
+
+def wait_appshell_work_ready(client: Any, *, timeout: float = 15.0) -> dict[str, Any]:
+    """Poll until Work is routable; fail if it degrades."""
+    health = wait_appshell_work(client, timeout=timeout)
+    if (health.get("work") or {}).get("status") != "ready":
+        raise RuntimeError(f"Work runtime unavailable: {health}")
+    return health
 
 
 @pytest.fixture

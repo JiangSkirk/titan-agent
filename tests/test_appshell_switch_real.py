@@ -387,4 +387,5 @@ def test_launcher_builds_isolated_argv(tmp_path: Path, monkeypatch: Any) -> None
     assert host == "127.0.0.1"
     assert port == 18000
     assert app.state.personal_app is not None
-    assert app.state.work_app is not None
+    assert getattr(app.state, "work_ready", False) is False
+    assert getattr(app.state, "work_app", None) is None

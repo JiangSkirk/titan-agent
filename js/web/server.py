@@ -743,15 +743,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     _agent = JSAgent(_settings)
     _echo_safety_service = _agent.echo_safety_service
-    # Register fleet collaboration tool so the agent can delegate to multi-agent team
-    try:
-        from js.web.routers.fleet import get_fleet
-
-        _agent.register_fleet_tool(get_fleet)
-        _agent.set_fleet_getter(get_fleet)
-    except Exception:
-        logger.warning("Fleet tool registration failed (fleet may be unavailable)", exc_info=True)
-    _agent.start_background_tasks()
     _stats_store = TokenStatsStore(_settings.state_dir)
     runtime = WebRuntime(
         agent=_agent,
@@ -790,89 +781,114 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             _active_model = ""
     runtime.active_model = _active_model
-    # Clean up empty sessions on startup (sessions with no messages are orphaned)
-    try:
-        before_cleanup = _agent.memory.enhanced.list_sessions(limit=1000)
-        cleaned = _agent.memory.cleanup_empty_sessions()
-        after_cleanup = _agent.memory.enhanced.list_sessions(limit=1000)
-        logger.info(
-            f"Sessions on startup: {len(before_cleanup)} total, "
-            f"{cleaned} empty cleaned, {len(after_cleanup)} remaining"
-        )
-    except Exception:
-        logger.warning("Failed to clean up empty sessions", exc_info=True)
-
-    # Startup self-diagnostics
-    try:
-        import shutil
-
-        state_dir = _settings.state_dir
-        total, used, free = shutil.disk_usage(str(state_dir))
-        free_gb = free / (1024**3)
-        if free_gb < 1.0:
-            logger.warning("CRITICAL: state_dir has only %.1fGB free space remaining", free_gb)
-        elif free_gb < 5.0:
-            logger.warning("Disk low: state_dir has %.1fGB free space remaining", free_gb)
-        else:
-            logger.info("Disk check: state_dir has %.1fGB free", free_gb)
-
-        # Check WAL size
-        import sqlite3
-
-        for db_file in state_dir.rglob("*.db"):
-            wal = db_file.with_suffix(".db-wal")
-            if wal.exists() and wal.stat().st_size > 100 * 1024 * 1024:
-                logger.warning(
-                    "Large WAL file detected: %s (%.1fMB), checkpointing",
-                    wal,
-                    wal.stat().st_size / (1024**2),
-                )
-                try:
-                    with sqlite3.connect(str(db_file), timeout=5.0) as conn:
-                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except Exception:
-                    pass
-
-        # Check event logs size
-        event_dir = state_dir / "events"
-        if event_dir.exists():
-            total_size = sum(f.stat().st_size for f in event_dir.rglob("*") if f.is_file())
-            if total_size > 1024**3:
-                logger.warning(
-                    "Event log directory > 1GB (%.1fMB), consider pruning", total_size / (1024**2)
-                )
-    except Exception:
-        logger.debug("Startup self-diagnostics failed", exc_info=True)
-
-    # Load Hermes skills asynchronously only when explicitly enabled.
-    warm_start = os.getenv("JS_WARM_START")
-    skills = getattr(_agent, "skills", None)
-    hermes_opt_in = bool(skills is not None and getattr(skills, "hermes_skills_enabled", False))
-    if hermes_opt_in and skills is not None and warm_start:
-        try:
-            await asyncio.wait_for(skills.load_hermes_async(), timeout=60.0)
-            logger.info("Warm start: Hermes skills loaded")
-        except TimeoutError:
-            logger.warning("Warm start: Hermes skill loading timed out after 60s")
-        except Exception:
-            logger.warning("Warm start: Hermes skill loading failed", exc_info=True)
-
-    elif hermes_opt_in and skills is not None:
-        try:
-            asyncio.create_task(skills.load_hermes_async())
-            logger.info("Hermes skill loading started in background")
-        except Exception:
-            logger.warning("Failed to start Hermes skill loading", exc_info=True)
-    else:
-        logger.info("Hermes skill bridge skipped (features.hermes_skills_enabled=false)")
     logger.info("Web UI agent initialized")
     global _startup_time
     _startup_time = asyncio.get_event_loop().time()
     runtime.startup_time = _startup_time
 
+    async def _deferred_personal_startup() -> None:
+        agent = _agent
+        settings = _settings
+        if agent is None or settings is None:
+            return
+        try:
+            from js.web.routers.fleet import get_fleet
+
+            agent.register_fleet_tool(get_fleet)
+            agent.set_fleet_getter(get_fleet)
+        except Exception:
+            logger.warning(
+                "Fleet tool registration failed (fleet may be unavailable)",
+                exc_info=True,
+            )
+        agent.start_background_tasks()
+        try:
+            before_cleanup = agent.memory.enhanced.list_sessions(limit=1000)
+            cleaned = agent.memory.cleanup_empty_sessions()
+            after_cleanup = agent.memory.enhanced.list_sessions(limit=1000)
+            logger.info(
+                f"Sessions on startup: {len(before_cleanup)} total, "
+                f"{cleaned} empty cleaned, {len(after_cleanup)} remaining"
+            )
+        except Exception:
+            logger.warning("Failed to clean up empty sessions", exc_info=True)
+        try:
+            import shutil
+
+            state_dir = settings.state_dir
+            _total, _used, free = shutil.disk_usage(str(state_dir))
+            free_gb = free / (1024**3)
+            if free_gb < 1.0:
+                logger.warning(
+                    "CRITICAL: state_dir has only %.1fGB free space remaining",
+                    free_gb,
+                )
+            elif free_gb < 5.0:
+                logger.warning(
+                    "Disk low: state_dir has %.1fGB free space remaining",
+                    free_gb,
+                )
+            else:
+                logger.info("Disk check: state_dir has %.1fGB free", free_gb)
+
+            import sqlite3
+
+            for db_file in state_dir.rglob("*.db"):
+                wal = db_file.with_suffix(".db-wal")
+                if wal.exists() and wal.stat().st_size > 100 * 1024 * 1024:
+                    logger.warning(
+                        "Large WAL file detected: %s (%.1fMB), checkpointing",
+                        wal,
+                        wal.stat().st_size / (1024**2),
+                    )
+                    try:
+                        with sqlite3.connect(str(db_file), timeout=5.0) as conn:
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
+
+            event_dir = state_dir / "events"
+            if event_dir.exists():
+                total_size = sum(
+                    item.stat().st_size for item in event_dir.rglob("*") if item.is_file()
+                )
+                if total_size > 1024**3:
+                    logger.warning(
+                        "Event log directory > 1GB (%.1fMB), consider pruning",
+                        total_size / (1024**2),
+                    )
+        except Exception:
+            logger.debug("Startup self-diagnostics failed", exc_info=True)
+
+        warm_start = os.getenv("JS_WARM_START")
+        skills = getattr(agent, "skills", None)
+        hermes_opt_in = bool(
+            skills is not None and getattr(skills, "hermes_skills_enabled", False)
+        )
+        if hermes_opt_in and skills is not None and warm_start:
+            try:
+                await asyncio.wait_for(skills.load_hermes_async(), timeout=60.0)
+                logger.info("Warm start: Hermes skills loaded")
+            except TimeoutError:
+                logger.warning("Warm start: Hermes skill loading timed out after 60s")
+            except Exception:
+                logger.warning("Warm start: Hermes skill loading failed", exc_info=True)
+        elif hermes_opt_in and skills is not None:
+            try:
+                asyncio.create_task(skills.load_hermes_async())
+                logger.info("Hermes skill loading started in background")
+            except Exception:
+                logger.warning("Failed to start Hermes skill loading", exc_info=True)
+        else:
+            logger.info("Hermes skill bridge skipped (features.hermes_skills_enabled=false)")
+
+    deferred_startup = asyncio.create_task(_deferred_personal_startup())
     try:
         yield
     finally:
+        deferred_startup.cancel()
+        with suppress(asyncio.CancelledError):
+            await deferred_startup
         logger.info("Shutting down JS Agent Web UI")
         # Graceful: give in-flight requests a brief window to finish
         try:
