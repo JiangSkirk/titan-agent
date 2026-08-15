@@ -208,6 +208,12 @@ def test_bundle_runs_outside_repo_with_empty_path_and_cleans_process_group(
         assert listener[0] == "127.0.0.1"
         assert 0 < listener[1] < 65536
         assert listener[1] != 8765
+        mei_extracts = [
+            path
+            for path in (tmp_path / "tmp").rglob("*")
+            if path.name.startswith("_MEI")
+        ]
+        assert mei_extracts == [], mei_extracts
 
         metadata = subprocess.check_output(
             [

@@ -2,6 +2,10 @@
 
 > **当前版本: v0.1.5 本地 release candidate / 受控试用 — 欢迎反馈！**
 >
+> 包装版本是 `0.1.5`。集成分支名 `0.2.0-beta.1` 是工程轨道，不是包版本。
+>
+> 受控试用合同见 [docs/release/PUBLIC_BETA_CONTRACT.md](docs/release/PUBLIC_BETA_CONTRACT.md)。这不是 `stable_ready`，也不是公证发布。
+>
 > [English README](README_en.md)
 
 JS Agent 不是聊天机器人，而是一套**本地个人 Agent Harness**——围绕你选择的模型，提供记忆持久化、上下文胶囊、工具执行、安全护栏、测试反馈、模型切换和任务复盘的一整套本地驾驭系统。
@@ -265,6 +269,7 @@ python -m build
 
 Public Beta 只绑定字面回环地址（`127.0.0.1` 或 `::1`）。非回环明文 HTTP
 （包括 `0.0.0.0`）会被拒绝启动；不要把它当作支持的部署方式。
+完整试用合同见 [docs/release/PUBLIC_BETA_CONTRACT.md](docs/release/PUBLIC_BETA_CONTRACT.md)。
 
 ```bash
 # Web UI（仅 loopback）

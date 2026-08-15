@@ -1,6 +1,7 @@
 node_modules/
 src-tauri/target/
 src-tauri/binaries/js-agent-host-*
+launcher/target/
 __pycache__/
 *.py[cod]
 .pytest_cache/

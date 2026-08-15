@@ -36,7 +36,10 @@ from pathlib import Path, PurePosixPath
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TARGET_TRIPLE = "aarch64-apple-darwin"
 SIDECAR_NAME = f"js-agent-host-{TARGET_TRIPLE}"
-PRODUCT_VERSION = "0.1.0"
+SIDECAR_RUNTIME_DIRNAME = "js-agent-host-runtime"
+SIDECAR_RUNTIME_BIN = "js-agent-host"
+PYINSTALLER_ONEDIR_NAME = "js-agent-host"
+PRODUCT_VERSION = "0.1.5"
 MANIFEST_SCHEMA = "JSAgentDesktopProvenanceV4"
 BUILD_ENVIRONMENT_SCHEMA = "JSAgentDesktopBuildEnvironmentV2"
 PYTHON_RUNTIME_SCHEMA = "JSAgentDesktopPythonRuntimeV1"
@@ -72,8 +75,16 @@ _DESKTOP_RUNTIME_PACKAGES = {
 _DESKTOP_RUNTIME_MODULES = ("Cocoa", "Quartz", "Security", "objc", "tomli_w")
 _PYTHON_AMBIENT_INJECTION_KEYS = ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE")
 _ARTIFACT_KEYS = frozenset(
-    {"rust_main", "sidecar", "sidecar_standalone", "app_tree", "zip"}
+    {
+        "rust_main",
+        "sidecar",
+        "sidecar_standalone",
+        "sidecar_runtime",
+        "app_tree",
+        "zip",
+    }
 )
+_TREE_ARTIFACT_KEYS = frozenset({"app_tree", "sidecar_runtime"})
 _BUILD_INPUT_PATHS = {
     "uv_lock": "uv.lock",
     "cargo_lock": "desktop/src-tauri/Cargo.lock",
@@ -1039,6 +1050,181 @@ def _cleanup_pnpm_store_project_links(store: Path) -> None:
             child.unlink()
 
 
+def flatten_tree_to_real_files(source: Path, destination: Path, label: str) -> None:
+    """Copy ``source`` to ``destination``, replacing every symlink with real bytes.
+
+    The destination must not exist. Any dangling, looping, or special-file
+    symlink fails closed. The result is walked again so a leftover link cannot
+    enter the ``.app`` bundle.
+    """
+    if destination.exists():
+        raise RuntimeError(f"{label} destination already exists")
+    parent = destination.parent
+    if not parent.exists():
+        raise RuntimeError(f"{label} destination parent is missing")
+    if _has_symlink_component(parent):
+        raise RuntimeError(f"{label} destination contains a symlink component")
+    try:
+        _copy_tree_replacing_symlinks(source, destination, label, seen=set())
+        _assert_tree_has_no_symlinks(destination, label)
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination)
+        raise
+
+
+def _copy_tree_replacing_symlinks(
+    source: Path,
+    destination: Path,
+    label: str,
+    *,
+    seen: set[tuple[int, int]],
+) -> None:
+    try:
+        info = source.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} source is unreadable") from exc
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            followed = source.stat()
+        except OSError as exc:
+            raise RuntimeError(f"{label} contains a dangling symlink") from exc
+        key = (followed.st_dev, followed.st_ino)
+        if key in seen:
+            raise RuntimeError(f"{label} contains a symlink loop")
+        seen = {*seen, key}
+        if stat.S_ISDIR(followed.st_mode):
+            destination.mkdir(parents=True, exist_ok=False)
+            try:
+                children = sorted(os.scandir(source), key=lambda entry: entry.name)
+            except OSError as exc:
+                raise RuntimeError(f"{label} symlink directory is unreadable") from exc
+            for child in children:
+                _copy_tree_replacing_symlinks(
+                    Path(child.path),
+                    destination / child.name,
+                    label,
+                    seen=seen,
+                )
+            return
+        if stat.S_ISREG(followed.st_mode):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination, follow_symlinks=True)
+            return
+        raise RuntimeError(f"{label} symlink points to a special file")
+    if stat.S_ISDIR(info.st_mode):
+        destination.mkdir(parents=True, exist_ok=False)
+        try:
+            children = sorted(os.scandir(source), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise RuntimeError(f"{label} directory is unreadable") from exc
+        for child in children:
+            _copy_tree_replacing_symlinks(
+                Path(child.path),
+                destination / child.name,
+                label,
+                seen=seen,
+            )
+        return
+    if stat.S_ISREG(info.st_mode):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination, follow_symlinks=False)
+        return
+    raise RuntimeError(f"{label} contains a special file")
+
+
+def _assert_tree_has_no_symlinks(root: Path, label: str) -> None:
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        try:
+            if stat.S_ISLNK(current_path.lstat().st_mode):
+                raise RuntimeError(f"{label} contains a leftover symlink")
+        except OSError as exc:
+            raise RuntimeError(f"{label} is unreadable after flatten") from exc
+        for name in (*dirnames, *filenames):
+            path = current_path / name
+            try:
+                mode = path.lstat().st_mode
+            except OSError as exc:
+                raise RuntimeError(f"{label} is unreadable after flatten") from exc
+            if stat.S_ISLNK(mode):
+                raise RuntimeError(f"{label} contains a leftover symlink")
+
+
+def materialize_sidecar_runtime(onedir_root: Path, destination: Path) -> Path:
+    """Flatten a PyInstaller onedir tree into the canonical runtime layout."""
+    executable = onedir_root / PYINSTALLER_ONEDIR_NAME
+    try:
+        mode = executable.lstat().st_mode
+    except OSError as exc:
+        raise RuntimeError("PyInstaller onedir executable is missing") from exc
+    if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+        raise RuntimeError("PyInstaller onedir executable is missing")
+    flatten_tree_to_real_files(onedir_root, destination, "sidecar runtime")
+    materialized = destination / SIDECAR_RUNTIME_BIN
+    _single_link_file_stat(materialized, "sidecar runtime executable")
+    return destination
+
+
+def install_sidecar_runtime(runtime_root: Path, app_path: Path) -> Path:
+    """Copy the flattened onedir runtime into ``Contents/Resources``."""
+    resources = _safe_directory(app_path, "app bundle") / "Contents/Resources"
+    resources.mkdir(parents=True, exist_ok=True)
+    if _has_symlink_component(resources):
+        raise RuntimeError("app Resources contains a symlink component")
+    destination = resources / SIDECAR_RUNTIME_DIRNAME
+    flatten_tree_to_real_files(runtime_root, destination, "bundled sidecar runtime")
+    _single_link_file_stat(destination / SIDECAR_RUNTIME_BIN, "bundled sidecar runtime")
+    return destination
+
+
+def build_host_launcher(
+    *,
+    run: BuildRun,
+    stage_root: Path,
+    offline_inputs: OfflineBuildInputs,
+    runner: Runner = _run,
+) -> Path:
+    """Compile the tiny ``externalBin`` launcher that execs the onedir runtime."""
+    if not _run_is_owned(run):
+        raise RuntimeError("build run owner marker is invalid")
+    inputs = _validated_offline_inputs(offline_inputs)
+    manifest = stage_root / "desktop/launcher/Cargo.toml"
+    lockfile = stage_root / "desktop/launcher/Cargo.lock"
+    _read_single_link_file(manifest, "host launcher Cargo.toml")
+    _read_single_link_file(lockfile, "host launcher Cargo.lock")
+    artifacts = run.root / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    target_dir = run.root / "stage/launcher-target"
+    env = controlled_build_environment(run, inputs)
+    env["CARGO_TARGET_DIR"] = str(target_dir)
+    command = [
+        str(inputs.cargo_executable),
+        "build",
+        "--release",
+        "--locked",
+        "--offline",
+        "--manifest-path",
+        str(manifest),
+        "--target",
+        TARGET_TRIPLE,
+    ]
+    code, _stdout, stderr = runner(
+        command,
+        cwd=stage_root / "desktop/launcher",
+        env=env,
+        timeout=600,
+    )
+    if code != 0:
+        raise RuntimeError(f"host launcher build failed: {stderr}")
+    built = target_dir / TARGET_TRIPLE / "release" / SIDECAR_RUNTIME_BIN
+    _single_link_file_stat(built, "host launcher")
+    destination = artifacts / SIDECAR_NAME
+    shutil.copy2(built, destination)
+    _single_link_file_stat(destination, "standalone host launcher")
+    return destination
+
+
 def build_sidecar(
     source_digest: str,
     *,
@@ -1061,6 +1247,7 @@ def build_sidecar(
     artifacts.mkdir(parents=True, exist_ok=True)
     work_dir = run.root / "stage/pyinstaller-work"
     spec_dir = run.root / "stage/pyinstaller-spec"
+    dist_dir = run.root / "stage/pyinstaller-dist"
     python, resolved_python, launcher_identity = _python_runtime_launch_executable(
         Path(sys.executable)
     )
@@ -1070,11 +1257,11 @@ def build_sidecar(
         "-s",
         "-m",
         "PyInstaller",
-        "--onefile",
+        "--onedir",
         "--name",
-        SIDECAR_NAME,
+        PYINSTALLER_ONEDIR_NAME,
         "--distpath",
-        str(artifacts),
+        str(dist_dir),
         "--workpath",
         str(work_dir),
         "--specpath",
@@ -1152,9 +1339,11 @@ def build_sidecar(
         raise RuntimeError("Python runtime executable changed during PyInstaller")
     if code != 0:
         raise RuntimeError(f"PyInstaller failed: {stderr}")
-    binary = artifacts / SIDECAR_NAME
-    _single_link_file_stat(binary, "PyInstaller sidecar")
-    return binary
+    onedir_root = dist_dir / PYINSTALLER_ONEDIR_NAME
+    _safe_directory(onedir_root, "PyInstaller onedir")
+    return materialize_sidecar_runtime(
+        onedir_root, artifacts / SIDECAR_RUNTIME_DIRNAME
+    )
 
 
 def validate_build_number(value: object) -> str:
@@ -1792,6 +1981,9 @@ def _artifact_paths(source_digest: str) -> dict[str, str]:
         "rust_main": "artifacts/JS Agent.app/Contents/MacOS/js-agent-desktop",
         "sidecar": "artifacts/JS Agent.app/Contents/MacOS/js-agent-host",
         "sidecar_standalone": f"artifacts/{SIDECAR_NAME}",
+        "sidecar_runtime": (
+            "artifacts/JS Agent.app/Contents/Resources/" + SIDECAR_RUNTIME_DIRNAME
+        ),
         "app_tree": "artifacts/JS Agent.app",
         "zip": f"artifacts/{zip_name}",
     }
@@ -1886,6 +2078,12 @@ def generate_manifest(
         "sidecar_standalone": {
             "path": expected_paths["sidecar_standalone"],
             "sha256": _sha256_file(sidecar_path),
+        },
+        "sidecar_runtime": {
+            "path": expected_paths["sidecar_runtime"],
+            "sha256": _sha256_tree(
+                run.root / expected_paths["sidecar_runtime"], "sidecar runtime"
+            ),
         },
         "app_tree": {
             "path": expected_paths["app_tree"],
@@ -2099,7 +2297,7 @@ def verify_manifest(
             errors.append(f"artifact path escapes output root or contains a link: {name}")
             continue
         artifact_files[name] = full_path
-        if name == "app_tree":
+        if name in _TREE_ARTIFACT_KEYS:
             continue
         try:
             actual = _sha256_file(full_path, f"artifact {name}")
@@ -2148,6 +2346,20 @@ def verify_manifest(
         try:
             _verify_bundle_versions(app, validated_build_number)
             _verify_app_bundle_permissions(app)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    runtime = artifact_files.get("sidecar_runtime")
+    if runtime is not None:
+        try:
+            if not hmac.compare_digest(
+                _sha256_tree(runtime, "sidecar runtime"),
+                artifacts["sidecar_runtime"]["sha256"],
+            ):
+                errors.append("sidecar runtime tree digest mismatch")
+            _single_link_file_stat(
+                runtime / SIDECAR_RUNTIME_BIN, "sidecar runtime executable"
+            )
         except RuntimeError as exc:
             errors.append(str(exc))
 
@@ -2215,7 +2427,13 @@ def build_desktop(
         )
         build_inputs_before = _collect_build_inputs(repo_root)
         with _preserve_cargo_home_caches(inputs.cargo_home):
-            sidecar_path = build_sidecar(
+            sidecar_path = build_host_launcher(
+                run=run,
+                stage_root=stage_root,
+                offline_inputs=inputs,
+                runner=runner,
+            )
+            runtime_root = build_sidecar(
                 source_digest,
                 run=run,
                 stage_root=stage_root,
@@ -2225,6 +2443,10 @@ def build_desktop(
             staged_binary = stage_root / f"desktop/src-tauri/binaries/{SIDECAR_NAME}"
             staged_binary.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(sidecar_path, staged_binary)
+            staged_runtime = staged_binary.parent / SIDECAR_RUNTIME_DIRNAME
+            flatten_tree_to_real_files(
+                runtime_root, staged_runtime, "staged sidecar runtime"
+            )
             staged_app = build_tauri_app(
                 source_digest,
                 build_number=validated_build_number,
@@ -2235,6 +2457,7 @@ def build_desktop(
             )
             app_path = run.root / "artifacts/JS Agent.app"
             shutil.copytree(staged_app, app_path, symlinks=True)
+            install_sidecar_runtime(runtime_root, app_path)
             normalize_app_bundle_permissions(app_path)
             zip_path = create_zip(
                 app_path,

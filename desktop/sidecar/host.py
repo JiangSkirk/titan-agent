@@ -46,9 +46,9 @@ _DESKTOP_MANAGED_ISSUER = "js-agent-desktop-bootstrap-v1"
 def _sentinel_pid() -> int:
     """PID reported in the ready sentinel for Tauri process-group validation.
 
-    For PyInstaller onefile, the bootloader (process-group leader) is the PID
-    Tauri launched. The real Python runtime runs as a child of that leader and
-    must report the leader PID, otherwise setup fails with
+    The runtime may be a child of the externalBin process-group leader
+    (the tiny launcher, or a PyInstaller bootloader). Report the leader PID
+    so setup does not fail with
     ``sidecar sentinel PID escaped the externalBin process group``.
     """
     try:
@@ -427,8 +427,8 @@ async def _serve(
         return 70
 
     ready = {
-        # PyInstaller onefile re-execs into a child; Tauri validates the
-        # sentinel PID against the externalBin launch process group leader.
+        # The Host runtime may be a child of the externalBin leader. Tauri
+        # validates the sentinel PID against that process group.
         "pid": _sentinel_pid(),
         "port": int(listener.getsockname()[1]),
         "schema": READY_SCHEMA,

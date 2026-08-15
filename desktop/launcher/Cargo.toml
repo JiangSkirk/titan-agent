@@ -1,0 +1,11 @@
+[package]
+name = "js-agent-host-launcher"
+version = "0.1.5"
+description = "Exec-only launcher for the onedir JS Agent Host runtime"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "js-agent-host"
+path = "src/main.rs"

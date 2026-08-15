@@ -48,7 +48,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>com.titan.js-agent</string>
 <key>CFBundleExecutable</key><string>js-agent-desktop</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleShortVersionString</key><string>0.1.5</string>
 <key>CFBundleVersion</key><string>2026081101</string>
 </dict></plist>
 """,
@@ -100,7 +100,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 "schema": "JSAgentDesktopProvenanceV4",
                 "source_digest": "a" * 64,
                 "arch": "aarch64-apple-darwin",
-                "product_version": "0.1.0",
+                "product_version": "0.1.5",
                 "build_number": "2026081101",
                 "artifacts": {
                     "rust_main": {
@@ -341,6 +341,7 @@ def _bound_receipt(
     from desktop import build_driver
     from desktop.tests.test_build_driver import (
         BUILD_NUMBER,
+        _fake_runtime_binding,
         _offline_build_inputs,
         _write_info_plist,
         _write_release_inputs,
@@ -367,10 +368,12 @@ def _bound_receipt(
     executable = app / "Contents/MacOS/js-agent-desktop"
     bundled_sidecar = app / "Contents/MacOS/js-agent-host"
     standalone = artifacts / build_driver.SIDECAR_NAME
+    runtime_bin = app / "Contents/Resources/js-agent-host-runtime/js-agent-host"
     for path, content in (
         (executable, b"app-v1"),
         (bundled_sidecar, b"sidecar-v1"),
         (standalone, b"sidecar-v1"),
+        (runtime_bin, b"runtime-v1"),
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
@@ -379,19 +382,26 @@ def _bound_receipt(
     standalone.chmod(0o755)
     source_digest = release_source_digest(root)
     zip_path = artifacts / (
-        f"JS-Agent-0.1.0-macos-arm64-unsigned-{source_digest[:16]}.zip"
+        f"JS-Agent-0.1.5-macos-arm64-unsigned-{source_digest[:16]}.zip"
     )
     _write_zip_from_app(app, zip_path)
-    manifest = build_driver.generate_manifest(
-        source_digest=source_digest,
-        build_number=BUILD_NUMBER,
-        sidecar_path=standalone,
-        app_path=app,
-        zip_path=zip_path,
-        run=run,
-        repo_root=root,
-        offline_inputs=_offline_build_inputs(tmp_path / "formal-inputs"),
+    original_runtime = build_driver.verify_desktop_python_runtime
+    build_driver.verify_desktop_python_runtime = (
+        lambda *_args, **_kwargs: _fake_runtime_binding(root)
     )
+    try:
+        manifest = build_driver.generate_manifest(
+            source_digest=source_digest,
+            build_number=BUILD_NUMBER,
+            sidecar_path=standalone,
+            app_path=app,
+            zip_path=zip_path,
+            run=run,
+            repo_root=root,
+            offline_inputs=_offline_build_inputs(tmp_path / "formal-inputs"),
+        )
+    finally:
+        build_driver.verify_desktop_python_runtime = original_runtime
     manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
     if manifest_mutation is not None:
         manifest_mutation(manifest_payload, app)

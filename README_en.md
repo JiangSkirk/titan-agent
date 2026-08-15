@@ -5,6 +5,10 @@ An AI agent harness, not a chatbot. JS Agent wraps your chosen model with persis
 The model is the engine. The harness is the complete frame that lets the engine work.
 
 > **Status**: v0.1.5 local release candidate / controlled trial — feedback welcome!
+>
+> The package version is `0.1.5`. The integration branch name `0.2.0-beta.1` is an engineering track, not the package version.
+>
+> The controlled-trial contract is [docs/release/PUBLIC_BETA_CONTRACT.md](docs/release/PUBLIC_BETA_CONTRACT.md). It is not `stable_ready` and not a notarized release.
 
 ## Core Harness Capabilities
 
@@ -136,7 +140,8 @@ The release gate covers lint, typing, full tests, mock benchmarks, and release s
 
 Public Beta binds only literal loopback addresses (`127.0.0.1` or `::1`).
 Cleartext non-loopback HTTP, including `0.0.0.0`, is refused at startup and
-is not a supported deployment mode.
+is not a supported deployment mode. The full trial contract is
+[docs/release/PUBLIC_BETA_CONTRACT.md](docs/release/PUBLIC_BETA_CONTRACT.md).
 
 ```bash
 # Web UI (loopback only)

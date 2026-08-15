@@ -601,11 +601,28 @@ fn bundled_sidecar_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "desktop executable has no parent directory".to_string())?;
     let bundled = directory.join("js-agent-host");
     if bundled.is_file() {
+        if directory.file_name().and_then(|name| name.to_str()) == Some("MacOS") {
+            let runtime = directory
+                .parent()
+                .map(|contents| {
+                    contents
+                        .join("Resources")
+                        .join("js-agent-host-runtime")
+                        .join("js-agent-host")
+                })
+                .filter(|path| path.is_file());
+            if runtime.is_none() {
+                return Err("bundled AppShell sidecar runtime is missing".to_string());
+            }
+        }
         return Ok(bundled);
     }
-    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("binaries/js-agent-host-aarch64-apple-darwin");
-    if development.is_file() {
+    let development_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
+    let development = development_root.join("js-agent-host-aarch64-apple-darwin");
+    let development_runtime = development_root
+        .join("js-agent-host-runtime")
+        .join("js-agent-host");
+    if development.is_file() && development_runtime.is_file() {
         return Ok(development);
     }
     Err("bundled AppShell sidecar is missing".to_string())

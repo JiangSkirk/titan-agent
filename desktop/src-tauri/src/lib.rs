@@ -1174,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn onefile_runtime_pid_must_stay_in_the_external_bin_process_group() {
+    fn runtime_pid_must_stay_in_the_external_bin_process_group() {
         assert!(ready_pid_matches_group(4200, 4200, 4200));
         assert!(!ready_pid_matches_group(4200, 4201, 4200));
         assert!(!ready_pid_matches_group(4200, 4200, 4201));
