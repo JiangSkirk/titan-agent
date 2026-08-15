@@ -95,7 +95,10 @@ def _ensure_repo_toolchain(root: Path) -> None:
     for name in ("python", "ruff", "mypy"):
         source = repo_root / ".venv" / "bin" / name
         if not source.is_file():
-            continue
+            found = shutil.which(name)
+            if found is None:
+                continue
+            source = Path(found)
         target = root / ".venv" / "bin" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(source, target)

@@ -1,6 +1,6 @@
 [package]
 name = "js-agent-desktop"
-version = "0.1.0"
+version = "0.1.5"
 description = "Least-authority native shell for JS Agent"
 authors = ["JS Agent contributors"]
 edition = "2024"

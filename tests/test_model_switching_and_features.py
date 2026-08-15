@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -37,6 +38,12 @@ class MockCloudProvider(ModelProvider):
         self._responses: list[ChatResponse] = []
         self._index = 0
         self._stream_index = 0
+        self.config = SimpleNamespace(
+            name="cloud",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
+        self._endpoint_snapshot = "http://127.0.0.1:9/v1"
 
     def set_responses(self, responses: list[ChatResponse]) -> None:
         self._responses = responses
@@ -98,6 +105,12 @@ class MockLocalProvider(ModelProvider):
         self.models_used: list[str] = []
         self._responses: list[ChatResponse] = []
         self._index = 0
+        self.config = SimpleNamespace(
+            name="local",
+            base_url="http://127.0.0.1:1234/v1",
+            max_retries=1,
+        )
+        self._endpoint_snapshot = "http://127.0.0.1:1234/v1"
 
     def set_responses(self, responses: list[ChatResponse]) -> None:
         self._responses = responses

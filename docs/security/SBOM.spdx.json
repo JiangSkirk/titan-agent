@@ -2,13 +2,13 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "creationInfo": {
     "comment": "Local lockfile-derived SBOM. This artifact is not an external legal or license-review approval.",
-    "created": "2026-08-15T01:49:29Z",
+    "created": "2026-08-15T06:59:51Z",
     "creators": [
       "Tool: scripts/generate_release_evidence.py"
     ]
   },
   "dataLicense": "CC0-1.0",
-  "documentNamespace": "https://example.invalid/js-agent/sbom/2ec1899de3f3a742b882692b79f5ec76fe88860bf0db7c1382da503787d8f262",
+  "documentNamespace": "https://example.invalid/js-agent/sbom/bc7787d915d70df618c29643b68f6431b32a109f0f0400352d20a81641098f60",
   "name": "js-agent-echo-2.0-local-sbom",
   "packages": [
     {
@@ -3252,14 +3252,14 @@
       "versionInfo": "0.4.1"
     },
     {
-      "SPDXID": "SPDXRef-Package-cargo-js-agent-desktop-0.1.0",
+      "SPDXID": "SPDXRef-Package-cargo-js-agent-desktop-0.1.5",
       "checksums": [],
       "copyrightText": "NOASSERTION",
       "downloadLocation": "crates.io",
       "externalRefs": [
         {
           "referenceCategory": "PACKAGE-MANAGER",
-          "referenceLocator": "pkg:pypi/cargo:js-agent-desktop@0.1.0",
+          "referenceLocator": "pkg:pypi/cargo:js-agent-desktop@0.1.5",
           "referenceType": "purl"
         }
       ],
@@ -3268,7 +3268,7 @@
       "licenseConcluded": "NOASSERTION",
       "licenseDeclared": "NOASSERTION",
       "name": "cargo:js-agent-desktop",
-      "versionInfo": "0.1.0"
+      "versionInfo": "0.1.5"
     },
     {
       "SPDXID": "SPDXRef-Package-cargo-js-sys-0.3.103",
@@ -13460,7 +13460,7 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
-      "relatedSpdxElement": "SPDXRef-Package-cargo-js-agent-desktop-0.1.0",
+      "relatedSpdxElement": "SPDXRef-Package-cargo-js-agent-desktop-0.1.5",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },

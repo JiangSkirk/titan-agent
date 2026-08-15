@@ -77,7 +77,10 @@ class _FakeProvider:
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
+        attachments: Any = None,
+        **kwargs: Any,
     ) -> AsyncIterator[StreamEvent]:
+        del attachments, kwargs
         self.seen_tools = tools
         for ev in self._events:
             yield ev
@@ -100,8 +103,10 @@ class _FakeRouter:
         before_model_call: Any = None,
         after_model_call: Any = None,
         permit_grant: Any = None,
+        attachments: Any = None,
+        **kwargs: Any,
     ) -> AsyncIterator[StreamEvent]:
-        del max_tokens
+        del max_tokens, attachments, kwargs
         decision = SimpleNamespace(
             provider=self.provider,
             model=model or "m1",
@@ -423,7 +428,9 @@ class TestStreamEventDispatch:
                 tools: list[dict[str, Any]] | None = None,
                 temperature: float = 0.7,
                 max_tokens: int | None = None,
+                attachments: Any = None,
             ) -> AsyncIterator[StreamEvent]:
+                del attachments
                 yield StreamEvent(kind="text_delta", text="manual")
                 yield StreamEvent(kind="done", finish_reason="stop")
 

@@ -282,7 +282,7 @@ def test_desktop_v4_exports_closed_sanitized_descriptor_without_private_paths(
             "sha256": "3" * 64,
         },
         "zip": {
-            "path": f"artifacts/JS-Agent-0.1.0-macos-arm64-unsigned-{DIGEST[:16]}.zip",
+            "path": f"artifacts/JS-Agent-0.1.5-macos-arm64-unsigned-{DIGEST[:16]}.zip",
             "sha256": "4" * 64,
         },
     }
@@ -290,7 +290,7 @@ def test_desktop_v4_exports_closed_sanitized_descriptor_without_private_paths(
         "schema": "JSAgentDesktopProvenanceV4",
         "source_digest": DIGEST,
         "arch": "aarch64-apple-darwin",
-        "product_version": "0.1.0",
+        "product_version": "0.1.5",
         "build_number": "2026081101",
         "artifacts": artifacts,
         "build_inputs": {
@@ -528,7 +528,7 @@ def test_desktop_v4_exports_closed_sanitized_descriptor_without_private_paths(
         "original_manifest_sha256": original_manifest_sha,
         "source_digest": DIGEST,
         "arch": "aarch64-apple-darwin",
-        "product_version": "0.1.0",
+        "product_version": "0.1.5",
         "build_number": "2026081101",
         "app_tree": artifacts["app_tree"],
         "app_binary": artifacts["rust_main"],

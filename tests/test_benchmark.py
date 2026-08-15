@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +16,25 @@ from benchmarks.runner import (
     run_task,
     score_task,
 )
+
+_LOOPBACK = "http://127.0.0.1:9/v1"
+
+
+@pytest.fixture(autouse=True)
+def _bind_mock_benchmark_loopback() -> Iterator[None]:
+    """Align the shared benchmark mock with HEAD's fail-closed endpoint contract."""
+    original_init = MockBenchmarkProvider.__init__
+
+    def _init(self: MockBenchmarkProvider, responses: object) -> None:
+        original_init(self, responses)
+        self.config = SimpleNamespace(name="mock", base_url=_LOOPBACK, max_retries=1)
+        self._endpoint_snapshot = _LOOPBACK
+
+    MockBenchmarkProvider.__init__ = _init  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        MockBenchmarkProvider.__init__ = original_init  # type: ignore[method-assign]
 
 
 class TestLoadTasks:

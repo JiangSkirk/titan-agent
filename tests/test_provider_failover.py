@@ -20,6 +20,7 @@ import pytest
 
 from js.agent import JSAgent
 from js.config import JSSettings, ModelConfig
+from js.echo.turn_context import RuntimeContext, reset_runtime_context, set_runtime_context
 from js.models.permit import ModelPermitIssuer
 from js.models.providers import ChatMessage, ChatResponse, ModelProvider
 from js.models.router import ModelRouter
@@ -37,6 +38,12 @@ class ToggleableMockProvider(ModelProvider):
         self.calls: list[list[ChatMessage]] = []
         self._responses: list[ChatResponse] = []
         self._index = 0
+        self.config = SimpleNamespace(
+            name=name,
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
+        self._endpoint_snapshot = "http://127.0.0.1:9/v1"
 
     def set_responses(self, responses: list[ChatResponse]) -> None:
         self._responses = responses
@@ -125,6 +132,27 @@ def _echo_model_hooks(
 class TestRouterFailover:
     """Test ModelRouter fallback logic between multiple providers."""
 
+    @pytest.fixture(autouse=True)
+    def _egress_identity(self, tmp_path: Path) -> Any:
+        token = set_runtime_context(
+            RuntimeContext(
+                product_id="js-agent",
+                channel="chat",
+                owner_key_hash="owner",
+                session_id="session",
+                run_id="run",
+                role="user",
+                profile="default",
+                capabilities=(),
+                workspace=tmp_path,
+                state_dir=tmp_path,
+            )
+        )
+        try:
+            yield
+        finally:
+            reset_runtime_context(token)
+
     @pytest.fixture
     def router(self) -> ModelRouter:
         settings = JSSettings()
@@ -188,7 +216,12 @@ class TestRouterFailover:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         provider = ToggleableMockProvider("primary", healthy=True)
-        provider.config = SimpleNamespace(max_retries=3)  # type: ignore[attr-defined]
+        provider.config = SimpleNamespace(
+            name="primary",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=3,
+        )  # type: ignore[attr-defined]
+        provider._endpoint_snapshot = "http://127.0.0.1:9/v1"
         attempts = 0
 
         async def flaky_chat(*_args: Any, **_kwargs: Any) -> ChatResponse:

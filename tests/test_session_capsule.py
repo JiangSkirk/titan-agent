@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -22,6 +23,12 @@ class MockProvider(ModelProvider):
         self.responses = responses
         self.index = 0
         self.last_messages: list[ChatMessage] | None = None
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
+        self._endpoint_snapshot = "http://127.0.0.1:9/v1"
 
     async def chat(
         self,

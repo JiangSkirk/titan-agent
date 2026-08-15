@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -138,6 +139,12 @@ async def test_streaming_callback_receives_redacted_tokens(tmp_path):
     provider.chat_stream = fake_stream
     provider.chat_stream_events = fake_stream_events
     provider._last_stream_usage = None
+    provider.config = SimpleNamespace(
+        name="mock",
+        base_url="http://127.0.0.1:9/v1",
+        max_retries=1,
+    )
+    provider._endpoint_snapshot = "http://127.0.0.1:9/v1"
     decision = MagicMock()
     decision.provider = provider
     decision.model = "m"
@@ -182,7 +189,10 @@ async def test_streaming_callback_receives_redacted_tokens(tmp_path):
     )
     token = set_runtime_context(runtime_context)
     try:
-        response = await executor._get_response([], None)
+        response = await executor._get_response(
+            [ChatMessage(role="user", content="hi")],
+            None,
+        )
     finally:
         reset_runtime_context(token)
     assert isinstance(response, ChatResponse)
