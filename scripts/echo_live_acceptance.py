@@ -223,7 +223,6 @@ def _write_config(path: Path, *, workspace: Path, state_dir: Path, provider_port
             {
                 "name": "live-local",
                 "base_url": f"http://{LOOPBACK}:{provider_port}/v1",
-                "api_key": "local-only",
                 "timeout": 12,
                 "max_retries": 1,
                 "default_model": "live-local-model",
@@ -243,7 +242,11 @@ def _write_config(path: Path, *, workspace: Path, state_dir: Path, provider_port
     import yaml
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    dumped = yaml.safe_dump(config, sort_keys=False)
+    # PyYAML otherwise emits unquoted `on`, which loads back as boolean true.
+    dumped = dumped.replace("echo_engine: true\n", 'echo_engine: "on"\n')
+    dumped = dumped.replace("echo_engine: on\n", 'echo_engine: "on"\n')
+    path.write_text(dumped, encoding="utf-8")
 
 
 def _mint_owners(state_dir: Path) -> tuple[str, str]:

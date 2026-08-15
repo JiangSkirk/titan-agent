@@ -35,7 +35,7 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 from js.agent import JSAgent
-from js.config import JSSettings, MemoryConfig, ModelConfig, SecurityConfig
+from js.config import JSSettings, MemoryConfig, ModelConfig, ModelProviderConfig, SecurityConfig
 from js.echo.context_runtime import (
     get_context_runtime_snapshot_for_tests,
     reset_context_runtime_for_tests,
@@ -362,6 +362,7 @@ class DeterministicProvider(ModelProvider):
         self._stream_inter_text_delay_seconds = stream_inter_text_delay_seconds
         self.active_chat_calls = 0
         self.peak_chat_calls = 0
+        self.config = ModelProviderConfig(name="bench", base_url="http://127.0.0.1:9/v1")
 
     async def chat(
         self,
@@ -507,6 +508,8 @@ class DeterministicRouter(ModelRouter):
         self._providers: dict[str, ModelProvider] = {"bench": provider}
         self._model_map: dict[str, tuple[str, ModelConfig]] = {}
         self._permit_verifier = permit_verifier
+        self._egress_consent_broker = None
+        self._registered_provider_secrets: dict[int, tuple[object, ...]] = {}
 
     async def select_model(
         self, task_complexity: str = "medium", preferred: str | None = None
@@ -540,21 +543,35 @@ class DeterministicRouter(ModelRouter):
             Any,
         ]
         | None = None,
+        attachments: Any = None,
+        provenance: Any = None,
     ) -> ChatResponse:
         if before_model_call is None or after_model_call is None or permit_grant is None:
             raise RuntimeError(
                 "Echo benchmark router requires model gate callbacks and a runtime permit"
             )
         decision = await self.select_model(preferred=model)
-        self._consume_model_permit(permit_grant, decision, messages, tools)
-        context = await before_model_call(decision, messages, tools)
-        try:
-            response = await self._provider.chat(
+        send_messages, send_tools, send_max_tokens, context = (
+            await self._authorize_egress_then_permit(
+                decision,
                 messages=messages,
-                model=decision.model,
                 tools=tools,
+                attachments=attachments,
+                provenance=provenance,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                attempt_kind="initial",
+                before_model_call=before_model_call,
+                permit_grant=permit_grant,
+            )
+        )
+        try:
+            response = await self._provider.chat(
+                messages=send_messages,
+                model=decision.model,
+                tools=send_tools,
+                temperature=temperature,
+                max_tokens=send_max_tokens,
             )
         except Exception as exc:
             await after_model_call(context, None, exc)

@@ -10,6 +10,10 @@ PRODUCTION_ROOTS = (
     ROOT / "js" / "orchestration",
     ROOT / "js" / "daemon",
     ROOT / "js" / "web",
+    ROOT / "js" / "cron",
+    ROOT / "js" / "pipeline",
+    ROOT / "js" / "mcp",
+    ROOT / "js" / "connectors",
     ROOT / "js_work",
 )
 FORBIDDEN_CALLS = (

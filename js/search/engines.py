@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
+from js.security.bounded_http import BoundedResponse, read_bounded_response
 from js.security.net_guard import PinnedTransport, resolve_and_validate
 from js.utils.log import get_logger
 from js.utils.metrics import get_metrics
@@ -41,13 +42,13 @@ class _PinnedSearchClient:
         self.timeout = timeout
         self.headers = dict(headers or {})
 
-    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+    async def get(self, url: str, **kwargs: Any) -> BoundedResponse:
         return await self._request("get", url, **kwargs)
 
-    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+    async def post(self, url: str, **kwargs: Any) -> BoundedResponse:
         return await self._request("post", url, **kwargs)
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    async def _request(self, method: str, url: str, **kwargs: Any) -> BoundedResponse:
         from js.security import egress as network_egress
 
         frozen_url = url if type(url) is str else ""
@@ -117,16 +118,16 @@ class _PinnedSearchClient:
             allow_loopback=False,
             allow_private=False,
         )
+        timeout_seconds = float(timeout) if isinstance(timeout, int | float) else float(self.timeout)
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
         async with httpx.AsyncClient(
             transport=PinnedTransport(validated_ips[0], verify=True),
             timeout=httpx.Timeout(timeout),
             follow_redirects=False,
             trust_env=False,
             headers=send_headers,
-        ) as client:
-            request = getattr(client, send_method)
-            response: httpx.Response = await request(send_url, **send_kwargs)
-            return response
+        ) as client, client.stream(send_method, send_url, **send_kwargs) as response:
+            return await read_bounded_response(response, deadline_monotonic=deadline)
 
     async def aclose(self) -> None:
         return None

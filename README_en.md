@@ -134,17 +134,13 @@ The release gate covers lint, typing, full tests, mock benchmarks, and release s
 
 ## Production Deployment
 
-> Note: binding to `0.0.0.0` exposes the service beyond localhost. Production, LAN, or public deployments must require an API key; never expose no-auth mode outside the local machine.
+Public Beta binds only literal loopback addresses (`127.0.0.1` or `::1`).
+Cleartext non-loopback HTTP, including `0.0.0.0`, is refused at startup and
+is not a supported deployment mode.
 
 ```bash
-# Web UI
-js web --host 0.0.0.0 --port 8000
-
-# Or Docker
-docker run -p 8000:8000 -e OPENAI_API_KEY=xxx js-agent
-
-# Or Gunicorn + Uvicorn
-gunicorn "js.web:create_app()" -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+# Web UI (loopback only)
+js web --host 127.0.0.1 --port 8000
 ```
 
 ## License

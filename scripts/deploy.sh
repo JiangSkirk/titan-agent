@@ -53,24 +53,17 @@ else
     echo "  ✅ 虚拟环境已存在，跳过"
 fi
 
-# 3. 安装 uv（如果可用则优先使用）
+# 3. 安装依赖（离线冻结）
 echo ""
 echo "[3/5] 安装依赖..."
 source "$VENV_DIR/bin/activate"
 
-# 尝试安装 uv（更快）
 if ! command -v uv &> /dev/null; then
-    echo "  正在安装 uv (Python 包管理加速器)..."
-    pip install uv --quiet 2>/dev/null || true
+    echo "  ❌ 需要 uv 才能离线冻结安装；拒绝在线 pip 范围解析。"
+    exit 1
 fi
-
-if command -v uv &> /dev/null; then
-    echo "  使用 uv 安装 (更快)..."
-    uv pip install -e "$PROJECT_DIR"
-else
-    echo "  使用 pip 安装..."
-    pip install -e "$PROJECT_DIR"
-fi
+echo "  使用 uv sync --frozen --offline..."
+uv sync --frozen --offline
 echo "  ✅ 依赖安装完成"
 
 # 4. 一键配置
@@ -94,21 +87,21 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$PROJECT_DIR/.venv/bin/activate"
 echo "Starting JS Agent Web UI..."
 echo "Open http://localhost:8000 in your browser"
-js web --host 0.0.0.0 --port 8000
+js web --host 127.0.0.1 --port 8000
 EOF
 chmod +x "$LAUNCH_SCRIPT"
 echo "  ✅ 启动脚本已创建: $LAUNCH_SCRIPT"
 
-# macOS: 创建 Automator 快捷方式
+# macOS: 源码快捷方式不得覆盖正式 JS Agent.app
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    APP_DIR="$HOME/Applications/JS Agent.app"
+    APP_DIR="$HOME/Applications/JS Agent Source.app"
     if [ ! -d "$APP_DIR" ]; then
         mkdir -p "$APP_DIR/Contents/MacOS"
-        cat > "$APP_DIR/Contents/MacOS/JS Agent" << EOF
+        cat > "$APP_DIR/Contents/MacOS/JS Agent Source" << EOF
 #!/bin/bash
 osascript -e 'tell application "Terminal" to do script "cd $PROJECT_DIR && ./start.sh"'
 EOF
-        chmod +x "$APP_DIR/Contents/MacOS/JS Agent"
+        chmod +x "$APP_DIR/Contents/MacOS/JS Agent Source"
         echo "  ✅ macOS 应用快捷方式已创建: $APP_DIR"
     fi
 fi

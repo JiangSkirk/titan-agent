@@ -140,6 +140,10 @@ def create_staged(
             dir_fd=parent_fd,
         )
         identity = _fd_identity(descriptor)
+        opened = os.fstat(descriptor)
+        if opened.st_nlink != 1:
+            os.close(descriptor)
+            raise ValueError("staged artifact must not be hardlinked")
         os.close(descriptor)
     except Exception:
         os.close(parent_fd)
@@ -354,6 +358,10 @@ def _verify_staged_identity(staged: StagedArtifact) -> tuple[int, int]:
     except OSError as exc:
         raise ValueError(f"staged file is not a regular file: {staged}") from exc
     identity = _fd_identity(descriptor)
+    opened = os.fstat(descriptor)
+    if opened.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError("staged artifact must not be hardlinked")
     os.close(descriptor)
     try:
         pathname_identity = _path_identity(Path(staged))

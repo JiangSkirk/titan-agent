@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
@@ -890,29 +898,478 @@ class TestAttachmentAPI:
         assert after_delete.json()["files"] == []
 
 
+_WORK_LOOPBACK_ENDPOINT = "http://127.0.0.1:1/v1"
+_WORK_LOOPBACK_PROVIDER = "work-loopback"
+_WORK_LOOPBACK_MODEL = "work-loopback-model"
+_WORK_CLI_LAUNCHER = (
+    "import sys\n"
+    "from js_work.cli import main\n"
+    "sys.argv = ['js-work-direct', *sys.argv[1:]]\n"
+    "main()\n"
+)
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _stop_work_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def _write_work_web_config(
+    path: Path,
+    *,
+    workspace: Path,
+    state_dir: Path,
+    work_home: Path,
+    endpoint: str,
+) -> None:
+    path.write_text(
+        "\n".join(
+            (
+                f'work_home: "{work_home}"',
+                f'workspace: "{workspace}"',
+                f'state_dir: "{state_dir}"',
+                "first_run_completed: true",
+                "security:",
+                "  api_key_required: false",
+                "providers:",
+                f"  - name: {_WORK_LOOPBACK_PROVIDER}",
+                f"    base_url: {json.dumps(endpoint)}",
+                f"    default_model: {_WORK_LOOPBACK_MODEL}",
+                "    models:",
+                f"      - id: {_WORK_LOOPBACK_MODEL}",
+                "        name: Work Loopback",
+                f"        provider: {_WORK_LOOPBACK_PROVIDER}",
+                "models: []",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+
+def _isolated_work_env(home: Path, config_path: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "JS_WORK_CONFIG_PATH": str(config_path),
+            "JS_WORK_ECHO_ENGINE": "on",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    for name in (
+        "JS_CONFIG_PATH",
+        "JS_STATE_DIR",
+        "JS_ECHO_ENGINE",
+        "JS_WARM_START",
+        "JS_ALLOWED_ORIGINS",
+    ):
+        env.pop(name, None)
+    return env
+
+
+def _work_cli_argv(*, config_path: Path, home: Path, port: int) -> list[str]:
+    return [
+        sys.executable,
+        "-c",
+        _WORK_CLI_LAUNCHER,
+        "--config",
+        str(config_path),
+        "--home",
+        str(home),
+        "--profile",
+        "office",
+        "web",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+    ]
+
+
+@dataclass(frozen=True)
+class _WorkWebHarness:
+    base_url: str
+    isolated_home: Path
+    work_home: Path
+    workspace: Path
+    state_dir: Path
+    config_path: Path
+    personal_poison_workspace: Path
+    endpoint: str
+    api_key: str
+    owner_key_hash: str
+
+
+@pytest.fixture(scope="session")
+def work_web_harness(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_WorkWebHarness]:
+    """Start official Work Web via ``js_work.cli.main`` in an isolated HOME.
+
+    Public ``js-work`` / ``python -m js_work`` are AppShell shims and default
+    to Personal. This fixture uses the official Work product CLI
+    (``--profile office``) so the Work lifespan is selected explicitly.
+    """
+
+    base = tmp_path_factory.mktemp("work-web-product-gate")
+    isolated_home = base / "isolated-home"
+    work_root = base / "work-root"
+    work_product_home = work_root / ".js-work"
+    workspace = work_product_home / "workspace"
+    state_dir = work_product_home / "state"
+    personal_poison_workspace = isolated_home / ".js" / "workspace"
+    personal_poison_state = isolated_home / ".js" / "state"
+    isolated_home.mkdir()
+    work_product_home.mkdir(parents=True)
+    workspace.mkdir()
+    state_dir.mkdir()
+    personal_poison_workspace.mkdir(parents=True)
+    personal_poison_state.mkdir(parents=True)
+    (personal_poison_workspace / "personal-only.txt").write_text(
+        "personal-secret", encoding="utf-8"
+    )
+    personal_config = isolated_home / ".config" / "js" / "config.yaml"
+    personal_config.parent.mkdir(parents=True)
+    personal_config.write_text(
+        "\n".join(
+            (
+                f'workspace: "{personal_poison_workspace}"',
+                f'state_dir: "{personal_poison_state}"',
+                "first_run_completed: true",
+                "providers:",
+                "  - name: personal-poison",
+                "    base_url: http://127.0.0.1:9/v1",
+                "    default_model: personal-poison-model",
+                "models: []",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    config_path = base / "work-config.yaml"
+    _write_work_web_config(
+        config_path,
+        workspace=workspace,
+        state_dir=state_dir,
+        work_home=work_product_home,
+        endpoint=_WORK_LOOPBACK_ENDPOINT,
+    )
+    port = _free_loopback_port()
+    base_url = f"http://127.0.0.1:{port}"
+    env = _isolated_work_env(isolated_home, config_path)
+    argv = _work_cli_argv(config_path=config_path, home=work_root, port=port)
+    log_path = base / "work-server.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            argv,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        try:
+            deadline = time.monotonic() + 45
+            last_error = "Work server did not respond"
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                try:
+                    with _LOCAL_OPENER.open(f"{base_url}/", timeout=1) as response:
+                        if response.status == 200:
+                            from js.web.auth import AuthManager
+
+                            auth = AuthManager(state_dir)
+                            api_key = auth.create_key("work-web-e2e", role="admin")
+                            owner_key_hash = str(auth.verify(api_key)["key_hash"])
+                            yield _WorkWebHarness(
+                                base_url=base_url,
+                                isolated_home=isolated_home,
+                                work_home=work_product_home,
+                                workspace=workspace,
+                                state_dir=state_dir,
+                                config_path=config_path,
+                                personal_poison_workspace=personal_poison_workspace,
+                                endpoint=_WORK_LOOPBACK_ENDPOINT,
+                                api_key=api_key,
+                                owner_key_hash=owner_key_hash,
+                            )
+                            return
+                except Exception as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                time.sleep(0.2)
+            log.flush()
+            server_log = log_path.read_text(encoding="utf-8", errors="replace")[-8000:]
+            pytest.fail(
+                f"Work product browser gate failed to start: {last_error}\n"
+                f"exit={process.poll()}\nargv={argv}\n{server_log}",
+                pytrace=False,
+            )
+        finally:
+            _stop_work_process(process)
+
+
+@pytest.fixture(scope="session")
+def work_live_server(work_web_harness: _WorkWebHarness) -> str:
+    return work_web_harness.base_url
+
+
 class TestWorkWebProduct:
     def test_work_web_has_distinct_identity_profile_and_skill_boundary(
-        self, work_live_server: str, page: Page
+        self, work_web_harness: _WorkWebHarness, page: Page
     ) -> None:
-        page.goto(work_live_server, wait_until="domcontentloaded")
+        from js.echo.attachment_gate import owner_slug, session_slug
+
+        harness = work_web_harness
+        auth_headers = {"Origin": harness.base_url, "X-API-Key": harness.api_key}
+        page.goto(harness.base_url, wait_until="domcontentloaded")
         expect(page).to_have_title("JS Agent Work")
         expect(page.locator("#nav-rail .rail-brand").first).to_have_text("JS")
+        assert "JS Agent Work" in page.content()
+        assert "欢迎使用 JS Agent</" not in page.content()
 
-        status = page.request.get(f"{work_live_server}/api/status")
+        status = page.request.get(f"{harness.base_url}/api/status", headers=auth_headers)
         assert status.ok, status.text()
         status_payload = status.json()
         assert status_payload["product_id"] == "js-work"
         assert status_payload["profile"] == "office"
         assert status_payload["echo"]["architecture_state"] == "primary_healthy"
+        workspace = str(status_payload["workspace"])
+        state_dir = str(status_payload["state_dir"])
+        assert Path(workspace) == harness.workspace.resolve()
+        assert Path(state_dir) == harness.state_dir.resolve()
+        assert str(harness.personal_poison_workspace) not in (workspace, state_dir)
+        assert "/.js-work/" in workspace.replace("\\", "/")
+        assert str(harness.isolated_home / ".js") not in workspace
+        status_text = status.text()
+        assert str(Path.cwd() / "chat.jsonl") not in status_text
+        assert str(harness.isolated_home / "chat.jsonl") not in status_text
 
-        skills = page.request.get(f"{work_live_server}/api/skills")
+        capabilities = page.request.get(
+            f"{harness.base_url}/api/capabilities", headers=auth_headers
+        )
+        assert capabilities.ok, capabilities.text()
+        caps = capabilities.json()
+        assert caps["product_id"] == "js-work"
+        assert caps["features"]["skills_enabled"] is False
+        assert caps["features"]["skill_tools_enabled"] is False
+        assert caps["features"]["evolution_enabled"] is False
+        assert caps["tabs"]["skills"]["enabled"] is False
+        assert caps["tabs"]["evolution"]["enabled"] is False
+        assert caps["tabs"]["files"]["enabled"] is True
+        assert caps["api"]["skills_mutations"] is False
+        assert caps["api"]["evolution_actions"] is False
+
+        skills = page.request.get(f"{harness.base_url}/api/skills", headers=auth_headers)
         assert skills.ok, skills.text()
         skills_payload = skills.json()
         assert skills_payload["skills"] == []
         assert skills_payload["disabled"] is True
         assert skills_payload.get("global_stats", {}).get("skills_loaded", 0) == 0
 
+        json_headers = {**auth_headers, "Content-Type": "application/json"}
+        skill_install = page.request.post(
+            f"{harness.base_url}/api/skills/install",
+            headers=json_headers,
+            data=json.dumps({"source": "personal-only"}),
+        )
+        assert skill_install.status in {403, 503}, skill_install.text()
+        skill_delete = page.request.delete(
+            f"{harness.base_url}/api/skills/personal-only",
+            headers=auth_headers,
+        )
+        assert skill_delete.status == 403, skill_delete.text()
+        assert "Work" in skill_delete.text() or "disabled" in skill_delete.text().lower()
+
+        evolution = page.request.post(
+            f"{harness.base_url}/api/evolution/run",
+            headers=json_headers,
+            data=json.dumps({}),
+        )
+        assert evolution.status in {403, 503}, evolution.text()
+
+        desktop = page.request.get(
+            f"{harness.base_url}/api/desktop/status", headers=auth_headers
+        )
+        assert desktop.status == 403, desktop.text()
+
+        routines = page.request.get(
+            f"{harness.base_url}/api/work/routines", headers=auth_headers
+        )
+        assert routines.ok, routines.text()
+        assert "routines" in routines.json()
+
+        diag = page.request.get(f"{harness.base_url}/api/diag", headers=auth_headers)
+        assert diag.ok, diag.text()
+        diag_payload = diag.json()
+        route_paths = {item["path"] for item in diag_payload["routes"]}
+        assert "/api/work/routines" in route_paths
+        assert diag_payload["subsystems"]["evolver"] is False
+        assert diag_payload["hermes_bridge"]["skills_loaded"] == 0
+        assert diag_payload["hermes_bridge"]["enabled"] is False
+
+        models = page.request.get(f"{harness.base_url}/api/models", headers=auth_headers)
+        assert models.ok, models.text()
+        providers = models.json()["providers"]
+        assert providers
+        assert providers[0]["name"] == _WORK_LOOPBACK_PROVIDER
+        assert providers[0]["base_url"] == _WORK_LOOPBACK_ENDPOINT
+        assert providers[0]["base_url"] != ""
+        assert providers[0]["base_url"] is not None
+        assert providers[0]["base_url"].startswith("http://127.0.0.1:")
+        assert not providers[0]["base_url"].startswith("https://")
+        assert all(item["name"] != "personal-poison" for item in providers)
+
+        session_id = "work-web-e2e-session"
+        upload = page.request.post(
+            f"{harness.base_url}/api/upload",
+            headers=auth_headers,
+            multipart={
+                "session_id": session_id,
+                "file": {
+                    "name": "work-only.txt",
+                    "mimeType": "text/plain",
+                    "buffer": b"work-boundary",
+                },
+            },
+        )
+        assert upload.ok, upload.text()
+        listed = page.request.get(
+            f"{harness.base_url}/api/uploads",
+            headers=auth_headers,
+            params={"session_id": session_id},
+        )
+        assert listed.ok, listed.text()
+        names = [item["name"] for item in listed.json()["files"]]
+        assert names == ["work-only.txt"]
+        assert "personal-only.txt" not in names
+
+        escaped = page.request.get(
+            f"{harness.base_url}/api/file-preview",
+            headers=auth_headers,
+            params={
+                "session_id": session_id,
+                "path": str(harness.personal_poison_workspace / "personal-only.txt"),
+            },
+        )
+        assert escaped.status in {400, 403}, escaped.text()
+
+        other_session = page.request.get(
+            f"{harness.base_url}/api/uploads",
+            headers=auth_headers,
+            params={"session_id": "foreign-session"},
+        )
+        assert other_session.ok, other_session.text()
+        assert other_session.json()["files"] == []
+
+        owned_upload = (
+            harness.workspace
+            / "uploads"
+            / owner_slug(harness.owner_key_hash)
+            / session_slug(session_id)
+            / "work-only.txt"
+        )
+        assert owned_upload.read_bytes() == b"work-boundary"
+        assert not (harness.personal_poison_workspace / "work-only.txt").exists()
+
         resource_urls = page.evaluate(
             "performance.getEntriesByType('resource').map(entry => entry.name)"
         )
-        assert all(url.startswith(work_live_server) for url in resource_urls), resource_urls
+        assert all(url.startswith(harness.base_url) for url in resource_urls), resource_urls
+        assert all(
+            not str(url).startswith("https://") for url in resource_urls
+        ), resource_urls
+
+    def test_work_web_empty_endpoint_is_fail_closed_with_zero_transport(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        isolated_home = tmp_path / "iso-home"
+        isolated_home.mkdir()
+        monkeypatch.setenv("HOME", str(isolated_home))
+        for name in ("JS_CONFIG_PATH", "JS_STATE_DIR", "JS_WORK_CONFIG_PATH"):
+            monkeypatch.delenv(name, raising=False)
+
+        config_path = tmp_path / "empty-endpoint.yaml"
+        _write_work_web_config(
+            config_path,
+            workspace=tmp_path / ".js-work" / "workspace",
+            state_dir=tmp_path / ".js-work" / "state",
+            work_home=tmp_path / ".js-work",
+            endpoint="",
+        )
+
+        transport_calls = {"resolve": 0, "async_openai": 0, "httpx": 0}
+
+        def counting_resolve(*_args: object, **_kwargs: object) -> object:
+            transport_calls["resolve"] += 1
+            raise AssertionError("DNS/transport must not run for an empty endpoint")
+
+        class CountingOpenAI:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                transport_calls["async_openai"] += 1
+                raise AssertionError("AsyncOpenAI must not be constructed")
+
+        class CountingAsyncClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                transport_calls["httpx"] += 1
+                raise AssertionError("httpx must not be constructed")
+
+        monkeypatch.setattr(
+            "js.security.net_guard.resolve_and_validate_provider_endpoint",
+            counting_resolve,
+        )
+        monkeypatch.setattr("js.models.providers.AsyncOpenAI", CountingOpenAI)
+        monkeypatch.setattr("httpx.AsyncClient", CountingAsyncClient)
+
+        from js_work.agent_factory import create_work_agent
+        from js_work.config import load_work_settings
+        from js_work.tools import WorkToolProfile
+
+        with pytest.raises(PermissionError, match="provider endpoint is invalid"):
+            create_work_agent(
+                settings=load_work_settings(str(config_path), home=tmp_path),
+                profile=WorkToolProfile.OFFICE,
+            )
+        assert transport_calls == {"resolve": 0, "async_openai": 0, "httpx": 0}
+
+        port = _free_loopback_port()
+        log_path = tmp_path / "empty-endpoint.log"
+        argv = _work_cli_argv(config_path=config_path, home=tmp_path, port=port)
+        env = _isolated_work_env(isolated_home, config_path)
+        with log_path.open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                argv,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            try:
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline and process.poll() is None:
+                    time.sleep(0.2)
+                if process.poll() is None:
+                    _stop_work_process(process)
+                    pytest.fail("empty endpoint Work CLI stayed running")
+            finally:
+                _stop_work_process(process)
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        assert "provider endpoint is invalid" in log_text
+        assert process.returncode not in {0, None}

@@ -99,5 +99,8 @@ def launch_appshell(
 
     print(f"AppShell: {host_base_url}")
     print("Personal and Work are isolated runtimes behind this one trusted host.")
+    from js.security.loopback_bind import require_literal_loopback_bind
+
+    host = require_literal_loopback_bind(host)
     uvicorn.run(app, host=host, port=port)
     return 0

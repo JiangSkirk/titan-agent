@@ -1444,7 +1444,8 @@ class EnhancedMemoryStore:
                     conn.execute(f"PRAGMA user_version = {_current_schema_version}")
                     conn.commit()
                 except Exception:
-                    pass
+                    conn.rollback()
+                    raise
 
             # Audit log for memory changes
             conn.execute("""
@@ -1465,7 +1466,8 @@ class EnhancedMemoryStore:
                 if "owner_key_hash" not in audit_cols:
                     conn.execute("ALTER TABLE memory_audit_log ADD COLUMN owner_key_hash TEXT")
             except Exception:
-                logger.warning("Failed to migrate memory_audit_log owner column", exc_info=True)
+                conn.rollback()
+                raise
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_audit_memory
                 ON memory_audit_log(memory_id, table_name)

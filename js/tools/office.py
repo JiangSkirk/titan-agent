@@ -532,6 +532,33 @@ class OfficeTools:
             raise ValueError(f"Path escapes workspace: {path}") from e
         return resolved
 
+    @staticmethod
+    def _write_csv_nofollow(
+        target: Path,
+        rows_data: list[list[Any]],
+        encoding: str,
+        delimiter: str,
+    ) -> None:
+        import csv
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(target, flags, 0o600)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise ValueError("CSV write target must be a regular file with nlink==1")
+            os.ftruncate(fd, 0)
+            with os.fdopen(fd, "w", encoding=encoding, newline="") as handle:
+                fd = -1
+                writer = csv.writer(handle, delimiter=delimiter)
+                writer.writerows(rows_data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
     def _relative_workspace_path(self, path: str) -> Path:
         """Return a workspace-relative path without following final-component symlinks."""
         if not isinstance(path, str) or not path or "\x00" in path:
@@ -1159,9 +1186,7 @@ class OfficeTools:
 
                 _publish_work_artifact(target, _write_csv, validate_xlsx=False)
             else:
-                with open(target, "w", encoding=encoding, newline="") as f:
-                    writer = csv.writer(f, delimiter=delimiter)
-                    writer.writerows(rows_data)
+                self._write_csv_nofollow(target, rows_data, encoding, delimiter)
 
             return ToolResult(
                 success=True,

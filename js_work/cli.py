@@ -614,6 +614,9 @@ def web(
     console.print(f"[green]Starting JS Agent AppShell at {url}[/green]")
     import uvicorn
 
+    from js.security.loopback_bind import require_literal_loopback_bind
+
+    host = require_literal_loopback_bind(host)
     uvicorn.run(app, host=host, port=port, reload=False)
 
 

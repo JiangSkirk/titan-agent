@@ -13,7 +13,7 @@ from typing import Any
 
 from js.security.sandbox import SandboxExecutor
 from js.skills.security import runtime_security_check
-from js.skills.spec import SkillSpec, SkillType
+from js.skills.spec import SkillSpec, SkillType, TrustLevel
 from js.utils.log import get_logger
 
 logger = get_logger("js.skills.executor")
@@ -166,6 +166,8 @@ async def _execute_code(
             network_allowed=False,
             fs_restricted=True,
             read_only_paths=[spec.path],
+            workspace_writable=spec.trust_level
+            not in {TrustLevel.COMMUNITY, TrustLevel.QUARANTINE},
         )
         return {
             "success": result.returncode == 0,
@@ -377,6 +379,8 @@ async def _execute_workflow(
                         timeout=spec.timeout_seconds,
                         network_allowed=False,
                         fs_restricted=True,
+                        workspace_writable=spec.trust_level
+                        not in {TrustLevel.COMMUNITY, TrustLevel.QUARANTINE},
                     )
                     step_result.update({
                         "status": "success" if result_obj.returncode == 0 and not result_obj.killed else "error",

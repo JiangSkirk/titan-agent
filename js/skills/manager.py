@@ -237,6 +237,13 @@ class SkillManager:
         """
         return spec.trust_level != TrustLevel.QUARANTINE
 
+    @staticmethod
+    def _skill_tool_is_dangerous(spec: SkillSpec) -> bool:
+        return spec.trust_level == TrustLevel.QUARANTINE or (
+            spec.trust_level == TrustLevel.COMMUNITY
+            and spec.type in {SkillType.CODE, SkillType.WORKFLOW, SkillType.META}
+        )
+
     def _tool_registration(
         self,
         spec: SkillSpec,
@@ -272,7 +279,7 @@ class SkillManager:
             name=tool_name,
             description=spec.description or f"Execute skill: {spec.name}",
             parameters=parameters,
-            dangerous=spec.trust_level == TrustLevel.QUARANTINE,
+            dangerous=self._skill_tool_is_dangerous(spec),
             read_only=spec.type == SkillType.PROMPT,
         )
 

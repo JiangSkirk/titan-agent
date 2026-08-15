@@ -19,7 +19,6 @@ import plistlib
 import re
 import secrets
 import shutil
-import site
 import stat
 import struct
 import subprocess
@@ -906,17 +905,14 @@ def verify_desktop_python_runtime(
     ambient_environment: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Verify the isolated, lock-matched Python used to freeze the sidecar."""
+    if python_executable is None:
+        raise RuntimeError("Python runtime executable must be explicit")
     ambient = os.environ if ambient_environment is None else ambient_environment
     injected = [key for key in _PYTHON_AMBIENT_INJECTION_KEYS if ambient.get(key)]
     if injected:
         raise RuntimeError("Python runtime ambient injection is forbidden")
-    if python_executable is None and (
-        Path(sys.prefix).resolve() == Path(sys.base_prefix).resolve()
-        or site.ENABLE_USER_SITE is not False
-    ):
-        raise RuntimeError("Python runtime build process is not isolated")
     expected_packages = _locked_desktop_runtime_versions(lock_path)
-    requested_python = Path(sys.executable) if python_executable is None else python_executable
+    requested_python = Path(python_executable)
     launch_python, resolved_python, launcher_identity = (
         _python_runtime_launch_executable(requested_python)
     )
@@ -1509,6 +1505,18 @@ def _preserve_cargo_home_caches(cargo_home: Path) -> Iterator[None]:
         _restore_cargo_home_caches(cargo_home, snapshot)
 
 
+def require_production_signing_identity(*, production_release: bool = True) -> None:
+    """Fail closed when a production release is requested without Apple identity."""
+    if not production_release:
+        return
+    team = str(os.environ.get("JS_AGENT_APPLE_TEAM_ID", "")).strip()
+    identity = str(os.environ.get("JS_AGENT_DEVELOPER_ID_APPLICATION", "")).strip()
+    if not team or not identity:
+        raise RuntimeError(
+            "production signing identity is missing; Developer ID/notary is EXTERNAL_PENDING"
+        )
+
+
 def _adhoc_sign_app(app_path: Path, *, runner: Runner = _run) -> None:
     """Ad-hoc sign the .app bundle for local testing.
 
@@ -1811,7 +1819,10 @@ def build_environment_binding(
             run.root / OWNER_MARKER_NAME, "build owner marker"
         ),
         "python": _file_binding(Path(sys.executable).resolve(strict=True), "Python"),
-        "python_runtime": verify_desktop_python_runtime(repo_root.resolve() / "uv.lock"),
+        "python_runtime": verify_desktop_python_runtime(
+            repo_root.resolve() / "uv.lock",
+            python_executable=Path(sys.executable),
+        ),
         "pnpm": _file_binding(inputs.pnpm_executable, "pnpm"),
         "cargo": _file_binding(inputs.cargo_executable, "Cargo"),
         "node": _file_binding(inputs.node_executable, "Node"),
@@ -2170,6 +2181,7 @@ def build_desktop(
     runner: Runner = _run,
     offline_inputs: OfflineBuildInputs,
     temporary_parent: Path | None = None,
+    production_release: bool = False,
 ) -> Path:
     from js.echo.ledger.release_gates import validate_release_source_integrity
 
@@ -2187,7 +2199,10 @@ def build_desktop(
         stage_root = stage_release_sources(
             source_digest, run=run, repo_root=repo_root
         )
-        verify_desktop_python_runtime(stage_root / "uv.lock")
+        verify_desktop_python_runtime(
+            stage_root / "uv.lock",
+            python_executable=Path(sys.executable),
+        )
         verify_python_build_requirements(stage_root / "desktop/requirements-build.txt")
         install_desktop_dependencies(
             stage_root,
@@ -2238,7 +2253,12 @@ def build_desktop(
             != environment_before
         ):
             raise RuntimeError("offline tool or cache drift during desktop build")
-        # Ad-hoc sign the .app for local testing (not a Developer ID signature).
+        # Ad-hoc sign is local-only. Production release requires Developer ID.
+        if production_release:
+            require_production_signing_identity(production_release=True)
+            raise RuntimeError(
+                "production Developer ID/notary pipeline is EXTERNAL_PENDING"
+            )
         _adhoc_sign_app(app_path, runner=runner)
         # Copy the signed bundled sidecar back to standalone so they match.
         # Tauri renames the sidecar to "js-agent-host" inside the bundle.

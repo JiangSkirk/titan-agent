@@ -69,7 +69,11 @@ async def test_office_pdf_generate_without_reportlab_returns_error(tmp_path: Pat
 
 def test_attachments_pdf_with_extras_installed(tmp_path: Path) -> None:
     """Sanity check that real extras are available in the dev environment."""
+    from pypdf import PdfWriter
+
     pdf_path = tmp_path / "empty.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
-    # pypdf can parse the header but returns no text; should not raise.
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    with pdf_path.open("wb") as handle:
+        writer.write(handle)
     extract_pdf_text(pdf_path)

@@ -543,6 +543,23 @@ def release_source_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def require_git_bound_release_digest(root: Path) -> str:
+    """Fail closed unless the live release digest matches a clean git archive."""
+    resolved = root.resolve()
+    head = _release_candidate_head(resolved)
+    if head is None:
+        raise ReleaseSourceIntegrityError(
+            "release digest requires a complete tracked clean git tree"
+        )
+    live = release_source_digest(resolved)
+    archived = _git_release_source_digest(resolved, head)
+    if archived is None or live != archived:
+        raise ReleaseSourceIntegrityError(
+            "working tree digest does not match git archive"
+        )
+    return live
+
+
 def release_source_surface_metadata_fingerprint(root: Path) -> str:
     """Hash release-surface path metadata (not contents) for soak drift detection."""
     resolved_root = root.resolve()

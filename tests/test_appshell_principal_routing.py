@@ -201,6 +201,8 @@ def test_work_role_is_required_and_failed_switch_does_not_mutate_mode(
 ) -> None:
     body = appshell.login(_PERSONAL_ONLY_KEY)
     assert body["principal"]["mode_roles"] == {"personal": "user"}
+    caps = appshell.client.get("/api/appshell/capabilities").json()
+    assert caps["workspace_handles"]["work"] is None
 
     response = appshell.client.post(
         "/api/appshell/switch",

@@ -120,7 +120,15 @@ class SideEffects:
         )
         client.get = AsyncMock(return_value=response)
         client.post = AsyncMock(return_value=response)
-        client.stream = AsyncMock()
+
+        class _Stream:
+            async def __aenter__(self) -> httpx.Response:
+                return response
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+        client.stream = lambda *args, **kwargs: _Stream()
         return client
 
 
@@ -403,6 +411,19 @@ async def test_08_redirect_new_host_not_followed(
                 request=request,
             )
 
+        def stream(self, method: str, url: str, **kwargs: Any) -> Any:
+            async def _enter() -> httpx.Response:
+                return await self.get(url, **kwargs)
+
+            class _CM:
+                async def __aenter__(self) -> httpx.Response:
+                    return await _enter()
+
+                async def __aexit__(self, *args: Any) -> None:
+                    return None
+
+            return _CM()
+
     monkeypatch.setattr("httpx.AsyncClient", RedirectClient)
     broker = FakeNetworkBroker()
     with network_runtime(tmp_path, broker=broker):
@@ -513,6 +534,19 @@ async def test_04_send_uses_frozen_snapshot_not_live_dict(
             captured["params"] = kwargs.get("params")
             effects.http += 1
             return httpx.Response(200, text="<html></html>", request=httpx.Request("GET", url))
+
+        def stream(self, method: str, url: str, **kwargs: Any) -> Any:
+            async def _enter() -> httpx.Response:
+                return await self.get(url, **kwargs)
+
+            class _CM:
+                async def __aenter__(self) -> httpx.Response:
+                    return await _enter()
+
+                async def __aexit__(self, *args: Any) -> None:
+                    return None
+
+            return _CM()
 
     payload = {"q": SYNTH_QUERY}
     original = _require(module, "authorize_network_egress")

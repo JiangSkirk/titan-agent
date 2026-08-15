@@ -19,8 +19,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
-from pypdf import PdfReader
 
+from js.security.bounded_parse import extract_work_pdf
 from js_work.file_scope import WorkFileSnapshot
 
 if TYPE_CHECKING:
@@ -123,40 +123,24 @@ class WorkDocumentEngine:
             source = self._snapshot_display_path(path, suffixes={".pdf"})
             self._check_input_size(path)
             source_hash = path.sha256
-            reader = PdfReader(io.BytesIO(path.verified_data()))
+            parsed = extract_work_pdf(io.BytesIO(path.verified_data()))
         else:
             source = self._resolve_input(path, suffixes={".pdf"})
             self._check_input_size(source)
             source_identity, source_hash = self._capture_source_identity(source)
-            reader = PdfReader(str(source))
-        if reader.is_encrypted:
-            raise ValueError("encrypted PDFs are not supported")
-        self._validate_pdf_active_content(reader)
-
-        pages: list[dict[str, Any]] = []
-        remaining = MAX_EXTRACTED_CHARS
-        total_pages = len(reader.pages)
-        truncated = total_pages > MAX_PDF_PAGES
-        for index, page in enumerate(reader.pages[:MAX_PDF_PAGES], start=1):
-            text = (page.extract_text() or "").strip()
-            if len(text) > remaining:
-                text = text[:remaining]
-                truncated = True
-            pages.append({"page": index, "text": text})
-            remaining -= len(text)
-            if remaining <= 0:
-                if index < total_pages:
-                    truncated = True
-                break
+            parsed = extract_work_pdf(source)
         if source_identity is not None:
             self._assert_source_unchanged(source, source_identity)
+        pages = parsed.get("pages")
+        if not isinstance(pages, list):
+            raise ValueError("PDF parse failed")
         return {
             "status": "passed",
             "path": str(source),
             "sha256": source_hash,
-            "page_count": total_pages,
+            "page_count": int(parsed.get("page_count") or 0),
             "pages": pages,
-            "truncated": truncated,
+            "truncated": bool(parsed.get("truncated")),
         }
 
     def read_word(self, path: str | Path | WorkFileSnapshot) -> dict[str, Any]:

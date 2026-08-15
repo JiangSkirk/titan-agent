@@ -11,7 +11,10 @@ import os
 import sys
 from pathlib import Path
 
-from js.echo.ledger.release_gates import format_release_result_line
+from js.echo.ledger.release_gates import (
+    format_release_result_line,
+    require_git_bound_release_digest,
+)
 
 
 def _success_bindings(manifest_path: Path, manifest: dict[str, object]) -> dict[str, str]:
@@ -41,6 +44,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args(argv)
+
+    try:
+        require_git_bound_release_digest(Path(".").resolve())
+    except Exception as exc:
+        print(f"[FAIL] desktop_build: git-bound source digest: {exc}", file=sys.stderr)
+        print(format_release_result_line(gate="desktop_build", ok=False))
+        return 1
 
     pnpm = Path(os.environ.get("JS_AGENT_PNPM_EXECUTABLE", ""))
     cargo = Path(os.environ.get("JS_AGENT_CARGO_EXECUTABLE", ""))

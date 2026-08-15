@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -505,73 +504,13 @@ def get_bridge_stats() -> HermesBridgeStats:
 
 
 def _try_hermes_guard_scan(skill_path: Path) -> ScanResult | None:
-    """Attempt to use Hermes's own skills_guard scanner if available.
+    """Public Beta does not execute host Hermes scanners.
 
-    This provides an additional security layer by leveraging Hermes's
-    80+ threat pattern database. Falls back gracefully if Hermes is not
-    installed or the module is unavailable.
+    External ``skills_guard`` modules must not be imported onto ``sys.path``
+    or run in the JS Agent process. A future pin of a vendored scanner can
+    be added behind an explicit allowlist.
     """
-    try:
-        # Add Hermes agent tools to path temporarily
-        hermes_tools = _get_hermes_home() / "hermes-agent" / "tools"
-        if not hermes_tools.exists():
-            return None
-
-        # Validate skill_path is within the Hermes skills directory
-        skills_dir = _get_hermes_home() / "skills"
-        try:
-            skill_path.resolve().relative_to(skills_dir.resolve())
-        except ValueError:
-            logger.warning(
-                "Skill path %s is outside Hermes skills directory %s — skipping Hermes guard scan",
-                skill_path,
-                skills_dir,
-            )
-            return None
-
-        # Use subprocess to avoid import side-effects.
-        # Pass skill_path as a CLI argument instead of embedding it in the
-        # script string to prevent injection via the file path.
-        script = (
-            "import sys\n"
-            f"sys.path.insert(0, {str(hermes_tools)!r})\n"
-            "from skills_guard import scan_skill\n"
-            "skill_path = sys.argv[1]\n"
-            "result = scan_skill(skill_path, source='community')\n"
-            "print('VERDICT:', result.verdict)\n"
-            "flags = []\n"
-            "for f in result.findings:\n"
-            "    flags.append(f.pattern_id + ':' + f.severity)\n"
-            "print('FLAGS:', '|'.join(flags))\n"
-        )
-        import subprocess
-
-        proc = subprocess.run(
-            [sys.executable, "-c", script, str(skill_path)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if proc.returncode == 0:
-            # Parse simple output format
-            lines = proc.stdout.strip().split("\n")
-            verdict = "safe"
-            flags: list[str] = []
-            for line in lines:
-                if line.startswith("VERDICT: "):
-                    verdict = line.split(": ", 1)[1]
-                elif line.startswith("FLAGS: "):
-                    flags_str = line.split(": ", 1)[1]
-                    if flags_str:
-                        flags = [f.split(":")[0] for f in flags_str.split("|")]
-            return ScanResult(
-                skill_id=skill_path.parent.name,
-                content_hash="",
-                risk_flags=flags,
-                trust_level=TrustLevel.TRUSTED if verdict == "safe" else TrustLevel.COMMUNITY,
-            )
-    except Exception:
-        logger.warning("Operation failed", exc_info=True)
+    del skill_path
     return None
 
 

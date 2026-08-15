@@ -24,6 +24,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 SECURITY_DIR = ROOT / "docs" / "security"
 LOCKFILE = ROOT / "uv.lock"
+CARGO_LOCK = ROOT / "desktop" / "src-tauri" / "Cargo.lock"
+PNPM_LOCK = ROOT / "desktop" / "pnpm-lock.yaml"
 
 
 @dataclass(frozen=True)
@@ -139,7 +141,84 @@ def read_lock_packages() -> list[PackageEvidence]:
                 hashes=hashes,
             )
         )
+    packages.extend(read_cargo_lock_packages(CARGO_LOCK))
+    packages.extend(read_pnpm_lock_packages(PNPM_LOCK))
     return sorted(packages, key=lambda p: (p.name.lower(), p.version))
+
+
+def read_cargo_lock_packages(path: Path) -> list[PackageEvidence]:
+    if not path.is_file():
+        return []
+    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    packages: list[PackageEvidence] = []
+    for pkg in raw.get("package", []):
+        if not isinstance(pkg, dict):
+            raise ValueError("Cargo.lock contains an invalid package entry")
+        name = pkg.get("name")
+        version = pkg.get("version")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Cargo.lock contains a package without a name")
+        if not isinstance(version, str) or not version.strip():
+            raise ValueError(f"Cargo.lock package {name!r} has no version")
+        checksum = pkg.get("checksum")
+        hashes = (str(checksum),) if isinstance(checksum, str) and checksum else ()
+        source = str(pkg.get("source") or "crates.io")
+        packages.append(
+            PackageEvidence(
+                name=f"cargo:{name}",
+                version=version,
+                source=source,
+                license_text="NOASSERTION",
+                classifiers=(),
+                hashes=hashes,
+            )
+        )
+    if not packages:
+        raise ValueError("Cargo.lock contains no packages")
+    return packages
+
+
+def read_pnpm_lock_packages(path: Path) -> list[PackageEvidence]:
+    if not path.is_file():
+        return []
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ValueError("PyYAML is required to parse pnpm-lock.yaml") from exc
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("pnpm-lock.yaml is invalid")
+    packages_raw = raw.get("packages")
+    if not isinstance(packages_raw, dict) or not packages_raw:
+        raise ValueError("pnpm-lock.yaml contains no packages")
+    packages: list[PackageEvidence] = []
+    for key, meta in packages_raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("pnpm-lock.yaml contains an invalid package key")
+        version = ""
+        if isinstance(meta, dict):
+            resolution = meta.get("resolution")
+            if isinstance(resolution, dict) and isinstance(resolution.get("integrity"), str):
+                hashes = (str(resolution["integrity"]),)
+            else:
+                hashes = ()
+        else:
+            hashes = ()
+        if "@" in key:
+            name, version = key.rsplit("@", 1)
+        else:
+            name = key
+        packages.append(
+            PackageEvidence(
+                name=f"pnpm:{name}",
+                version=version or "0",
+                source="pnpm-lock.yaml",
+                license_text="NOASSERTION",
+                classifiers=(),
+                hashes=hashes,
+            )
+        )
+    return packages
 
 
 def _validate_lock_package_set(raw_packages: object) -> None:

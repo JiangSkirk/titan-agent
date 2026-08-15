@@ -24,6 +24,7 @@ from js.config import JSSettings
 from js.echo.effect_interpreter import ToolEffect
 from js.echo.turn_context import RuntimeContext
 from js.echo.turn_runtime import run_echo_turn
+from js.security.loopback_bind import require_literal_loopback_bind
 from js.tools.registry import ToolResult
 from js.utils.log import configure_logging, get_logger
 from js.web.messages import humanize_error
@@ -542,6 +543,8 @@ def appshell_cmd(
     from js.appshell.server import create_appshell_app
     from js_work.tools import WorkToolProfile
 
+    host = require_literal_loopback_bind(host)
+
     app = create_appshell_app(
         personal_config=personal_config,
         work_config=work_config,
@@ -873,6 +876,7 @@ def _launch_web(
         threading.Thread(target=_open, daemon=True).start()
 
     app = create_app(runtime_settings=runtime_settings)
+    host = require_literal_loopback_bind(host)
     uvicorn.run(app, host=host, port=port, reload=reload)
 
 

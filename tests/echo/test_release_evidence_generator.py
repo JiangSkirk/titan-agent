@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -124,6 +126,8 @@ def test_lockfile_evidence_rejects_an_empty_package_set(
     lockfile = tmp_path / "uv.lock"
     lockfile.write_text("version = 1\n", encoding="utf-8")
     monkeypatch.setattr(release_evidence, "LOCKFILE", lockfile)
+    monkeypatch.setattr(release_evidence, "CARGO_LOCK", tmp_path / "missing-cargo")
+    monkeypatch.setattr(release_evidence, "PNPM_LOCK", tmp_path / "missing-pnpm")
 
     with pytest.raises(ValueError, match="no packages"):
         release_evidence.read_lock_packages()
@@ -138,6 +142,8 @@ def test_lockfile_evidence_accepts_any_complete_nonempty_package_graph(
         encoding="utf-8",
     )
     monkeypatch.setattr(release_evidence, "LOCKFILE", lockfile)
+    monkeypatch.setattr(release_evidence, "CARGO_LOCK", tmp_path / "missing-cargo")
+    monkeypatch.setattr(release_evidence, "PNPM_LOCK", tmp_path / "missing-pnpm")
 
     packages = release_evidence.read_lock_packages()
 
@@ -156,6 +162,194 @@ def test_lockfile_evidence_rejects_a_missing_declared_dependency(
         encoding="utf-8",
     )
     monkeypatch.setattr(release_evidence, "LOCKFILE", lockfile)
+    monkeypatch.setattr(release_evidence, "CARGO_LOCK", tmp_path / "missing-cargo")
+    monkeypatch.setattr(release_evidence, "PNPM_LOCK", tmp_path / "missing-pnpm")
 
     with pytest.raises(ValueError, match="missing-transitive"):
         release_evidence.read_lock_packages()
+
+
+def _assert_spdx_schema(spdx: dict[str, Any]) -> None:
+    for key in (
+        "spdxVersion",
+        "dataLicense",
+        "SPDXID",
+        "name",
+        "documentNamespace",
+        "creationInfo",
+        "packages",
+        "relationships",
+    ):
+        assert key in spdx
+    assert spdx["spdxVersion"] == "SPDX-2.3"
+    assert spdx["SPDXID"] == "SPDXRef-DOCUMENT"
+    assert isinstance(spdx["packages"], list) and spdx["packages"]
+    created = spdx["creationInfo"]["created"]
+    assert isinstance(created, str) and created.endswith("Z")
+    assert spdx["creationInfo"]["creators"]
+    for package in spdx["packages"]:
+        assert package["SPDXID"]
+        assert package["name"]
+        assert package["versionInfo"]
+
+
+def _assert_spdx_three_ecosystems(spdx: dict[str, Any]) -> None:
+    names = [package["name"] for package in spdx["packages"]]
+    assert any(name.startswith("cargo:") for name in names), "Cargo lock ecosystem missing from SPDX"
+    assert any(name.startswith("pnpm:") for name in names), "pnpm lock ecosystem missing from SPDX"
+    pypi = [
+        name
+        for name in names
+        if name != "js-agent" and not name.startswith(("cargo:", "pnpm:"))
+    ]
+    assert pypi, "uv/PyPI lock ecosystem missing from SPDX"
+    assert "cargo:tauri" in names
+    assert "cargo:serde" in names
+
+
+def _assert_spdx_has_no_runtime_leak(text: str) -> None:
+    home = str(Path.home())
+    assert home not in text
+    assert "chat.jsonl" not in text
+    assert "/Users/jiangxuanzhen" not in text
+    assert "BEGIN PRIVATE KEY" not in text
+    assert ".tmp/" not in text
+    assert "node_modules" not in text
+
+
+def _write_synthetic_locks(tmp_path: Path) -> tuple[Path, Path, Path]:
+    uv_lock = tmp_path / "uv.lock"
+    uv_lock.write_text(
+        '[[package]]\nname = "example-root"\nversion = "1.0"\n',
+        encoding="utf-8",
+    )
+    cargo_lock = tmp_path / "Cargo.lock"
+    cargo_lock.write_text(
+        '[[package]]\nname = "tauri"\nversion = "2.0.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        'checksum = "aa"\n\n'
+        '[[package]]\nname = "serde"\nversion = "1.0.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        'checksum = "bb"\n',
+        encoding="utf-8",
+    )
+    pnpm_lock = tmp_path / "pnpm-lock.yaml"
+    pnpm_lock.write_text(
+        "lockfileVersion: '9.0'\n"
+        "packages:\n"
+        "  '@scope/synth-pkg@1.2.3':\n"
+        "    resolution: {integrity: sha512-abc}\n",
+        encoding="utf-8",
+    )
+    return uv_lock, cargo_lock, pnpm_lock
+
+
+def test_generator_emits_uv_cargo_and_pnpm_from_synthetic_locks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    uv_lock, cargo_lock, pnpm_lock = _write_synthetic_locks(tmp_path)
+    monkeypatch.setattr(release_evidence, "LOCKFILE", uv_lock)
+    monkeypatch.setattr(release_evidence, "CARGO_LOCK", cargo_lock)
+    monkeypatch.setattr(release_evidence, "PNPM_LOCK", pnpm_lock)
+
+    packages = release_evidence.read_lock_packages()
+    names = {package.name for package in packages}
+    assert names == {
+        "example-root",
+        "cargo:tauri",
+        "cargo:serde",
+        "pnpm:@scope/synth-pkg",
+    }
+    spdx = release_evidence.build_spdx(packages, "2026-08-15T00:00:00Z")
+    _assert_spdx_schema(spdx)
+    _assert_spdx_three_ecosystems(spdx)
+    assert any(package["name"] == "pnpm:@scope/synth-pkg" for package in spdx["packages"])
+
+
+def test_sbom_closure_fails_when_cargo_ecosystem_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    uv_lock, _cargo_lock, pnpm_lock = _write_synthetic_locks(tmp_path)
+    monkeypatch.setattr(release_evidence, "LOCKFILE", uv_lock)
+    monkeypatch.setattr(release_evidence, "CARGO_LOCK", tmp_path / "missing-cargo")
+    monkeypatch.setattr(release_evidence, "PNPM_LOCK", pnpm_lock)
+
+    packages = release_evidence.read_lock_packages()
+    spdx = release_evidence.build_spdx(packages, "2026-08-15T00:00:00Z")
+    with pytest.raises(AssertionError, match="Cargo"):
+        _assert_spdx_three_ecosystems(spdx)
+
+
+def test_sbom_closure_fails_when_pnpm_ecosystem_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    uv_lock, cargo_lock, _pnpm_lock = _write_synthetic_locks(tmp_path)
+    monkeypatch.setattr(release_evidence, "LOCKFILE", uv_lock)
+    monkeypatch.setattr(release_evidence, "CARGO_LOCK", cargo_lock)
+    monkeypatch.setattr(release_evidence, "PNPM_LOCK", tmp_path / "missing-pnpm")
+
+    packages = release_evidence.read_lock_packages()
+    spdx = release_evidence.build_spdx(packages, "2026-08-15T00:00:00Z")
+    with pytest.raises(AssertionError, match="pnpm"):
+        _assert_spdx_three_ecosystems(spdx)
+
+
+def test_legacy_uv_only_spdx_fixture_fails_closure() -> None:
+    fixture = {
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "name": "legacy-uv-only",
+        "documentNamespace": "https://example.invalid/legacy",
+        "creationInfo": {
+            "created": "2026-07-16T21:27:26Z",
+            "creators": ["Tool: scripts/generate_release_evidence.py"],
+        },
+        "packages": [
+            {"SPDXID": "SPDXRef-Package-js-agent", "name": "js-agent", "versionInfo": "0.1.5"},
+            {"SPDXID": "SPDXRef-Package-aiosqlite", "name": "aiosqlite", "versionInfo": "0.22.1"},
+        ],
+        "relationships": [],
+    }
+    _assert_spdx_schema(fixture)
+    with pytest.raises(AssertionError, match="Cargo|pnpm"):
+        _assert_spdx_three_ecosystems(fixture)
+
+
+def test_committed_spdx_is_closed_with_current_real_locks() -> None:
+    packages = release_evidence.read_lock_packages()
+    sbom_path = release_evidence.SECURITY_DIR / "SBOM.spdx.json"
+    created = release_evidence._existing_generated_at(sbom_path)
+    assert created is not None
+    generated = release_evidence.generate_static_artifacts(packages, created)[sbom_path]
+    committed = sbom_path.read_text(encoding="utf-8")
+    assert committed == generated
+    spdx = json.loads(committed)
+    _assert_spdx_schema(spdx)
+    _assert_spdx_three_ecosystems(spdx)
+    _assert_spdx_has_no_runtime_leak(committed)
+    names = {package["name"] for package in spdx["packages"]}
+    for package in packages:
+        assert package.name in names
+    assert len(spdx["packages"]) > 134
+    uv_digest = hashlib.sha256(release_evidence.LOCKFILE.read_bytes()).hexdigest()
+    cargo_digest = hashlib.sha256(release_evidence.CARGO_LOCK.read_bytes()).hexdigest()
+    pnpm_digest = hashlib.sha256(release_evidence.PNPM_LOCK.read_bytes()).hexdigest()
+    assert len(uv_digest) == 64
+    assert len(cargo_digest) == 64
+    assert len(pnpm_digest) == 64
+    comment = str(spdx["creationInfo"].get("comment", ""))
+    assert "lockfile" in comment.lower()
+    from js.echo.ledger.release_gates import release_source_digest
+
+    source_digest = release_source_digest(release_evidence.ROOT)
+    assert len(source_digest) == 64
+
+
+def test_spdx_generation_is_byte_stable_for_identical_inputs() -> None:
+    packages = release_evidence.read_lock_packages()
+    sbom_path = release_evidence.SECURITY_DIR / "SBOM.spdx.json"
+    first = release_evidence.generate_static_artifacts(packages, "2026-08-15T00:00:00Z")[sbom_path]
+    second = release_evidence.generate_static_artifacts(packages, "2026-08-15T00:00:00Z")[sbom_path]
+    assert first == second
+    _assert_spdx_has_no_runtime_leak(first)

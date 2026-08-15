@@ -182,6 +182,8 @@ class FileTools:
             return None
         if stat.S_ISLNK(metadata.st_mode):
             raise ValueError("Symlinks are not allowed for workspace file operations")
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
+            raise ValueError("Hardlinked workspace files are not allowed")
         return metadata
 
     def _secure_write(self, path: str, payload: bytes, *, append: bool) -> Path:
@@ -200,6 +202,8 @@ class FileTools:
                     opened = os.fstat(fd)
                     if not stat.S_ISREG(opened.st_mode):
                         raise ValueError("Workspace write target must be a regular file")
+                    if opened.st_nlink != 1:
+                        raise ValueError("Hardlinked workspace files are not allowed")
                     self._write_all(fd, payload)
                     os.fsync(fd)
                 finally:
@@ -256,6 +260,8 @@ class FileTools:
                 before = os.fstat(fd)
                 if not stat.S_ISREG(before.st_mode):
                     raise ValueError("Workspace read target must be a regular file")
+                if before.st_nlink != 1:
+                    raise ValueError("Hardlinked workspace files are not allowed")
                 if before.st_size > max_bytes:
                     raise ValueError("Workspace file exceeds the read size limit")
                 chunks: list[bytes] = []

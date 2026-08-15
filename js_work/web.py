@@ -167,6 +167,10 @@ def serve_work_web(
     """Start the JS Agent Work Web server."""
     import uvicorn
 
+    from js.security.loopback_bind import require_literal_loopback_bind
+
+    host = require_literal_loopback_bind(host)
+
     app = create_work_web_app(
         config=config,
         home=home,

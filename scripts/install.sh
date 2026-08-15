@@ -193,14 +193,23 @@ log_ok "启动器已创建"
 # 8. Create macOS app shortcut
 # ───────────────────────────────────────────────
 log_step "创建 macOS 应用快捷方式..."
-APP_DIR="$HOME/Applications/JS Agent.app"
+DESKTOP_APP="$HOME/Applications/JS Agent.app"
+if [[ -d "$DESKTOP_APP" ]]; then
+    existing_id="$(defaults read "$DESKTOP_APP/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
+    if [[ -n "$existing_id" && "$existing_id" != "com.titan.js-agent.source-legacy" ]]; then
+        log_err "拒绝覆盖已有 $DESKTOP_APP（bundle id: ${existing_id}）"
+        log_err "源码快捷方式安装到 ~/Applications/JS Agent Source.app"
+        exit 1
+    fi
+fi
+APP_DIR="$HOME/Applications/JS Agent Source.app"
 mkdir -p "$APP_DIR/Contents/MacOS"
 
-cat > "$APP_DIR/Contents/MacOS/JS Agent" << EOF
+cat > "$APP_DIR/Contents/MacOS/JS Agent Source" << EOF
 #!/usr/bin/env bash
 osascript -e 'tell application "Terminal" to do script "cd $SOURCE_DIR && ./start.sh"' -e 'tell application "Terminal" to activate'
 EOF
-chmod +x "$APP_DIR/Contents/MacOS/JS Agent"
+chmod +x "$APP_DIR/Contents/MacOS/JS Agent Source"
 
 # Create Info.plist for better Finder integration
 cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
@@ -209,11 +218,11 @@ cat > "$APP_DIR/Contents/Info.plist" << 'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>JS Agent</string>
+    <string>JS Agent Source</string>
     <key>CFBundleIdentifier</key>
-    <string>com.jsagent.app</string>
+    <string>com.titan.js-agent.source-legacy</string>
     <key>CFBundleName</key>
-    <string>JS Agent</string>
+    <string>JS Agent Source</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -244,7 +253,7 @@ echo -e "${GREEN}  JS Agent 安装完成!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 echo "启动方式:"
-echo "  1. 双击启动: ~/Applications/JS Agent.app"
+echo "  1. 双击启动: ~/Applications/JS Agent Source.app"
 echo "  2. 命令行启动: $SOURCE_DIR/start.sh"
 echo "  3. CLI 命令: js-agent (如果 ~/.local/bin 在 PATH 中)"
 echo ""

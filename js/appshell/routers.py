@@ -367,7 +367,9 @@ async def appshell_capabilities(
         "workspace": principal.workspace,
         "workspace_handles": {
             "personal": None,
-            "work": request.app.state.work_workspace_handle,
+            "work": request.app.state.work_workspace_handle
+            if "work" in principal.mode_roles
+            else None,
         },
         "session": principal.session,
         "expires_at": principal.expires_at,

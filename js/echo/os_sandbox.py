@@ -22,6 +22,7 @@ logger = get_logger("js.echo.os_sandbox")
 _STDOUT_TRUNCATE_MARKER = "\n... [output truncated]"
 _STDERR_TRUNCATE_MARKER = "\n... [stderr truncated]"
 _STREAM_READ_CHUNK = 65_536
+MAX_SANDBOX_PIDS = 16
 _SAFE_ENV_KEYS = frozenset(
     {
         "LANG",
@@ -75,7 +76,7 @@ _MACOS_BASE_ALLOW_RULES = """
     (subpath "/dev")
 {extra_read_paths})
 (allow file-write*
-    (subpath "{workspace}")
+    {workspace_write_rule}
     (subpath "{sandbox_tmp}")
     (literal "/dev/null")
     (literal "/dev/stdout")
@@ -95,6 +96,32 @@ _MACOS_NETWORK_DENY_PROFILE = (
 _MACOS_FS_RESTRICT_PROFILE = (
     "(version 1)\n(deny default)\n(deny network*)\n" + _MACOS_BASE_ALLOW_RULES
 )
+
+
+def _workspace_write_rule(workspace: Path, writable: bool) -> str:
+    if not writable:
+        return ""
+    return f'(subpath "{_sandbox_profile_path(workspace)}")'
+
+
+def _tree_rss_and_pids(pid: int | None) -> tuple[int, int]:
+    """Return (rss_bytes, live_pid_count) for a process and its descendants."""
+    if not pid:
+        return 0, 0
+    try:
+        root = psutil.Process(pid)
+        processes = [root, *root.children(recursive=True)]
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
+        return 0, 0
+    rss = 0
+    live = 0
+    for process in processes:
+        try:
+            rss += int(process.memory_info().rss)
+            live += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
+            continue
+    return rss, live
 
 
 class SandboxExecutor:
@@ -206,6 +233,7 @@ class SandboxExecutor:
         self,
         cmd: list[str],
         network_allowed: bool = True,
+        workspace_writable: bool = True,
     ) -> list[str]:
         """Wrap command with network isolation if requested and tools available."""
         if network_allowed:
@@ -222,6 +250,7 @@ class SandboxExecutor:
                 workspace=_sandbox_profile_path(self.workspace),
                 sandbox_tmp=_sandbox_profile_path(self._sandbox_temp_dir()),
                 extra_read_paths=trusted_rules,
+                workspace_write_rule=_workspace_write_rule(self.workspace, workspace_writable),
             )
             return [
                 "sandbox-exec",
@@ -254,6 +283,7 @@ class SandboxExecutor:
         fs_restricted: bool = False,
         read_only_paths: tuple[Path, ...] = (),
         network_allowed: bool = True,
+        workspace_writable: bool = True,
     ) -> list[str]:
         """Wrap command with filesystem isolation if requested and tools available."""
         if not fs_restricted:
@@ -280,6 +310,7 @@ class SandboxExecutor:
                 workspace=_sandbox_profile_path(self.workspace),
                 sandbox_tmp=_sandbox_profile_path(self._sandbox_temp_dir()),
                 extra_read_paths=extra_read_paths,
+                workspace_write_rule=_workspace_write_rule(self.workspace, workspace_writable),
             )
             return [
                 "sandbox-exec",
@@ -313,7 +344,7 @@ class SandboxExecutor:
                 wrapped.extend(("--ro-bind", str(read_only_path), str(read_only_path)))
             wrapped.extend(
                 (
-                    "--bind",
+                    "--ro-bind" if not workspace_writable else "--bind",
                     str(self.workspace),
                     str(self.workspace),
                     "--chdir",
@@ -352,6 +383,7 @@ class SandboxExecutor:
         network_allowed: bool = True,
         fs_restricted: bool = False,
         read_only_paths: list[Path] | tuple[Path, ...] | None = None,
+        workspace_writable: bool = True,
     ) -> SandboxResult:
         """Execute a command in sandboxed environment."""
         import time
@@ -419,12 +451,17 @@ class SandboxExecutor:
             or (platform.system() == "Linux" and self._has_bwrap)
         )
         if not combined_isolation:
-            cmd = self._wrap_network_isolation(cmd, network_allowed=network_allowed)
+            cmd = self._wrap_network_isolation(
+                cmd,
+                network_allowed=network_allowed,
+                workspace_writable=workspace_writable,
+            )
         cmd = self._wrap_filesystem_isolation(
             cmd,
             fs_restricted=fs_restricted,
             read_only_paths=normalized_read_paths,
             network_allowed=network_allowed,
+            workspace_writable=workspace_writable,
         )
 
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -674,22 +711,16 @@ class SandboxExecutor:
         return _apply_rlimit
 
     async def _monitor_memory(self, proc: asyncio.subprocess.Process, max_mb: int) -> bool:
-        """Monitor process memory and kill if it exceeds limit."""
+        """Monitor the process tree and kill if RSS or PID budget is exceeded."""
         max_bytes = max_mb * 1024 * 1024
         try:
             while proc.returncode is None:
                 await asyncio.sleep(0.5)
-                try:
-                    p = psutil.Process(proc.pid)
-                    mem_info = p.memory_info()
-                    if mem_info.rss > max_bytes:
-                        self._kill_process_tree(proc)
-                        return True
-                except psutil.NoSuchProcess:
-                    break
+                rss_bytes, pids = _tree_rss_and_pids(proc.pid)
+                if pids > MAX_SANDBOX_PIDS or rss_bytes > max_bytes:
+                    self._kill_process_tree(proc)
+                    return True
         except asyncio.CancelledError:
-            # Task was cancelled (normal when the monitored process exits);
-            # swallow silently so the caller's await does not re-raise.
             return False
         return False
 
