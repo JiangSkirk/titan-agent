@@ -226,11 +226,21 @@ class TestDNSRebindingDefense:
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
 
-            mock_response = MagicMock()
-            mock_response.is_redirect = False
-            mock_response.text = "hello"
-            mock_response.raise_for_status = MagicMock()
-            mock_client.get = AsyncMock(return_value=mock_response)
+            mock_response = httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                content=b"hello",
+                request=httpx.Request("GET", "http://example.com/test"),
+            )
+
+            class _Stream:
+                async def __aenter__(self) -> httpx.Response:
+                    return mock_response
+
+                async def __aexit__(self, *args: object) -> None:
+                    return None
+
+            mock_client.stream = MagicMock(return_value=_Stream())
 
             await tool.fetch("http://example.com/test")
 

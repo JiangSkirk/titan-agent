@@ -86,21 +86,12 @@ def _resolve_trust_level(skill_name: str, lock_data: dict[str, Any]) -> TrustLev
     """Determine trust level for a Hermes skill.
 
     The hub lock file (~/.hermes/skills/.hub/lock.json) is an unsigned JSON
-    file — it carries no cryptographic proof of authorship.  We therefore cap
-    the maximum trust derivable from it at TRUSTED.  Skills not explicitly
-    vetted by the lock file default to COMMUNITY.
+    file — it carries no cryptographic proof of authorship.  We therefore
+    never derive TRUSTED from it.  Lock-listed skills stay COMMUNITY unless
+    a later signed promotion path raises them.
     """
-    entries = lock_data.get("skills", {})
-    entry = entries.get(skill_name)
-    if entry:
-        source = entry.get("source", "").lower()
-        # Lock file is unsigned — never grant BUILTIN from it.  Cap at TRUSTED.
-        if source in ("builtin", "trusted"):
-            return TrustLevel.TRUSTED
-        # Unknown source — requires the skill to pass a security scan
+    if not isinstance(skill_name, str) or not isinstance(lock_data, dict):
         return TrustLevel.COMMUNITY
-
-    # Not in lock file at all — unknown provenance
     return TrustLevel.COMMUNITY
 
 

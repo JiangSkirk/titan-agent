@@ -49,6 +49,10 @@ class CodeTool:
         "shutil",      # shutil.copy/chown file manipulation
         "pty",         # pty.spawn interactive shell escape
         "pathlib",     # pathlib.Path.write_text file write bypass
+        "multiprocessing",
+        "pickle",
+        "operator",
+        "http",
     })
 
     DISALLOWED_ATTRS = frozenset({
@@ -255,9 +259,20 @@ class CodeTool:
             # Bare __builtins__ name access (e.g. __builtins__.__import__)
             elif isinstance(node, ast.Name) and node.id == "__builtins__":
                 return "Disallowed __builtins__ access — sandbox bypass"
-            # Check for __builtins__["eval"] / globals()["__builtins__"] subscript bypass
+            elif isinstance(node, ast.Name) and node.id in self.DISALLOWED_BUILTINS:
+                return f"Disallowed builtin name: {node.id}"
+            # Check for __builtins__["eval"] / [open][0] subscript bypass
             elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == "__builtins__":
                 return "Disallowed __builtins__ subscript access — sandbox bypass"
+            elif (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.List | ast.Tuple)
+                and any(
+                    isinstance(elt, ast.Name) and elt.id in self.DISALLOWED_BUILTINS
+                    for elt in node.value.elts
+                )
+            ):
+                return "Disallowed indexed sequence of callables — sandbox bypass"
 
         return None
 

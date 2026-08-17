@@ -3256,7 +3256,7 @@ class EnhancedMemoryStore:
         # Phase 1: Fast pre-filter with LIKE to avoid loading all rows
         safe_query = query.replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{safe_query}%"
-        candidate_limit = max(limit * 5, 50)
+        candidate_limit = min(max(limit * 5, 50), 128)
 
         with db_connection(self.db_path) as conn:
             conn.row_factory = sqlite3.Row

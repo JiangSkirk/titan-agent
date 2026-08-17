@@ -82,11 +82,11 @@ export async function loadDashboard() {
       const maxTokens = Math.max(...trend.map(t => t.total_tokens || 0), 1);
       tokenChartEl.innerHTML = trend.map(t => {
         const h = Math.max((t.total_tokens / maxTokens) * 100, 4);
-        return `<div class="flex-1 flex flex-col items-center gap-1 group" title="${t.date}: ${(t.total_tokens || 0).toLocaleString()} tokens">
+        return `<div class="flex-1 flex flex-col items-center gap-1 group" title="${escapeHtml(String(t.date || ''))}: ${(t.total_tokens || 0).toLocaleString()} tokens">
           <div class="w-full bg-blue-600/80 rounded-t hover:bg-blue-500 transition relative" style="height:${h}px;">
             <div class="absolute -top-6 left-1/2 -translate-x-1/2 bg-gray-700 text-white text-[10px] px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none z-10">${(t.total_tokens || 0).toLocaleString()}</div>
           </div>
-          <div class="text-[9px] text-gray-500">${t.date?.slice(5) || ''}</div>
+          <div class="text-[9px] text-gray-500">${escapeHtml(String(t.date?.slice(5) || ''))}</div>
         </div>`;
       }).join('');
     } else {

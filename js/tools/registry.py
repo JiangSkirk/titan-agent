@@ -422,6 +422,9 @@ class ToolRegistry:
         self._cache_max_size = 128
         self._echo_context_verifier: Callable[[ToolExecutionContext], str | None] | None = None
         self._echo_context_verifier_locked = False
+        self._schema_generation = 0
+        self._openai_schema_cache: list[dict[str, Any]] | None = None
+        self._openai_schema_generation = -1
 
     @property
     def echo_context_verifier(
@@ -474,6 +477,7 @@ class ToolRegistry:
         registration = _ToolRegistration(spec, handler, owner, generation)
         with self._lock:
             self._invalidate_cache_locked(spec.name)
+            self._bump_schema_generation_locked()
             self._registrations[spec.name] = registration
             self._tools[spec.name] = spec
             self._handlers[spec.name] = handler
@@ -528,6 +532,8 @@ class ToolRegistry:
             }
             for name in changed_names:
                 self._invalidate_cache_locked(name)
+            if changed_names:
+                self._bump_schema_generation_locked()
             return frozenset(accepted)
 
     def unregister(
@@ -547,6 +553,7 @@ class ToolRegistry:
             if generation is not None and registration.generation != generation:
                 return False
             self._invalidate_cache_locked(name)
+            self._bump_schema_generation_locked()
             self._registrations.pop(name, None)
             self._tools.pop(name, None)
             self._handlers.pop(name, None)
@@ -850,8 +857,20 @@ class ToolRegistry:
 
     def to_openai_schemas(self) -> list[dict[str, Any]]:
         with self._lock:
+            if (
+                self._openai_schema_cache is not None
+                and self._openai_schema_generation == self._schema_generation
+            ):
+                return copy.deepcopy(self._openai_schema_cache)
             tools = tuple(self._tools.values())
-        return [tool.to_openai_schema() for tool in tools if tool.model_visible]
+            schemas = [tool.to_openai_schema() for tool in tools if tool.model_visible]
+            self._openai_schema_cache = schemas
+            self._openai_schema_generation = self._schema_generation
+            return copy.deepcopy(schemas)
+
+    def _bump_schema_generation_locked(self) -> None:
+        self._schema_generation += 1
+        self._openai_schema_cache = None
 
     def _cache_key(
         self,

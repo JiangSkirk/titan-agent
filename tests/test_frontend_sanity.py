@@ -311,3 +311,43 @@ class TestIndexHtml:
         assert "'approvals'" in shell_js
         assert "from './tabs/approvals.js'" in app_js
         assert "if (tab === 'approvals') loadApprovals();" in app_js
+
+
+def test_status_wizard_escapes_dynamic_html() -> None:
+    source = (
+        Path(__file__).parent.parent / "js" / "web" / "static" / "tabs" / "status.js"
+    ).read_text(encoding="utf-8")
+    assert "${escapeHtml(String(errMsg).substring(0, 300))}" in source
+    assert "${escapeHtml(e.message)}" in source
+    assert "${escapeHtml(step.title)}" in source
+    assert "${escapeHtml(step.detail)}" in source
+    assert "${escapeHtml(step.action_label)}" in source
+    assert "${escapeHtml(data.install_summary)}" in source
+    assert "${step.title}" not in source
+    assert "${data.install_summary}" not in source
+
+
+def test_memory_editor_escapes_dynamic_html() -> None:
+    source = (
+        Path(__file__).parent.parent / "js" / "web" / "static" / "tabs" / "memory.js"
+    ).read_text(encoding="utf-8")
+    assert "${escapeHtml(w.category || 'general')}" in source
+    assert "${escapeHtml(String(w.importance || 0))}" in source
+    assert "escapeHtml(actionMap[e.action] || e.action)" in source
+    assert "escapeHtml(map[source] || source || '未知')" in source
+    assert "${w.category || 'general'}" not in source
+
+
+def test_cron_and_dashboard_escape_dynamic_html() -> None:
+    cron = (
+        Path(__file__).parent.parent / "js" / "web" / "static" / "tabs" / "cron.js"
+    ).read_text(encoding="utf-8")
+    dashboard = (
+        Path(__file__).parent.parent / "js" / "web" / "static" / "tabs" / "dashboard.js"
+    ).read_text(encoding="utf-8")
+    assert "escapeHtml(String(job.status || ''))" in cron
+    assert "escapeHtml(String(job.id || ''))" in cron
+    assert "escapeHtml(String(job.task_type || ''))" in cron
+    assert "runCronJob('${job.id}')" not in cron
+    assert "escapeHtml(String(t.date || ''))" in dashboard
+

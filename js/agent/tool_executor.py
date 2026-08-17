@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlsplit
 
 from js.agent.base import AgentBase
+from js.agent.tool_schema import filter_openai_tool_schemas
 from js.echo import stable_payload_hash
 from js.echo.capability import LeaseAuthority, LeaseDenied, sign_tool_execution_context
 from js.echo.durable_thread import claim_to_thread, durable_to_thread
@@ -1211,29 +1212,12 @@ class ToolExecutorMixin(AgentBase):
 
         schemas = self.registry.to_openai_schemas()
         agent_attributes = getattr(self, "__dict__", {})
+        capability_ceiling: set[str] | None = None
         if "_echo_capability_ceiling" in agent_attributes:
             capability_ceiling = {
                 str(name) for name in agent_attributes["_echo_capability_ceiling"]
             }
-            schemas = [
-                schema
-                for schema in schemas
-                if str(schema.get("function", {}).get("name", "")) in capability_ceiling
-            ]
         security = getattr(self.settings, "security", None)
-        if not (
-            bool(getattr(security, "network_enabled", False))
-            and tuple(getattr(security, "network_allowlist", ()))
-        ):
-            schemas = [
-                schema
-                for schema in schemas
-                if not tool_requires_network(
-                    str(schema.get("function", {}).get("name", "")),
-                    {},
-                )
-            ]
-
         context_window = 128_000
         is_local = False
         if model:
@@ -1241,65 +1225,24 @@ class ToolExecutorMixin(AgentBase):
             if cfg:
                 context_window = cfg.context_window
             is_local = self.router.is_local_model(model)
-
-        # Local models: aggressively trim to avoid prompt > context errors
-        # AND to reduce reasoning burden (weak FC models drown in too many tools).
-        if is_local and len(schemas) > 7:
-            # Local models struggle with browser_fetch (SPA sites, redirects)
-            # and multi-step WebBridge workflows.  Keep only the essentials.
-            _local_core = {
-                "web_search",
-                "file_read",
-                "file_write",
-                "file_edit",
-                "file_view",
-                "shell",
-                "python",
-            }
-            trimmed = [s for s in schemas if s.get("function", {}).get("name", "") in _local_core]
+        before = len(schemas)
+        filtered = filter_openai_tool_schemas(
+            schemas,
+            capability_ceiling=capability_ceiling,
+            network_enabled=bool(getattr(security, "network_enabled", False)),
+            network_allowlist=tuple(getattr(security, "network_allowlist", ()) or ()),
+            is_local=is_local,
+            context_window=context_window,
+            degraded=bool(self._degraded),
+        )
+        if is_local and before > 7 and len(filtered) != before:
             self.logger.info(
-                f"Local-model tool trim {model or 'default'}: {len(schemas)} -> {len(trimmed)}"
+                f"Local-model tool trim {model or 'default'}: {before} -> {len(filtered)}"
             )
-            schemas = trimmed
-        elif context_window < 32_000 and len(schemas) > 15:
-            # Small-context cloud models: trim skills/office but keep browser tools
-            _cloud_core = {
-                "web_search",
-                "browser_fetch",
-                "file_read",
-                "file_write",
-                "file_edit",
-                "file_view",
-                "file_list",
-                "code_search",
-                "shell",
-                "python",
-                "web_navigate",
-                "web_snapshot",
-                "web_click",
-                "web_fill",
-                "web_screenshot",
-                "web_evaluate",
-                "web_extract_text",
-                "web_find_tab",
-                "web_list_tabs",
-            }
-            trimmed = [s for s in schemas if s.get("function", {}).get("name", "") in _cloud_core]
+        elif context_window < 32_000 and before > 15 and len(filtered) != before:
             self.logger.debug(
-                f"Cloud tool trim {model or 'default'}: {len(schemas)} -> {len(trimmed)}"
+                f"Cloud tool trim {model or 'default'}: {before} -> {len(filtered)}"
             )
-            schemas = trimmed
-
-        if not self._degraded:
-            return schemas
-        filtered = []
-        for s in schemas or []:
-            name = s.get("function", {}).get("name", "")
-            if name in ("web_search", "browser_fetch", "browser_open", "fetch_url"):
-                continue
-            if name.startswith("web_"):
-                continue
-            filtered.append(s)
         return filtered
 
     def _setup_tools(self) -> None:

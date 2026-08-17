@@ -149,3 +149,23 @@ class TestToolRegistry:
 
         assert registry.get("managed") is None
         assert registry.get("native") is not None
+
+    def test_openai_schema_cache_invalidates_on_register(self, tmp_path: Path) -> None:
+        from js.tools.registry import ToolParam, ToolSpec
+
+        registry = ToolRegistry(ToolLimits(), BehaviorGuard(SecurityConfig(), tmp_path))
+
+        async def dummy_handler() -> None:
+            return None
+
+        first = registry.to_openai_schemas()
+        again = registry.to_openai_schemas()
+        assert first == again
+        registry.register(
+            ToolSpec("cached_tool", "desc", [ToolParam("x", "string", "x")]),
+            dummy_handler,
+        )
+        updated = registry.to_openai_schemas()
+        names = {schema["function"]["name"] for schema in updated}
+        assert "cached_tool" in names
+        assert names != {schema["function"]["name"] for schema in first}

@@ -67,6 +67,24 @@ class TestExecToolsRemovedFromCore:
         assert "python" not in names
 
 
+class TestFailClosedFallback:
+    def test_non_core_only_schemas_do_not_expand_to_full_surface(self) -> None:
+        schemas = [_schema("shell"), _schema("python"), _schema("excel_read")]
+        names = _names(_echo_tool_schema_subset("explain this simply", schemas))
+        assert names == []
+        assert "excel_read" not in names
+        assert "shell" not in names
+
+    def test_exec_only_schemas_stay_exec_when_opted_in(self) -> None:
+        schemas = [_schema("shell"), _schema("python")]
+        names = _names(
+            _echo_tool_schema_subset(
+                "explain this simply", schemas, allow_exec_tools=True
+            )
+        )
+        assert names == ["shell", "python"]
+
+
 class TestConfigGate:
     def test_security_config_exec_tools_default_off(self) -> None:
         assert SecurityConfig().echo_exec_tools is False

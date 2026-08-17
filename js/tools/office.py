@@ -1,4 +1,11 @@
-"""Office document tools: Excel and PDF generation/manipulation."""
+"""Office document tools: Excel and PDF generation/manipulation.
+
+Path sandboxing, symlink rejection, and O_NOFOLLOW writes live here.
+Work-specific spreadsheet/PDF routines stay in ``js_work/routines/`` and
+publish through ``js_work.safe_output``; they must not reimplement these
+path checks, and this module must not import Work business logic except
+the thin Work-runtime publish/validate adapters.
+"""
 
 from __future__ import annotations
 
@@ -532,6 +539,41 @@ class OfficeTools:
             raise ValueError(f"Path escapes workspace: {path}") from e
         return resolved
 
+    def _resolve_write(self, path: str) -> Path:
+        """Resolve a write target without following the final path component.
+
+        Parent directories are still resolved so a swapped parent symlink
+        cannot escape the workspace.  The last name is left unfollowed so
+        O_NOFOLLOW / lstat can see a dangling or hostile symlink.
+        """
+        p = Path(path)
+        candidate = p if p.is_absolute() else self.workspace / p
+        try:
+            parent = candidate.parent.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"Path escapes workspace: {path}") from exc
+        try:
+            parent.relative_to(self.workspace)
+        except ValueError as e:
+            raise ValueError(f"Path escapes workspace: {path}") from e
+        name = candidate.name
+        if name in {"", ".", ".."}:
+            raise ValueError(f"Path escapes workspace: {path}")
+        return parent / name
+
+    @staticmethod
+    def _reject_symlink_target(target: Path) -> None:
+        try:
+            st = os.lstat(target)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ValueError(f"office write target is unreadable: {target}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError("office write target must not be a symlink")
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("office write target must be a regular file")
+
     @staticmethod
     def _write_csv_nofollow(
         target: Path,
@@ -558,6 +600,33 @@ class OfficeTools:
         finally:
             if fd >= 0:
                 os.close(fd)
+
+    @staticmethod
+    def _save_office_nofollow(target: Path, writer: Callable[[Path], None]) -> None:
+        """Write via an exclusive sibling temp file, then replace the target.
+
+        Libraries such as openpyxl/reportlab reopen by path.  Creating the
+        temp with O_EXCL|O_NOFOLLOW and replacing the final name avoids
+        following a symlink that appears between exists() and save().
+        """
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.parent / f".{target.name}.{os.getpid()}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(tmp, flags, 0o600)
+        os.close(fd)
+        try:
+            writer(tmp)
+            opened = os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                info = os.fstat(opened)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("office write target must be a regular file")
+            finally:
+                os.close(opened)
+            os.replace(tmp, target)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def _relative_workspace_path(self, path: str) -> Path:
         """Return a workspace-relative path without following final-component symlinks."""
@@ -1160,7 +1229,7 @@ class OfficeTools:
         delimiter: str = ",",
     ) -> ToolResult:
         try:
-            target = self._resolve(path)
+            target = self._resolve_write(path)
         except ValueError as e:
             return ToolResult(success=False, error=str(e))
         decision = self.guard.check_path_operation(str(target), "write")
@@ -1304,7 +1373,7 @@ class OfficeTools:
         append: bool = False,
     ) -> ToolResult:
         try:
-            target = self._resolve(path)
+            target = self._resolve_write(path)
         except ValueError as e:
             return ToolResult(success=False, error=str(e))
         decision = self.guard.check_path_operation(str(target), "write")
@@ -1331,6 +1400,8 @@ class OfficeTools:
             if work_runtime:
                 rows_data = _normalize_work_cell_values(rows_data)
 
+            if not work_runtime:
+                self._reject_symlink_target(target)
             if target.exists() and not work_runtime:
                 wb = load_workbook(str(target))
             else:
@@ -1367,7 +1438,7 @@ class OfficeTools:
                     validate_xlsx=True,
                 )
             else:
-                wb.save(str(target))
+                self._save_office_nofollow(target, lambda staged: wb.save(str(staged)))
 
             content_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
             return ToolResult(
@@ -1401,7 +1472,7 @@ class OfficeTools:
         try:
             source = self._logical_input_target(source_path)
             target = self._logical_input_target(target_path)
-            output = self._resolve(output_path) if output_path else None
+            output = self._resolve_write(output_path) if output_path else None
         except ValueError as e:
             return ToolResult(success=False, error=str(e))
         work_runtime = _is_work_runtime()
@@ -1495,7 +1566,8 @@ class OfficeTools:
                     validate_xlsx=True,
                 )
             else:
-                tgt_wb.save(str(target))
+                self._reject_symlink_target(target)
+                self._save_office_nofollow(target, lambda staged: tgt_wb.save(str(staged)))
 
             return ToolResult(
                 success=True,
@@ -1526,7 +1598,7 @@ class OfficeTools:
         headers: str = "",
     ) -> ToolResult:
         try:
-            target = self._resolve(path)
+            target = self._resolve_write(path)
         except ValueError as e:
             return ToolResult(success=False, error=str(e))
         decision = self.guard.check_path_operation(str(target), "write")
@@ -1569,7 +1641,8 @@ class OfficeTools:
                     validate_xlsx=True,
                 )
             else:
-                wb.save(str(target))
+                self._reject_symlink_target(target)
+                self._save_office_nofollow(target, lambda staged: wb.save(str(staged)))
 
             return ToolResult(success=True, output=f"Created Excel file: {path}")
         except Exception as e:
@@ -1586,7 +1659,7 @@ class OfficeTools:
         page_size: str = "A4",
     ) -> ToolResult:
         try:
-            target = self._resolve(path)
+            target = self._resolve_write(path)
         except ValueError as e:
             return ToolResult(success=False, error=str(e))
         decision = self.guard.check_path_operation(str(target), "write")
@@ -1647,7 +1720,11 @@ class OfficeTools:
 
                 _publish_work_artifact(target, _write_pdf, validate_xlsx=False)
             else:
-                SimpleDocTemplate(str(target), pagesize=size).build(elements)
+                self._reject_symlink_target(target)
+                self._save_office_nofollow(
+                    target,
+                    lambda staged: SimpleDocTemplate(str(staged), pagesize=size).build(elements),
+                )
 
             return ToolResult(success=True, output=f"Generated PDF: {path}")
         except Exception as e:

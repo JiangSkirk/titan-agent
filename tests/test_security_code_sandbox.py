@@ -75,7 +75,10 @@ class TestImportEscapes:
         assert "Disallowed" in result.error
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("module", ["io", "posix", "runpy", "shutil", "pty", "pathlib"])
+    @pytest.mark.parametrize(
+        "module",
+        ["io", "posix", "runpy", "shutil", "pty", "pathlib", "multiprocessing", "pickle", "operator", "http"],
+    )
     async def test_newly_disallowed_modules_rejected(
         self, code_tool: CodeTool, module: str
     ) -> None:
@@ -106,6 +109,15 @@ class TestLegitCodeStillScansClean:
     @pytest.mark.asyncio
     async def test_math_code_allowed(self, code_tool: CodeTool) -> None:
         assert code_tool._scan_code("import math\nprint(math.sqrt(16))") is None
+
+    def test_list_index_of_data_allowed(self, code_tool: CodeTool) -> None:
+        assert code_tool._scan_code("xs = [1, 2, 3]\nprint(xs[0])") is None
+
+    def test_open_index_chain_rejected(self, code_tool: CodeTool) -> None:
+        assert code_tool._scan_code("[open][0]('x')") is not None
+
+
+class TestBytecodeDisabled:
 
     def test_bytecode_disabled_in_child_env(self, code_tool: CodeTool) -> None:
         """F-10: the sandboxed interpreter must not write .pyc files."""

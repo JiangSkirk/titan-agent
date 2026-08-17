@@ -185,7 +185,16 @@ def _echo_tool_schema_subset(
             or (name.startswith("skill_") and (needs_skill or _query_mentions_skill(query_l, name)))
         ):
             selected.append(schema)
-    return selected or schemas
+    if selected:
+        return selected
+    # Fail-closed: never advertise the unfiltered registry just because the
+    # keyword heuristic matched nothing.  Core tools (and opted-in exec tools)
+    # are the only fallback; an empty core subset stays empty.
+    return [
+        schema
+        for schema in schemas
+        if str(schema.get("function", {}).get("name", "")) in core_names
+    ]
 
 
 def _query_has_any(query_l: str, terms: tuple[str, ...]) -> bool:

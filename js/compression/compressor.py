@@ -64,7 +64,7 @@ class CompressionConfig:
     summary_max_tokens: int = 12000
     image_token_estimate: int = 1600  # per image
     enable_compression: bool = True
-    use_llm_summary: bool = True  # Use LLM if summarizer available
+    use_llm_summary: bool = True  # FULL/critical path only; GENTLE stays rule-based
 
     # Dual-threshold compression (Hermes-inspired)
     warning_threshold: float = 0.50   # at 50% of max_tokens, start gentle compression
@@ -386,6 +386,7 @@ class ContextCompressor:
             pruned_middle,
             identifiers,
             token_counter=token_counter,
+            allow_llm=self.config.use_llm_summary,
         )
 
         # Build result without rewriting or selectively dropping system/security messages.
@@ -675,11 +676,14 @@ class ContextCompressor:
         identifiers: list[str] | None = None,
         *,
         token_counter: TokenCounter,
+        allow_llm: bool = False,
     ) -> str:
         """Generate a text summary of compressed messages.
 
         The summary budget is derived from summary_ratio × middle_section_budget
         to ensure summaries don't consume an excessive fraction of the context.
+        LLM round-trips are opt-in and only offered on the FULL (critical)
+        compression path that calls this helper.
         """
         middle_tokens = self.estimate_tokens(messages, token_counter=token_counter)
         # summary_ratio (default 20%) caps the summary size relative to the
@@ -695,7 +699,7 @@ class ContextCompressor:
         )
         max_chars = budget_tokens * 4
 
-        if self.config.use_llm_summary and self._summarizer:
+        if allow_llm and self.config.use_llm_summary and self._summarizer:
             try:
                 summary = await self._summarizer(messages, identifiers)
                 if summary:

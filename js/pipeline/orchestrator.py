@@ -28,6 +28,16 @@ from js.utils.log import get_logger
 
 logger = get_logger("js.pipeline")
 
+_EXPERIMENTAL_CONNECTORS = frozenset(
+    {
+        "gmail",
+        "notion",
+        "github",
+        "slack",
+        "drive",
+        "calendar",
+    }
+)
 _CONNECTOR_MAP: dict[str, type[Connector]] = {
     "gmail": GmailConnector,
     "notion": NotionConnector,
@@ -70,6 +80,12 @@ class AutoFetchOrchestrator:
             if src_cfg is None:
                 continue
             if not src_cfg.get("enabled", False):
+                continue
+            if name in _EXPERIMENTAL_CONNECTORS and not src_cfg.get("experimental", False):
+                logger.warning(
+                    "Skipping experimental connector %s; set experimental: true to enable",
+                    name,
+                )
                 continue
             # R4-B: fail closed on legacy plaintext credentials
             legacy_api_key = src_cfg.get("api_key", "")

@@ -213,7 +213,7 @@ class TestLoading:
         assert spec.name == "plan"
         assert spec.description == "Plan mode: write markdown plan to .hermes/plans/, no exec."
         assert spec.type == SkillType.PROMPT
-        assert spec.trust_level == TrustLevel.TRUSTED  # capped from unsigned lock file
+        assert spec.trust_level == TrustLevel.COMMUNITY  # unsigned lock cannot grant TRUSTED
         assert "planning" in spec.tags
         assert "workflow" in spec.tags
         assert "writing-plans" in spec.dependencies
@@ -277,7 +277,7 @@ class TestLoading:
 class TestTrustLevels:
     def test_builtin_trust_from_lock(self, fake_hermes_home):
         lock = _load_hub_lock()
-        assert _resolve_trust_level("plan", lock) == TrustLevel.TRUSTED
+        assert _resolve_trust_level("plan", lock) == TrustLevel.COMMUNITY
 
     def test_community_trust_from_lock(self, fake_hermes_home):
         lock = _load_hub_lock()
