@@ -105,6 +105,12 @@ class TestTarArgumentRules:
     def test_tar_workspace_archive_allowed(self, shell_tool: ShellTool) -> None:
         assert not _denied(shell_tool, "tar -cf out.tar src")
 
+    def test_tar_absolute_archive_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "tar -cf /tmp/out.tar src")
+
+    def test_tar_file_equals_absolute_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "tar --file=/tmp/out.tar src")
+
 
 class TestMvArgumentRules:
     def test_mv_overwrite_existing_denied(
@@ -145,6 +151,54 @@ class TestJqArgumentRules:
         assert not _denied(shell_tool, "jq '.name' data.json")
 
 
+class TestRgArgumentRules:
+    def test_rg_pre_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "rg --pre id pattern .")
+
+    def test_rg_pre_equals_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "rg --pre=id pattern .")
+
+    def test_rg_pre_path_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "rg --pre-path /bin/sh pattern .")
+
+    def test_rg_hostname_bin_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "rg --hostname-bin id pattern .")
+
+    def test_rg_pattern_allowed(self, shell_tool: ShellTool) -> None:
+        assert not _denied(shell_tool, "rg pattern .")
+
+
+class TestProcessSubstitutionAllowlist:
+    def test_process_subst_in_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "cat <(id)")
+
+    def test_process_subst_out_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "echo >(id)")
+
+    def test_quoted_process_subst_literal_allowed(self, shell_tool: ShellTool) -> None:
+        assert not _denied(shell_tool, "echo '<(id)'")
+
+    def test_plain_cat_allowed(self, shell_tool: ShellTool) -> None:
+        assert not _denied(shell_tool, "cat file.txt")
+
+
+class TestPathAndSortRules:
+    def test_ls_absolute_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "ls /etc")
+
+    def test_stat_absolute_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "stat /etc/passwd")
+
+    def test_sort_output_absolute_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "sort -o /tmp/out.txt file.txt")
+
+    def test_sort_output_equals_absolute_denied(self, shell_tool: ShellTool) -> None:
+        assert _denied(shell_tool, "sort --output=/tmp/out.txt file.txt")
+
+    def test_sort_workspace_allowed(self, shell_tool: ShellTool) -> None:
+        assert not _denied(shell_tool, "sort file.txt")
+
+
 class TestBypassRejectedEndToEnd:
     """The shell tool rejects the attack before any process spawns."""
 
@@ -157,6 +211,13 @@ class TestBypassRejectedEndToEnd:
     @pytest.mark.asyncio
     async def test_git_dash_c_rejected_before_spawn(self, shell_tool: ShellTool) -> None:
         result = await shell_tool.execute("git -c core.pager=id log")
+        assert not result.success
+        assert result.error
+        assert "denied" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_rg_pre_rejected_before_spawn(self, shell_tool: ShellTool) -> None:
+        result = await shell_tool.execute("rg --pre id pattern .")
         assert not result.success
         assert result.error
         assert "denied" in result.error.lower()

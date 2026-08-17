@@ -63,6 +63,13 @@ _JQ_DENIED_FLAGS = frozenset({
     "--from-file",
 })
 
+# ripgrep preprocessor / helper-binary execution vectors (F-09).
+_RG_DENIED_FLAGS = frozenset({
+    "--pre",
+    "--pre-path",
+    "--hostname-bin",
+})
+
 
 def _find_arg_error(args: list[str]) -> str | None:
     for token in args[1:]:
@@ -123,7 +130,70 @@ def _sed_arg_error(args: list[str]) -> str | None:
     return None
 
 
-def _tar_arg_error(args: list[str]) -> str | None:
+def _workspace_path_error(
+    token: str, *, cwd: Path, workspace: Path, label: str
+) -> str | None:
+    target = Path(token)
+    candidate = target if target.is_absolute() else cwd / target
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return f"{label} denied (unresolvable path)"
+    try:
+        resolved.relative_to(workspace)
+    except ValueError:
+        return f"{label} denied (outside workspace): {token}"
+    return None
+
+
+def _looks_like_fs_path(token: str) -> bool:
+    if not token or token in {".", "-"}:
+        return False
+    if token.startswith("/") or token.startswith("~"):
+        return True
+    return ".." in token.split("/")
+
+
+def _generic_path_arg_error(args: list[str], *, cwd: Path, workspace: Path) -> str | None:
+    for token in args[1:]:
+        if token.startswith("-") or not _looks_like_fs_path(token):
+            continue
+        error = _workspace_path_error(
+            token, cwd=cwd, workspace=workspace, label="command path"
+        )
+        if error is not None:
+            return error
+    return None
+
+
+def _sort_arg_error(args: list[str], *, cwd: Path, workspace: Path) -> str | None:
+    idx = 1
+    while idx < len(args):
+        token = args[idx]
+        output: str | None = None
+        if token in ("-o", "--output"):
+            if idx + 1 >= len(args):
+                return "sort output denied (missing path)"
+            output = args[idx + 1]
+            idx += 2
+        elif token.startswith("--output="):
+            output = token.split("=", 1)[1]
+            idx += 1
+        elif token.startswith("-o") and not token.startswith("--") and token != "-o":
+            output = token[2:]
+            idx += 1
+        else:
+            idx += 1
+            continue
+        error = _workspace_path_error(
+            output, cwd=cwd, workspace=workspace, label="sort output"
+        )
+        if error is not None:
+            return error
+    return None
+
+
+def _tar_arg_error(args: list[str], *, cwd: Path, workspace: Path) -> str | None:
     idx = 1
     while idx < len(args):
         token = args[idx]
@@ -131,8 +201,19 @@ def _tar_arg_error(args: list[str]) -> str | None:
             name = token.split("=", 1)[0]
             if name in _TAR_DENIED_LONG_FLAGS:
                 return f"tar flag denied (directory-escape/exec vector): {token}"
-            if name in ("--file",) and "=" not in token:
-                idx += 1  # skip the archive value
+            if name == "--file":
+                if "=" in token:
+                    archive = token.split("=", 1)[1]
+                elif idx + 1 < len(args):
+                    archive = args[idx + 1]
+                    idx += 1
+                else:
+                    return "tar archive denied (missing --file value)"
+                error = _workspace_path_error(
+                    archive, cwd=cwd, workspace=workspace, label="tar archive"
+                )
+                if error is not None:
+                    return error
         elif token.startswith("-") and len(token) > 1:
             letters = token[1:]
             denied = _TAR_DENIED_SHORT_LETTERS.intersection(letters)
@@ -140,6 +221,14 @@ def _tar_arg_error(args: list[str]) -> str | None:
                 return f"tar flag denied (directory-escape/absolute-path vector): -{sorted(denied)[0]}"
             value_letters = [c for c in letters if c in _TAR_VALUE_SHORT_LETTERS]
             if value_letters and letters.endswith(value_letters[-1]):
+                if idx + 1 >= len(args):
+                    return "tar archive denied (missing option value)"
+                if "f" in value_letters:
+                    error = _workspace_path_error(
+                        args[idx + 1], cwd=cwd, workspace=workspace, label="tar archive"
+                    )
+                    if error is not None:
+                        return error
                 idx += 1  # skip the option value (e.g. archive after -czf)
         else:
             # Archive member: reject traversal and absolute paths.
@@ -181,13 +270,29 @@ def _jq_arg_error(args: list[str]) -> str | None:
     return None
 
 
+def _rg_arg_error(args: list[str]) -> str | None:
+    for token in args[1:]:
+        if token in _RG_DENIED_FLAGS:
+            return f"rg flag denied (preprocessor/exec vector): {token}"
+        for flag in _RG_DENIED_FLAGS:
+            if token.startswith(flag + "="):
+                return f"rg flag denied (preprocessor/exec vector): {token}"
+    return None
+
+
 _STATIC_ARG_RULES = {
     "find": _find_arg_error,
     "awk": _awk_arg_error,
     "git": _git_arg_error,
     "sed": _sed_arg_error,
-    "tar": _tar_arg_error,
     "jq": _jq_arg_error,
+    "rg": _rg_arg_error,
+}
+
+_PATHFUL_ARG_RULES = {
+    "mv": _mv_arg_error,
+    "tar": _tar_arg_error,
+    "sort": _sort_arg_error,
 }
 
 
@@ -278,11 +383,15 @@ class ShellTool:
         """
 
         try:
-            from js.security.parser import extract_all_args, parse
+            from js.security.parser import extract_all_args, has_subshell, parse
 
             parsed = parse(command)
             if parsed is None:
                 return "Shell command allowlist denied an unparseable command"
+            if has_subshell(parsed):
+                return (
+                    "Shell command allowlist denied a subshell/process substitution"
+                )
             command_args = extract_all_args(parsed)
         except Exception:
             return "Shell command allowlist denied an unparseable command"
@@ -296,18 +405,22 @@ class ShellTool:
             raw_name = args[0]
             if "/" in raw_name or "\\" in raw_name or raw_name not in allowed:
                 return f"Shell command allowlist denied executable: {raw_name}"
-            if raw_name == "mv":
-                mv_error = _mv_arg_error(
-                    args, cwd=effective_cwd, workspace=self.workspace
-                )
-                if mv_error is not None:
-                    return f"Shell command allowlist denied: {mv_error}"
-                continue
-            rule = _STATIC_ARG_RULES.get(raw_name)
-            if rule is not None:
-                arg_error = rule(args)
+            pathful = _PATHFUL_ARG_RULES.get(raw_name)
+            if pathful is not None:
+                arg_error = pathful(args, cwd=effective_cwd, workspace=self.workspace)
                 if arg_error is not None:
                     return f"Shell command allowlist denied: {arg_error}"
+            else:
+                rule = _STATIC_ARG_RULES.get(raw_name)
+                if rule is not None:
+                    arg_error = rule(args)
+                    if arg_error is not None:
+                        return f"Shell command allowlist denied: {arg_error}"
+            path_error = _generic_path_arg_error(
+                args, cwd=effective_cwd, workspace=self.workspace
+            )
+            if path_error is not None:
+                return f"Shell command allowlist denied: {path_error}"
         return None
 
     def register(self, registry: Any) -> None:

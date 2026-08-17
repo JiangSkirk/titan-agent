@@ -58,7 +58,24 @@ class SandboxResult:
 # seatbelt profile language cannot scope them further.
 _MACOS_BASE_ALLOW_RULES = """
 (allow process-exec process-fork)
-(allow file-read-metadata)
+(allow file-read-metadata
+    (literal "/")
+    (literal "/private")
+    (literal "/private/var")
+    (subpath "{workspace}")
+    (subpath "{sandbox_tmp}")
+    (subpath "/System")
+    (subpath "/usr")
+    (subpath "/bin")
+    (subpath "/sbin")
+    (subpath "/opt")
+    (subpath "/Library")
+    (subpath "/dev")
+    (subpath "/private/var/db")
+    (literal "/var")
+    (subpath "/var/select")
+    (subpath "/private/var/select")
+{extra_read_paths})
 (allow file-read-xattr)
 (allow file-ioctl)
 (allow mach-lookup)
@@ -67,12 +84,15 @@ _MACOS_BASE_ALLOW_RULES = """
     (literal "/")
     (literal "/private")
     (literal "/private/var")
+    (literal "/var")
     (subpath "{workspace}")
     (subpath "/System")
     (subpath "/usr")
     (subpath "/opt")
     (subpath "/Library")
     (subpath "/private/var/db")
+    (subpath "/private/var/select")
+    (subpath "/var/select")
     (subpath "/dev")
 {extra_read_paths})
 (allow file-write*
@@ -161,10 +181,11 @@ class SandboxExecutor:
                 bindir = candidate.parent
                 venv_root = bindir.parent
                 try:
+                    self._trusted_read_roots.add(bindir)
                     if (venv_root / "pyvenv.cfg").is_file():
-                        self._trusted_read_roots.add(venv_root.resolve())
+                        self._trusted_read_roots.add(venv_root)
                     else:
-                        self._trusted_read_roots.add(bindir)
+                        self._trusted_read_roots.add(resolved.parent)
                 except (OSError, RuntimeError):
                     continue
         self._has_sandbox_exec = shutil.which("sandbox-exec") is not None
@@ -219,6 +240,15 @@ class SandboxExecutor:
         temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(temp_dir, 0o700)
         env["TMPDIR"] = str(temp_dir)
+        # Neutralize repo-local git hook / fsmonitor execution.  These keys
+        # override .git/config and are not in _SAFE_ENV_KEYS, so extras cannot
+        # replace them.  ``git -c`` remains denied by the shell allowlist.
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_CONFIG_COUNT"] = "2"
+        env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
+        env["GIT_CONFIG_VALUE_0"] = "/dev/null"
+        env["GIT_CONFIG_KEY_1"] = "core.fsmonitor"
+        env["GIT_CONFIG_VALUE_1"] = ""
         return env
 
     def _sandbox_temp_dir(self) -> Path:
@@ -241,10 +271,23 @@ class SandboxExecutor:
         system = platform.system()
         if system == "Darwin" and self._has_sandbox_exec:
             # macOS: use sandbox-exec with a fail-closed profile denying network
+            launcher_roots = _launcher_read_roots(cmd)
+            trusted_roots = sorted({*self._trusted_read_roots, *launcher_roots})
+            traversal_rules = "\n".join(
+                f'            (literal "{_sandbox_profile_path(path)}")'
+                for path in _sandbox_traversal_paths((self.workspace, *trusted_roots))
+            )
             trusted_rules = "\n".join(
-                f'            (subpath "{_sandbox_profile_path(path)}")'
-                for path in sorted(self._trusted_read_roots)
-                if not _path_is_within(path, self.workspace)
+                rule
+                for rule in (
+                    traversal_rules,
+                    "\n".join(
+                        f'            (subpath "{_sandbox_profile_path(path)}")'
+                        for path in trusted_roots
+                        if not _path_is_within(path, self.workspace)
+                    ),
+                )
+                if rule
             )
             profile = _MACOS_NETWORK_DENY_PROFILE.format(
                 workspace=_sandbox_profile_path(self.workspace),
@@ -290,17 +333,24 @@ class SandboxExecutor:
             return cmd
         system = platform.system()
         if system == "Darwin" and self._has_sandbox_exec:
+            launcher_roots = _launcher_read_roots(cmd)
+            readable_roots = (
+                self.workspace,
+                *read_only_paths,
+                *self._trusted_read_roots,
+                *launcher_roots,
+            )
             read_rules = "\n".join(
                 f'            (subpath "{_sandbox_profile_path(path)}")'
                 for path in read_only_paths
             )
             traversal_rules = "\n".join(
                 f'            (literal "{_sandbox_profile_path(path)}")'
-                for path in _sandbox_traversal_paths((self.workspace, *read_only_paths))
+                for path in _sandbox_traversal_paths(readable_roots)
             )
             trusted_rules = "\n".join(
                 f'            (subpath "{_sandbox_profile_path(path)}")'
-                for path in sorted(self._trusted_read_roots)
+                for path in sorted({*self._trusted_read_roots, *launcher_roots})
                 if not _path_is_within(path, self.workspace)
             )
             extra_read_paths = "\n".join(
@@ -791,21 +841,6 @@ class SandboxExecutor:
         if not tokens:
             return None
 
-        read_command_names = {"cat", "head", "tail", "less", "more", "grep", "sed", "awk"}
-        write_command_names = {
-            "cp",
-            "install",
-            "mkdir",
-            "mv",
-            "python",
-            "python3",
-            "rm",
-            "ruby",
-            "node",
-            "perl",
-            "tee",
-            "touch",
-        }
         shell_command_names = {"bash", "sh", "zsh"}
         redirects = {">", ">>", "1>", "1>>", "2>", "2>>", "&>"}
         command_name = Path(tokens[0]).name
@@ -823,36 +858,28 @@ class SandboxExecutor:
             )
             if nested_rejection is not None:
                 return nested_rejection
-        should_check_positional_paths = command_name in read_command_names | write_command_names
         for idx, token in enumerate(tokens):
             if token in {"<", "--"} | redirects:
                 continue
-            if idx == 0 and not should_check_positional_paths:
-                continue
-            if idx == 0 and self._is_trusted_executable(token):
+            # argv[0] is the launched binary (interpreter, git, rg, …), not a
+            # user filesystem operand.  Trusted interpreters may live outside
+            # the workspace; their operands are still checked below.
+            if idx == 0:
                 continue
             if token.startswith("-"):
                 continue
-            previous = tokens[idx - 1] if idx > 0 else ""
-            if (
-                not should_check_positional_paths
-                and idx > 0
-                and previous not in {"<"} | redirects
-            ):
-                continue
             if self._looks_outside_workspace(token, read_only_paths=read_only_paths):
                 return f"Filesystem restricted command denied path outside workspace: {token}"
-        if command_name in write_command_names | shell_command_names:
-            for token in tokens[1:]:
-                for embedded_path in _embedded_absolute_paths(token):
-                    if self._looks_outside_workspace(
-                        embedded_path,
-                        read_only_paths=read_only_paths,
-                    ):
-                        return (
-                            "Filesystem restricted command denied path outside workspace: "
-                            f"{embedded_path}"
-                        )
+        for token in tokens[1:]:
+            for embedded_path in _embedded_absolute_paths(token):
+                if self._looks_outside_workspace(
+                    embedded_path,
+                    read_only_paths=read_only_paths,
+                ):
+                    return (
+                        "Filesystem restricted command denied path outside workspace: "
+                        f"{embedded_path}"
+                    )
         return None
 
     def resolve_cwd(
@@ -959,6 +986,35 @@ def _path_is_within(path: Path, root: Path) -> bool:
 def _sandbox_profile_path(path: Path) -> str:
     """Escape an already-resolved path for a sandbox-exec string literal."""
     return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _launcher_read_roots(cmd: list[str]) -> tuple[Path, ...]:
+    """Directories the launched binary needs to stat/read (venv, bindir)."""
+    if not cmd:
+        return ()
+    token = Path(str(cmd[0]))
+    if not token.is_absolute():
+        located = shutil.which(str(token))
+        if located is None:
+            return ()
+        token = Path(located)
+    roots: list[Path] = [token.parent]
+    venv = token.parent.parent
+    if (venv / "pyvenv.cfg").is_file():
+        roots.append(venv)
+    try:
+        resolved = token.resolve()
+        roots.append(resolved.parent)
+        resolved_venv = resolved.parent.parent
+        if (resolved_venv / "pyvenv.cfg").is_file():
+            roots.append(resolved_venv)
+    except (OSError, RuntimeError):
+        pass
+    unique: list[Path] = []
+    for path in roots:
+        if path not in unique:
+            unique.append(path)
+    return tuple(unique)
 
 
 def _sandbox_traversal_paths(roots: tuple[Path, ...]) -> tuple[Path, ...]:

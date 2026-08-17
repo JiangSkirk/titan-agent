@@ -68,7 +68,13 @@ class TestHardlineBlocklist:
 
     def test_subshell_blocked_even_in_off_mode(self, off_guard: BehaviorGuard) -> None:
         """Command substitution must stay denied under defense_mode=off."""
-        for command in ("echo $(id)", "echo `id`", "printf $(whoami)"):
+        for command in (
+            "echo $(id)",
+            "echo `id`",
+            "printf $(whoami)",
+            "cat <(id)",
+            "echo >(id)",
+        ):
             result = off_guard.check_command(command)
             assert result.decision == SecurityDecisionType.BLOCK, command
             assert "subshell" in result.reason.lower()

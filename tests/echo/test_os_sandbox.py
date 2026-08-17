@@ -193,6 +193,37 @@ async def test_sandbox_home_is_private_directory_not_workspace(
     assert home.is_dir()
 
 
+def test_sandbox_env_overrides_git_hooks_and_fsmonitor(tmp_path: Path) -> None:
+    """Repo .git/config hook/monitor keys cannot win over the sandbox env."""
+    executor = SandboxExecutor(workspace=tmp_path, timeout=5.0)
+    env = executor._build_env(
+        {
+            "GIT_CONFIG_NOSYSTEM": "0",
+            "GIT_CONFIG_COUNT": "99",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": "/tmp/evil-hooks",
+        }
+    )
+
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_CONFIG_COUNT"] == "2"
+    assert env["GIT_CONFIG_KEY_0"] == "core.hooksPath"
+    assert env["GIT_CONFIG_VALUE_0"] == "/dev/null"
+    assert env["GIT_CONFIG_KEY_1"] == "core.fsmonitor"
+    assert env["GIT_CONFIG_VALUE_1"] == ""
+
+
+@pytest.mark.asyncio
+async def test_git_status_succeeds_with_sandbox_git_overrides(tmp_path: Path) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is not available")
+    executor = SandboxExecutor(workspace=tmp_path, timeout=10.0, strict_isolation=True)
+    init = await executor.execute("git init", fs_restricted=True, network_allowed=False)
+    assert init.returncode == 0, init.stderr
+    status = await executor.execute("git status", fs_restricted=True, network_allowed=False)
+    assert status.returncode == 0, status.stderr
+
+
 def test_linux_unshare_mount_namespace_is_not_claimed_as_fs_isolation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
