@@ -26,7 +26,9 @@ PLUGIN_DISALLOWED_BUILTINS = {
 }
 
 PLUGIN_DISALLOWED_MODULES = {
+    "os",
     "os.system",
+    "os.path",
     "subprocess",
     "ctypes",
     "socket",
@@ -82,12 +84,6 @@ def scan_plugin_source(plugin_id: str, source: str, filename: str = "<plugin>") 
             scan_time=time_mod.time() - start,
         )
 
-    # Track whether `os` or `asyncio` was imported (bare import, not `from`).
-    # We allow the import itself but block dangerous method calls on the module.
-    _imported_os = False
-    _imported_asyncio = False
-    _imported_importlib = False
-
     for node in ast.walk(tree):
         # Disallowed builtins: eval(), exec(), compile(), __import__()
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in PLUGIN_DISALLOWED_BUILTINS:
@@ -103,26 +99,31 @@ def scan_plugin_source(plugin_id: str, source: str, filename: str = "<plugin>") 
             and node.args[0].id == "__builtins__"
         ):
             risk_flags.append("disallowed_call:getattr(__builtins__)")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "os"
+        ):
+            risk_flags.append("disallowed_call:getattr(os)")
 
         # Disallowed imports — enforce against the full PLUGIN_DISALLOWED_MODULES set
         if isinstance(node, ast.Import):
             for alias in node.names:
-                # Check top-level module name against all disallowed modules
+                root = alias.name.split(".")[0]
                 _disallowed_toplevel = {
                     m.split(".")[0] for m in PLUGIN_DISALLOWED_MODULES
                 }
-                if alias.name in _disallowed_toplevel:
+                if root in _disallowed_toplevel or alias.name in PLUGIN_DISALLOWED_MODULES:
                     risk_flags.append(f"disallowed_import:{alias.name}")
-                # Track bare os / asyncio / importlib imports for call-site checks
-                if alias.name == "os":
-                    _imported_os = True
-                elif alias.name == "asyncio":
-                    _imported_asyncio = True
-                elif alias.name == "importlib":
-                    _imported_importlib = True
 
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
+            root = module.split(".")[0] if module else ""
+            if root in {m.split(".")[0] for m in PLUGIN_DISALLOWED_MODULES} or module in PLUGIN_DISALLOWED_MODULES:
+                risk_flags.append(f"disallowed_import:{module or '.'}")
             if node.names:
                 for alias in node.names:
                     if alias.name == "system" and module == "os":

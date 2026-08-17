@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -49,6 +50,11 @@ class MockModelProvider(ModelProvider):
         self._responses = responses or []
         self._index = 0
         self.calls: list[list[ChatMessage]] = []
+        self.config = SimpleNamespace(
+            name="mock",
+            base_url="http://127.0.0.1:9/v1",
+            max_retries=1,
+        )
 
     def set_responses(self, responses: list[ChatResponse]) -> None:
         self._responses = responses
@@ -218,6 +224,8 @@ class TestAgentCore:
         ])
         state = await agent.run("Loop")
         assert state.turn_count == 3
+        assert state.status == "error"
+        assert "maximum turn limit" in state.error_message.lower()
 
 
 # =============================================================================
@@ -591,7 +599,7 @@ class TestConfig:
     def test_provider_config_roundtrip(self) -> None:
         cfg = ModelProviderConfig(
             name="test",
-            base_url="http://localhost:1234/v1",
+            base_url="http://127.0.0.1:1234/v1",
             api_key="secret",
             default_model="gpt-4",
             models=[ModelConfig(id="gpt-4", name="GPT-4")],
@@ -657,7 +665,11 @@ class TestEndToEndWorkflow:
         assert len(events) >= 2
 
         # Memory should have session history
-        msgs = await asyncio.to_thread(agent.memory.get_session_messages, session_id)
+        msgs = await asyncio.to_thread(
+            agent.memory.get_session_messages,
+            session_id,
+            "local-user",
+        )
         assert len(msgs) >= 4  # user, assistant, user, assistant
 
     @pytest.mark.asyncio

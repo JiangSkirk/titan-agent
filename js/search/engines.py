@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import html as html_module
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
+from js.security.bounded_http import BoundedResponse, read_bounded_response
+from js.security.net_guard import PinnedTransport, resolve_and_validate
 from js.utils.log import get_logger
 from js.utils.metrics import get_metrics
 
 logger = get_logger("js.search")
 
 
-@dataclass
+@dataclass(frozen=True)
 class SearchResult:
     title: str
     url: str
@@ -25,16 +30,117 @@ class SearchResult:
     source: str
 
 
+class _PinnedSearchClient:
+    """Resolve, validate, and pin every fixed search-provider request."""
+
+    def __init__(
+        self,
+        *,
+        timeout: float,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.timeout = timeout
+        self.headers = dict(headers or {})
+
+    async def get(self, url: str, **kwargs: Any) -> BoundedResponse:
+        return await self._request("get", url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> BoundedResponse:
+        return await self._request("post", url, **kwargs)
+
+    async def _request(self, method: str, url: str, **kwargs: Any) -> BoundedResponse:
+        from js.security import egress as network_egress
+
+        frozen_url = url if type(url) is str else ""
+        frozen_method = str(method or "").upper()
+        request_headers = dict(self.headers)
+        extra_headers = kwargs.get("headers")
+        if isinstance(extra_headers, dict):
+            request_headers.update({str(key): str(value) for key, value in extra_headers.items()})
+        payload = {
+            "params": kwargs.get("params"),
+            "json": kwargs.get("json"),
+            "data": kwargs.get("data"),
+        }
+        credential = request_headers.get("Authorization") or request_headers.get("api-key") or ""
+        try:
+            auth = await network_egress.authorize_network_egress(
+                kind=network_egress.NetworkEgressKind.WEB_SEARCH,
+                target_identity="web_search",
+                endpoint_url=frozen_url,
+                method=frozen_method,
+                payload=payload,
+                provenance={
+                    "schema": network_egress.NETWORK_PROVENANCE_SCHEMA,
+                    "kind": "web_search_egress",
+                    "source": "web_search",
+                    "tool_name": "web_search",
+                },
+                credential_generation=network_egress.credential_generation_of(credential),
+                extra={"header_names": sorted(request_headers), "headers": dict(request_headers)},
+            )
+        except network_egress.EgressConsentError:
+            logger.error("web search network egress denied")
+            raise
+        try:
+            network_egress.assert_network_authorization_fresh(auth)
+            send_url = auth.snapshot.endpoint_url
+            send_method = auth.snapshot.method.lower()
+            if send_url != frozen_url.strip() or send_method != str(method).lower():
+                raise network_egress.EgressConsentError("search request changed after consent")
+            live_payload = {
+                "params": kwargs.get("params"),
+                "json": kwargs.get("json"),
+                "data": kwargs.get("data"),
+            }
+            if network_egress.digest_jsonable(live_payload) != auth.attempt.payload_digest:
+                raise network_egress.EgressConsentError("search payload changed after consent")
+        except network_egress.EgressConsentError:
+            logger.error("web search network egress denied")
+            raise
+        frozen_body = auth.snapshot.payload if type(auth.snapshot.payload) is dict else {}
+        send_kwargs: dict[str, Any] = {}
+        if frozen_body.get("params") is not None:
+            send_kwargs["params"] = frozen_body["params"]
+        if frozen_body.get("json") is not None:
+            send_kwargs["json"] = frozen_body["json"]
+        if frozen_body.get("data") is not None:
+            send_kwargs["data"] = frozen_body["data"]
+        timeout = kwargs.get("timeout", self.timeout)
+        send_headers = {}
+        if type(auth.snapshot.extra) is dict:
+            frozen_headers = auth.snapshot.extra.get("headers")
+            if type(frozen_headers) is dict:
+                send_headers = {str(key): str(value) for key, value in frozen_headers.items()}
+        validated_ips = await asyncio.to_thread(
+            resolve_and_validate,
+            send_url,
+            allow_loopback=False,
+            allow_private=False,
+        )
+        timeout_seconds = float(timeout) if isinstance(timeout, int | float) else float(self.timeout)
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        async with httpx.AsyncClient(
+            transport=PinnedTransport(validated_ips[0], verify=True),
+            timeout=httpx.Timeout(timeout),
+            follow_redirects=False,
+            trust_env=False,
+            headers=send_headers,
+        ) as client, client.stream(send_method, send_url, **send_kwargs) as response:
+            return await read_bounded_response(response, deadline_monotonic=deadline)
+
+    async def aclose(self) -> None:
+        return None
+
+
 class SearchEngine(ABC):
     """Abstract base for search engines."""
 
     @abstractmethod
-    async def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
-        ...
+    async def search(self, query: str, max_results: int = 5) -> list[SearchResult]: ...
 
     @abstractmethod
-    async def health_check(self) -> bool:
-        ...
+    async def health_check(self) -> bool: ...
 
 
 class DuckDuckGoEngine(SearchEngine):
@@ -48,9 +154,8 @@ class DuckDuckGoEngine(SearchEngine):
 
     def __init__(self, timeout: float = 15.0) -> None:
         self.timeout = timeout
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
-            follow_redirects=True,
+        self._client = _PinnedSearchClient(
+            timeout=timeout,
             headers={"User-Agent": self._USER_AGENT},
         )
 
@@ -71,23 +176,17 @@ class DuckDuckGoEngine(SearchEngine):
 
                 # Do not retry permanent client errors (except 429 Too Many Requests)
                 if 400 <= resp.status_code < 500 and resp.status_code != 429:
-                    logger.warning(
-                        f"DuckDuckGo returned {resp.status_code}, not retrying"
-                    )
+                    logger.warning(f"DuckDuckGo returned {resp.status_code}, not retrying")
                     break
 
-                logger.warning(
-                    f"DuckDuckGo returned {resp.status_code}, "
-                    f"attempt {attempt + 1}/3"
-                )
+                logger.warning(f"DuckDuckGo returned {resp.status_code}, attempt {attempt + 1}/3")
             except Exception as e:
                 logger.warning(
-                    f"DuckDuckGo request failed: {type(e).__name__}: {e}, "
-                    f"attempt {attempt + 1}/3"
+                    f"DuckDuckGo request failed: {type(e).__name__}: {e}, attempt {attempt + 1}/3"
                 )
 
             if attempt < 2:
-                await asyncio.sleep(2 ** attempt)  # 1s, 2s exponential backoff
+                await asyncio.sleep(2**attempt)  # 1s, 2s exponential backoff
 
         # Fallback to DuckDuckGo Lite
         lite_results = await self._search_via_lite(query, max_results)
@@ -108,13 +207,12 @@ class DuckDuckGoEngine(SearchEngine):
                 raise RuntimeError(f"DuckDuckGo Lite returned {resp.status_code}")
             return self._parse_html(resp.text, max_results)
         except Exception as e:
-            logger.error(
-                f"DuckDuckGo lite fallback failed: {type(e).__name__}: {e}"
-            )
-            raise RuntimeError(f"DuckDuckGo search failed: {e}") from e
+            logger.error("DuckDuckGo lite fallback failed: %s", type(e).__name__)
+            raise RuntimeError("DuckDuckGo search failed") from e
 
     def _parse_html(self, html: str, max_results: int) -> list[SearchResult]:
         import re
+
         results: list[SearchResult] = []
 
         # Remove scripts and styles to avoid false matches
@@ -175,9 +273,7 @@ class DuckDuckGoEngine(SearchEngine):
 
             # Within each block, pick the first <a> tag that points to an
             # external URL (skip internal DuckDuckGo navigation links).
-            for link_match in re.finditer(
-                r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S
-            ):
+            for link_match in re.finditer(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S):
                 url = self._normalize_result_url(link_match.group(1))
                 title = re.sub(r"<[^>]+>", "", link_match.group(2)).strip()
                 title = html_module.unescape(title)
@@ -238,8 +334,8 @@ class TavilyEngine(SearchEngine):
     def __init__(self, api_key: str, timeout: float = 15.0) -> None:
         self.api_key = api_key
         self.timeout = timeout
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
+        self._client = _PinnedSearchClient(
+            timeout=timeout,
             headers={"Authorization": f"Bearer {api_key}"},
         )
 
@@ -251,7 +347,7 @@ class TavilyEngine(SearchEngine):
             try:
                 get_metrics().search_requests_total.labels(engine="tavily").inc()
             except Exception:
-                logger.warning('Operation failed', exc_info=True)
+                logger.warning("Operation failed", exc_info=True)
             resp = await self._client.post(
                 "https://api.tavily.com/search",
                 json={
@@ -265,16 +361,18 @@ class TavilyEngine(SearchEngine):
             data = resp.json()
             results: list[SearchResult] = []
             for r in data.get("results", []):
-                results.append(SearchResult(
-                    title=r.get("title", ""),
-                    url=r.get("url", ""),
-                    snippet=r.get("content", ""),
-                    source="tavily",
-                ))
+                results.append(
+                    SearchResult(
+                        title=r.get("title", ""),
+                        url=r.get("url", ""),
+                        snippet=r.get("content", ""),
+                        source="tavily",
+                    )
+                )
             return results
         except Exception as e:
-            logger.error(f"Tavily search failed: {e}")
-            raise RuntimeError(f"Tavily search failed: {e}") from e
+            logger.error("Tavily search failed: %s", type(e).__name__)
+            raise RuntimeError("Tavily search failed") from e
 
     async def health_check(self) -> bool:
         try:
@@ -294,8 +392,8 @@ class SerperEngine(SearchEngine):
     def __init__(self, api_key: str, timeout: float = 15.0) -> None:
         self.api_key = api_key
         self.timeout = timeout
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
+        self._client = _PinnedSearchClient(
+            timeout=timeout,
             headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
         )
 
@@ -307,7 +405,7 @@ class SerperEngine(SearchEngine):
             try:
                 get_metrics().search_requests_total.labels(engine="serper").inc()
             except Exception:
-                logger.warning('Operation failed', exc_info=True)
+                logger.warning("Operation failed", exc_info=True)
             resp = await self._client.post(
                 "https://google.serper.dev/search",
                 json={"q": query, "num": max_results},
@@ -316,12 +414,14 @@ class SerperEngine(SearchEngine):
             data = resp.json()
             results: list[SearchResult] = []
             for r in data.get("organic", []):
-                results.append(SearchResult(
-                    title=r.get("title", ""),
-                    url=r.get("link", ""),
-                    snippet=r.get("snippet", ""),
-                    source="serper",
-                ))
+                results.append(
+                    SearchResult(
+                        title=r.get("title", ""),
+                        url=r.get("link", ""),
+                        snippet=r.get("snippet", ""),
+                        source="serper",
+                    )
+                )
             return results
         except Exception as e:
             logger.error(f"Serper search failed: {e}")
@@ -350,9 +450,8 @@ class BingEngine(SearchEngine):
 
     def __init__(self, timeout: float = 15.0) -> None:
         self.timeout = timeout
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
-            follow_redirects=True,
+        self._client = _PinnedSearchClient(
+            timeout=timeout,
             headers={
                 "User-Agent": self._USER_AGENT,
                 "Accept-Language": "en-US,en;q=0.9",
@@ -379,21 +478,31 @@ class BingEngine(SearchEngine):
                         parsed = self._parse_html(resp.text, max_results)
                         # Sanity check: if all results are from unrelated domains, try fallback
                         if parsed and not all(
-                            any(bad in r.url for bad in ("minhaconexao", "speedtest", "bilibili.com"))
+                            any(
+                                bad in r.url
+                                for bad in ("minhaconexao", "speedtest", "bilibili.com")
+                            )
                             for r in parsed
                         ):
                             return parsed
-                        logger.warning(f"Bing ({domain}) returned suspicious results, trying fallback")
+                        logger.warning(
+                            f"Bing ({domain}) returned suspicious results, trying fallback"
+                        )
                     else:
-                        logger.warning(f"Bing ({domain}) returned {resp.status_code}, attempt {attempt + 1}/2")
+                        logger.warning(
+                            f"Bing ({domain}) returned {resp.status_code}, attempt {attempt + 1}/2"
+                        )
                 except Exception as e:
-                    logger.warning(f"Bing ({domain}) request failed: {type(e).__name__}: {e}, attempt {attempt + 1}/2")
+                    logger.warning(
+                        f"Bing ({domain}) request failed: {type(e).__name__}: {e}, attempt {attempt + 1}/2"
+                    )
                 if attempt < 1:
                     await asyncio.sleep(2)
         raise RuntimeError("Bing search failed")
 
     def _parse_html(self, html: str, max_results: int) -> list[SearchResult]:
         import re
+
         results: list[SearchResult] = []
         html = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html, flags=re.S | re.I)
         # Bing results: <li class="b_algo"> containers
@@ -401,7 +510,9 @@ class BingEngine(SearchEngine):
             # Skip blocks that contain only stylesheets/icons (no real result)
             if block.count("<link ") > block.count("<a "):
                 continue
-            title_match = re.search(r'<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?</h2>', block, re.S | re.I)
+            title_match = re.search(
+                r'<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?</h2>', block, re.S | re.I
+            )
             if not title_match:
                 continue
             url = html_module.unescape(title_match.group(1))
@@ -409,10 +520,14 @@ class BingEngine(SearchEngine):
             if url.startswith("/") or "bing.com" in url.lower():
                 continue
             title = re.sub(r"<[^>]+>", "", title_match.group(2))
-            snippet_match = re.search(r'<p[^>]*>(.*?)</p>', block, re.S | re.I)
+            snippet_match = re.search(r"<p[^>]*>(.*?)</p>", block, re.S | re.I)
             snippet = re.sub(r"<[^>]+>", "", snippet_match.group(1)) if snippet_match else ""
             if url and title:
-                results.append(SearchResult(title=title.strip(), url=url, snippet=snippet.strip(), source="bing"))
+                results.append(
+                    SearchResult(
+                        title=title.strip(), url=url, snippet=snippet.strip(), source="bing"
+                    )
+                )
             if len(results) >= max_results:
                 break
         return results
@@ -425,41 +540,126 @@ class BingEngine(SearchEngine):
             return False
 
 
-class SearchCache:
-    """Simple in-memory TTL cache for search results."""
+_DEFAULT_SEARCH_CACHE_MAX_ENTRIES = 256
+_DEFAULT_SEARCH_MAX_QUERY_CHARS = 512
 
-    def __init__(self, ttl_seconds: float = 300.0) -> None:
-        self._ttl = ttl_seconds
-        self._store: dict[str, tuple[list[SearchResult], float]] = {}
+
+def validate_search_query(
+    query: str, *, max_query_chars: int = _DEFAULT_SEARCH_MAX_QUERY_CHARS
+) -> str:
+    if not isinstance(query, str):
+        raise ValueError("query must be a string")
+    normalized = query.strip()
+    if not normalized:
+        raise ValueError("query must not be empty")
+    if len(normalized) > max_query_chars:
+        raise ValueError(f"query exceeds max length of {max_query_chars} characters")
+    return normalized
+
+
+def validate_search_max_results(max_results: object) -> int:
+    if type(max_results) is not int:
+        raise ValueError("max_results must be an integer between 1 and 10")
+    if max_results < 1 or max_results > 10:
+        raise ValueError("max_results must be an integer between 1 and 10")
+    return max_results
+
+
+class SearchCache:
+    """Bounded in-memory LRU+TTL cache for search results."""
+
+    def __init__(
+        self,
+        ttl_seconds: float = 300.0,
+        *,
+        max_entries: int = _DEFAULT_SEARCH_CACHE_MAX_ENTRIES,
+        max_query_chars: int = _DEFAULT_SEARCH_MAX_QUERY_CHARS,
+    ) -> None:
+        if isinstance(ttl_seconds, bool) or type(ttl_seconds) not in (int, float):
+            raise ValueError("ttl_seconds must be a positive number")
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        if type(max_entries) is not int:
+            raise ValueError("max_entries must be a positive integer")
+        if max_entries < 1:
+            raise ValueError("max_entries must be positive")
+        if type(max_query_chars) is not int:
+            raise ValueError("max_query_chars must be a positive integer")
+        if max_query_chars < 1:
+            raise ValueError("max_query_chars must be positive")
+        self._ttl = float(ttl_seconds)
+        self._max_entries = max_entries
+        self._max_query_chars = max_query_chars
+        # key -> (results, inserted_at); OrderedDict preserves LRU order
+        self._store: OrderedDict[str, tuple[list[SearchResult], float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._store)
 
     def _key(self, query: str, max_results: int) -> str:
-        return f"{query.lower().strip()}:{max_results}"
+        normalized = validate_search_query(query, max_query_chars=self._max_query_chars)
+        bounded = validate_search_max_results(max_results)
+        return f"{normalized.lower()}:{bounded}"
+
+    def _purge_expired_unlocked(self, *, now: float) -> None:
+        expired = [
+            key
+            for key, (_results, timestamp) in self._store.items()
+            if now - timestamp >= self._ttl
+        ]
+        for key in expired:
+            del self._store[key]
 
     def get(self, query: str, max_results: int) -> list[SearchResult] | None:
         key = self._key(query, max_results)
-        entry = self._store.get(key)
-        if entry is None:
-            return None
-        results, timestamp = entry
-        if time.time() - timestamp > self._ttl:
-            self._store.pop(key, None)
-            return None
-        return results
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired_unlocked(now=now)
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            results, timestamp = entry
+            if now - timestamp >= self._ttl:
+                del self._store[key]
+                return None
+            self._store.move_to_end(key)
+            return list(results)
 
     def set(self, query: str, max_results: int, results: list[SearchResult]) -> None:
-        self._store[self._key(query, max_results)] = (results, time.time())
+        key = self._key(query, max_results)
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired_unlocked(now=now)
+            self._store[key] = (list(results), now)
+            self._store.move_to_end(key)
+            while len(self._store) > self._max_entries:
+                self._store.popitem(last=False)
 
     def clear(self) -> None:
-        self._store.clear()
+        with self._lock:
+            self._store.clear()
 
 
 class SearchManager:
     """Manages multiple search engines with fallback and caching."""
 
-    def __init__(self, cache_ttl: float = 300.0) -> None:
+    def __init__(
+        self,
+        cache_ttl: float = 300.0,
+        *,
+        cache_max_entries: int = _DEFAULT_SEARCH_CACHE_MAX_ENTRIES,
+        max_query_chars: int = _DEFAULT_SEARCH_MAX_QUERY_CHARS,
+    ) -> None:
         self.engines: list[SearchEngine] = []
         self._default: SearchEngine | None = None
-        self._cache = SearchCache(ttl_seconds=cache_ttl)
+        self._max_query_chars = int(max_query_chars)
+        self._cache = SearchCache(
+            ttl_seconds=cache_ttl,
+            max_entries=cache_max_entries,
+            max_query_chars=max_query_chars,
+        )
 
     def register(self, engine: SearchEngine, default: bool = False) -> None:
         self.engines.append(engine)
@@ -475,10 +675,12 @@ class SearchManager:
 
     async def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
         """Search with caching and fallback across all engines."""
+        query = validate_search_query(query, max_query_chars=self._max_query_chars)
+        max_results = validate_search_max_results(max_results)
         # Check cache first
         cached = self._cache.get(query, max_results)
         if cached is not None:
-            logger.debug(f"Search cache hit for query: {query[:40]}")
+            logger.debug("Search cache hit")
             return cached
 
         errors: list[str] = []
@@ -496,7 +698,4 @@ class SearchManager:
         return []
 
     async def health_check(self) -> dict[str, bool]:
-        return {
-            type(e).__name__: await e.health_check()
-            for e in self.engines
-        }
+        return {type(e).__name__: await e.health_check() for e in self.engines}

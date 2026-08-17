@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from js.agent.tool_executor import CONTROL_SETUP_STATE_TOOL
+from js.models.providers import ChatMessage
+from js.tools.registry import ToolResult
 from js.web.server import create_app
 
 
@@ -52,15 +56,84 @@ def client(tmp_path: Path) -> TestClient:
     mock_router = MagicMock()
     mock_agent.router = mock_router
 
+    async def _authorized_model_chat(*, messages, model=None, tools=None, temperature=0.7, **_):
+        decision = await mock_router.select_model(preferred=model)
+        return await decision.provider.chat(
+            messages=messages,
+            model=decision.model,
+            tools=tools,
+            temperature=temperature,
+        )
+
+    from js.echo.turn_runtime import EchoRuntime
+
+    mock_agent.authorized_model_chat = _authorized_model_chat
+    mock_agent._current_allowed_tools = {CONTROL_SETUP_STATE_TOOL}
+    mock_agent.echo_runtime = EchoRuntime(mock_agent)
+    mock_agent.take_setup_admin_key = MagicMock(return_value=None)
+
+    async def _execute_setup_state(effect, _context):
+        assert effect.tool_name == CONTROL_SETUP_STATE_TOOL
+        action = json.loads(effect.arguments_json)["action"]
+        status_map = {
+            "complete": "completed",
+            "skip": "skipped",
+            "start": "in_progress",
+            "reset": "pending",
+        }
+        if action not in status_map:
+            return (
+                ChatMessage(role="tool", content="invalid", name=effect.tool_name),
+                ToolResult(
+                    success=False,
+                    error="Invalid setup state action",
+                    metadata={"status_code": 400},
+                ),
+            )
+        settings.onboarding_status = status_map[action]
+        settings.first_run_completed = status_map[action] in {"completed", "skipped"}
+        return (
+            ChatMessage(role="tool", content="updated", name=effect.tool_name),
+            ToolResult(
+                success=True,
+                output="updated",
+                metadata={
+                    "first_run_completed": settings.first_run_completed,
+                    "onboarding_status": settings.onboarding_status,
+                },
+            ),
+        )
+
+    mock_agent.echo_runtime.execute_tool_effect = AsyncMock(side_effect=_execute_setup_state)
+
     web_server._agent = mock_agent
     web_server._settings = settings
     set_globals(mock_agent, settings)
     app = create_app()
-    return TestClient(app)
+    from js.web.auth import AuthManager
+
+    user_key = AuthManager(settings.state_dir).create_key("setup-wizard", role="user")
+    return TestClient(app, headers={"X-API-Key": user_key})
 
 
 class TestSetupFirstStart:
     """Tests for /api/setup/first-start diagnostics endpoint."""
+
+    def test_get_does_not_probe_local_model_servers(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from js.models import discovery as discovery_module
+
+        discovery = MagicMock(side_effect=AssertionError("GET must be side-effect free"))
+        monkeypatch.setattr(discovery_module, "LocalModelDiscovery", discovery)
+
+        res = client.get("/api/setup/first-start")
+
+        assert res.status_code == 200
+        assert res.json()["diagnostics"]["local_providers_detected"] == []
+        discovery.assert_not_called()
 
     def test_returns_first_run_status(self, client: TestClient) -> None:
         res = client.get("/api/setup/first-start")
@@ -99,6 +172,14 @@ class TestSetupComplete:
         res = client.get("/api/setup/first-start")
         assert res.json()["first_run_completed"] is True
 
+        from js.web.deps import get_agent
+
+        effect, context = get_agent().echo_runtime.execute_tool_effect.await_args.args
+        assert effect.tool_name == CONTROL_SETUP_STATE_TOOL
+        assert effect.allowed_tools == (CONTROL_SETUP_STATE_TOOL,)
+        assert effect.arguments_json == '{"action":"complete"}'
+        assert context.capabilities == (CONTROL_SETUP_STATE_TOOL,)
+
 
 class TestSetupReset:
     """Tests for /api/setup/reset endpoint."""
@@ -130,6 +211,7 @@ class TestSetupTestModel:
     def _get_router(self, client: TestClient):
         """Get the mock router from the deps module."""
         from js.web import deps
+
         agent = deps.get_agent()
         return agent.router
 
@@ -138,9 +220,7 @@ class TestSetupTestModel:
 
         router = self._get_router(client)
         router.select_model = AsyncMock(
-            return_value=RoutingDecision(
-                provider=None, model="", provider_name="", reason=""
-            )
+            return_value=RoutingDecision(provider=None, model="", provider_name="", reason="")
         )
         res = client.post("/api/setup/test-model", json={"model_id": "nonexistent"})
         assert res.status_code == 404
@@ -174,9 +254,16 @@ class TestSetupTestModel:
         mock_cfg = MagicMock()
         mock_cfg.context_window = 131072
         router.get_model_config = MagicMock(return_value=mock_cfg)
+        from js.web import deps
+
+        agent = deps.get_agent()
+        original_build_context = agent.echo_runtime.build_context
+        agent.echo_runtime.build_context = MagicMock(wraps=original_build_context)
 
         res = client.post("/api/setup/test-model", json={"model_id": "test/model"})
+        second = client.post("/api/setup/test-model", json={"model_id": "test/model"})
         assert res.status_code == 200
+        assert second.status_code == 200
         data = res.json()
         assert data["ok"] is True
         assert data["latency_ms"] >= 0
@@ -184,6 +271,9 @@ class TestSetupTestModel:
         assert data["context_window"] == 131072
         assert data["provider"] == "test"
         assert "response_preview" in data
+        contexts = agent.echo_runtime.build_context.call_args_list
+        assert contexts[0].kwargs["run_id"] != contexts[1].kwargs["run_id"]
+        assert contexts[0].kwargs["session_id"] != contexts[1].kwargs["session_id"]
 
     def test_model_test_failure(self, client: TestClient) -> None:
         from js.models.router import RoutingDecision

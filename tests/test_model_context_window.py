@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from collections.abc import Iterator
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,12 +19,13 @@ class TestLocalModelContextDetection:
     def discovery(self) -> LocalModelDiscovery:
         return LocalModelDiscovery(timeout=1.0)
 
-    @pytest.mark.asyncio
-    async def test_lmstudio_v0_api_context_parsing(self, discovery: LocalModelDiscovery) -> None:
-        """LM Studio v0 API max_context_length is correctly parsed."""
-        contexts = await discovery._lmstudio_context_lengths("http://127.0.0.1:1234/v1")
-        # When no server is running, returns empty dict; verifies it's a dict
-        assert isinstance(contexts, dict)
+    def test_local_discovery_exposes_no_raw_network_probe(
+        self,
+        discovery: LocalModelDiscovery,
+    ) -> None:
+        assert not hasattr(discovery, "_lmstudio_context_lengths")
+        assert not hasattr(discovery, "_ollama_context_lengths")
+        assert not hasattr(discovery, "_probe")
 
     def test_infer_with_lmstudio_override(self, discovery: LocalModelDiscovery) -> None:
         """When LM Studio v0 API provides context, it overrides name inference."""
@@ -78,6 +81,13 @@ class TestLocalModelContextDetection:
 class TestCloudModelDiscovery:
     """Verify cloud provider model lists can be refreshed from API."""
 
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
+
     @pytest.mark.asyncio
     async def test_provider_manager_discovers_with_context(self) -> None:
         """ProviderManager.discover_models returns context_window when available."""
@@ -121,9 +131,19 @@ class TestCloudModelDiscovery:
             ]
         }
 
-        with patch("httpx.AsyncClient.get", return_value=v1_response):
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(return_value=v1_response)
+        with (
+            patch(
+                "js.security.net_guard.resolve_and_validate_provider_endpoint",
+                return_value=["203.0.113.10"],
+            ),
+            patch("httpx.AsyncClient", return_value=mock_client),
+        ):
             result = await ProviderManager.discover_models(
-                "http://example.com/v1", api_key="test"
+                "https://example.com/v1", api_key="test"
             )
 
         assert result["models"][0]["context_window"] == 131072
@@ -140,15 +160,10 @@ class TestCloudModelDiscovery:
 class TestGenericLocalProvider:
     """Verify any OpenAI-compatible local endpoint is supported."""
 
-    @pytest.mark.asyncio
-    async def test_custom_port_discovery(self) -> None:
-        """Local servers on non-standard ports are discoverable."""
+    def test_lan_scanner_is_physically_absent(self) -> None:
+        """Broad LAN scanning cannot be reached through the compatibility class."""
         discovery = LocalModelDiscovery(timeout=0.5)
-        # We don't have a real server, but we verify the probe mechanism exists
-        # by testing scan_lan doesn't crash
-        results = await discovery.scan_lan(subnet_prefix="127.0")
-        assert isinstance(results, list)
-        await discovery.close()
+        assert not hasattr(discovery, "scan_lan")
 
     def test_infer_context_accurate_for_known_models(self) -> None:
         """Context inference covers major model families accurately."""

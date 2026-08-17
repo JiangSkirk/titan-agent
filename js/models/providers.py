@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, NoReturn, cast
+from urllib.parse import urlparse
 
 import httpx
 from openai import AsyncOpenAI
@@ -20,6 +22,11 @@ from tenacity import (
 
 from js.config import ModelProviderConfig
 from js.models.circuit_breaker import CircuitBreaker
+from js.models.stream_events import StreamEvent
+from js.security.net_guard import (
+    PinnedTransport,
+    is_canonical_loopback_literal,
+)
 from js.utils.log import get_logger
 from js.utils.metrics import get_metrics, start_span
 
@@ -27,35 +34,85 @@ from js.utils.metrics import get_metrics, start_span
 _transport_available = False
 try:
     from js.models.transports import ChatCompletionsTransport, get_transport
+
     _transport_available = True
 except Exception:
     pass
 
 
-def _redact_key(key: str | None) -> str:
-    """Redact an API key for safe logging."""
-    if not key:
-        return "<not-set>"
-    if len(key) <= 8:
-        return "***"
-    return key[:4] + "****" + key[-4:]
+def _credential_log_status(key: str | None) -> str:
+    """Return a non-identifying credential marker for operational logs."""
+    return "<configured>" if key else "<not-configured>"
+
+
+def _sanitize_provider_exc(
+    exc: BaseException,
+    *,
+    api_key: str | None,
+    query_param_name: str | None = None,
+) -> str:
+    from js.models.capability import SafeProviderError, sanitize_provider_error
+
+    if isinstance(exc, SafeProviderError):
+        return str(exc)
+    return sanitize_provider_error(
+        str(exc),
+        api_key=api_key,
+        query_param_name=query_param_name,
+    )
+
+
+def _raise_as_safe_provider_error(
+    exc: BaseException,
+    *,
+    api_key: str | None,
+    query_param_name: str | None = None,
+    retryable: bool | None = None,
+) -> NoReturn:
+    """Convert *exc* at the provider adapter exit and raise :class:`SafeProviderError`."""
+    from js.models.capability import raise_safe_provider_error
+
+    raise_safe_provider_error(
+        exc,
+        api_key=api_key,
+        query_param_name=query_param_name,
+        retryable=is_retryable_provider_error(exc) if retryable is None else retryable,
+    )
 
 
 def _is_local_provider(base_url: str) -> bool:
-    """Detect local model servers (LM Studio, Ollama, etc.) by URL."""
+    """Detect local model servers (LM Studio, Ollama, etc.) by URL.
+
+    Only canonical literal loopback addresses (127.0.0.0/8, ::1) are treated as
+    local.  ``localhost`` and other hostnames go through the full DNS guard.
+    """
     if not base_url:
         return False
-    return any(h in base_url for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1"))
+    hostname = (urlparse(base_url).hostname or "").lower()
+    return is_canonical_loopback_literal(hostname)
 
 
-def _is_retryable_exception(exc: BaseException) -> bool:
+def is_retryable_provider_error(exc: BaseException) -> bool:
     """Retry on network errors, protocol errors, timeouts, 5xx, and 429 rate limits."""
-    if isinstance(exc, (httpx.NetworkError, httpx.TimeoutException, asyncio.TimeoutError,
-                        httpx.RemoteProtocolError, httpx.ConnectError)):
+    from js.models.capability import SafeProviderError
+
+    if isinstance(exc, SafeProviderError):
+        return bool(exc.retryable)
+    if isinstance(
+        exc,
+        (
+            httpx.NetworkError,
+            httpx.TimeoutException,
+            asyncio.TimeoutError,
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+        ),
+    ):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500 or exc.response.status_code == 429
     return False
+
 
 logger = get_logger("js.models")
 
@@ -78,10 +135,26 @@ class ChatResponse:
     usage: dict[str, int]
     finish_reason: str
     reasoning_content: str = ""
+    usage_source: Literal[
+        "provider_actual",
+        "tokenizer",
+        "estimated",
+        "unavailable",
+    ] = "unavailable"
 
 
 class ModelProvider(ABC):
     """Abstract base for model providers."""
+
+    def response_secret_snapshot(self) -> object:
+        """Return the credential bound to this Provider generation.
+
+        Concrete remote providers should freeze this value when they are
+        constructed.  The default keeps legacy/test providers compatible;
+        ModelRouter additionally records the value when a generation is
+        registered and never puts it on a public routing decision.
+        """
+        return getattr(getattr(self, "config", None), "api_key", None)
 
     @abstractmethod
     async def chat(
@@ -91,8 +164,7 @@ class ModelProvider(ABC):
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
-    ) -> ChatResponse:
-        ...
+    ) -> ChatResponse: ...
 
     @abstractmethod
     def chat_stream(
@@ -102,16 +174,79 @@ class ModelProvider(ABC):
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
         max_tokens: int | None = None,
-    ) -> AsyncIterator[str]:
-        ...
+    ) -> AsyncIterator[str]: ...
+
+    async def chat_stream_events(
+        self,
+        messages: list[ChatMessage],
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Structured streaming events (text/thinking/tool/usage/done/error).
+
+        Default implementation wraps ``chat_stream()`` so providers that only
+        emit token text still feed the structured pipeline — each yielded
+        chunk becomes one ``text_delta`` event, followed by a terminal
+        ``done`` event. Concrete providers override this to expose richer
+        deltas (thinking, tool-call partials, usage) without breaking the
+        legacy ``chat_stream()`` contract that ``runner.py`` / ``router.py``
+        already depend on.
+        """
+        from js.models.stream_events import StreamEvent
+
+        try:
+            async for token in self.chat_stream(
+                messages=messages,
+                model=model,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ):
+                if token:
+                    yield StreamEvent(kind="text_delta", text=token, model=model)
+            yield StreamEvent(kind="done", finish_reason="stop", model=model)
+        except Exception as exc:
+            from js.models.capability import SafeProviderError, safe_provider_error
+
+            config = getattr(self, "config", None)
+            api_key = getattr(config, "api_key", None)
+            query_param_name = getattr(config, "query_param_name", None)
+            safe = (
+                exc
+                if isinstance(exc, SafeProviderError)
+                else safe_provider_error(
+                    exc,
+                    api_key=api_key,
+                    query_param_name=query_param_name,
+                    retryable=is_retryable_provider_error(exc),
+                )
+            )
+            # Even a pre-built SafeProviderError may be legacy/custom — re-scrub.
+            if isinstance(safe, SafeProviderError) and (api_key or query_param_name):
+                from js.models.capability import sanitize_provider_error
+
+                safe = SafeProviderError(
+                    sanitize_provider_error(
+                        str(safe),
+                        api_key=api_key,
+                        query_param_name=query_param_name,
+                    ),
+                    retryable=safe.retryable,
+                )
+            yield StreamEvent(
+                kind="error",
+                error=str(safe),
+                model=model,
+                meta={"retryable": is_retryable_provider_error(safe)},
+            )
 
     @abstractmethod
-    async def health_check(self) -> bool:
-        ...
+    async def health_check(self) -> bool: ...
 
     @abstractmethod
-    async def close(self) -> None:
-        ...
+    async def close(self) -> None: ...
 
 
 class OpenAICompatibleProvider(ModelProvider):
@@ -128,11 +263,38 @@ class OpenAICompatibleProvider(ModelProvider):
     _SEMAPHORES: dict[str, asyncio.Semaphore] = {}
     _SEMA_LOCK = asyncio.Lock()
 
-    def __init__(self, config: ModelProviderConfig) -> None:
+    def __init__(
+        self,
+        config: ModelProviderConfig,
+        *,
+        allow_private: bool = False,
+    ) -> None:
         self.config = config
+        # A Provider object is one immutable credential generation.  Static
+        # settings may be updated in place while an old operation is still
+        # active; lazy SDK construction and response scrubbing must therefore
+        # never re-read the mutable config credential or endpoint.
+        self._credential_snapshot = config.api_key
+        self._freeze_endpoint_generation(config.base_url)
+        self._provider_generation = f"{config.name}:{id(self)}"
+        try:
+            self._max_retries_snapshot = int(config.max_retries)
+        except (TypeError, ValueError):
+            self._max_retries_snapshot = 1
         self._is_local = _is_local_provider(config.base_url)
+        self._allow_private = allow_private is True
+        self._validated_ips: tuple[str, ...] = ()
+        self._pinned_transport: PinnedTransport | None = None
+        self._client_lock = asyncio.Lock()
+        self._client_init_task: asyncio.Task[AsyncOpenAI] | None = None
+        self._closed = False
+        self._lifecycle_condition = asyncio.Condition()
+        self._lifecycle_state = "OPEN"
+        self._active_operations = 0
+        self._close_task: asyncio.Task[None] | None = None
+        self._http_client: httpx.AsyncClient | None = None
+        self.client: AsyncOpenAI | None = None
 
-        # Local providers are more fragile — trip the breaker sooner
         cb_threshold = 3 if self._is_local else 5
         cb_recovery = 15.0 if self._is_local else 30.0
         self.circuit = CircuitBreaker(
@@ -141,65 +303,41 @@ class OpenAICompatibleProvider(ModelProvider):
             recovery_timeout=cb_recovery,
         )
 
-        # --- Optimised HTTP client ---
-        # 1. Connection pool: enough for concurrent tool calls + chat
-        # 2. HTTP/2: reduces latency for sequential requests
-        # 3. Keep-alive: avoids TLS handshake overhead on every request
-        # 4. trust_env=False: bypass system proxies for localhost
-        _limits = httpx.Limits(
+        self._http_limits = httpx.Limits(
             max_connections=20,
             max_keepalive_connections=10,
             keepalive_expiry=30.0,
         )
 
-        # Local models need longer timeouts — cold-start model loading into GPU
-        # can take 2-3 minutes (especially for large models like qwen3.5).
         if self._is_local:
             try:
                 cfg_timeout = float(config.timeout)
             except (TypeError, ValueError):
                 cfg_timeout = 120.0
             _local_timeout = max(cfg_timeout, 300.0)
-            _timeout = httpx.Timeout(
+            self._http_timeout = httpx.Timeout(
                 _local_timeout,
                 connect=3.0,
                 read=_local_timeout,
                 write=10.0,
                 pool=3.0,
             )
-            _http2 = False  # Many local servers don't support HTTP/2 well
+            self._http2 = False
         else:
-            _timeout = httpx.Timeout(
+            self._http_timeout = httpx.Timeout(
                 config.timeout,
                 connect=8.0,
                 read=config.timeout,
                 write=15.0,
                 pool=5.0,
             )
-            _http2 = True
-
-        _http_client = httpx.AsyncClient(
-            trust_env=False,
-            timeout=_timeout,
-            limits=_limits,
-            http2=_http2,
-        )
-
-        client_kwargs: dict[str, Any] = {
-            "base_url": config.base_url,
-            "api_key": config.api_key or "not-needed",
-            "http_client": _http_client,
-            "max_retries": 0,  # We handle retries ourselves
-        }
-        if config.auth_adapter == "query_param" and config.api_key and config.query_param_name:
-            client_kwargs["default_query"] = {config.query_param_name: config.api_key}
-            client_kwargs["api_key"] = "not-needed"  # Prevent Authorization Bearer token
-        self.client = AsyncOpenAI(**client_kwargs)
+            self._http2 = True
 
         self._last_health_check = 0.0
         self._health_status = False
         self._health_lock = asyncio.Lock()
         self._last_stream_usage: dict[str, int] | None = None
+        self._stream_options_supported = True
 
         # Transport layer (Hermes v0.14 architecture)
         self._transport: Any = None
@@ -209,19 +347,20 @@ class OpenAICompatibleProvider(ModelProvider):
                 try:
                     self._transport = get_transport(
                         ttype,
-                        api_key=config.api_key,
+                        api_key=self._credential_snapshot,
                     )
                     logger.info(
                         "Provider %s using transport=%s",
                         config.name,
                         ttype,
                     )
-                except Exception as e:
+                except Exception as exc:
                     logger.warning(
-                        "Transport %s failed for %s, falling back to chat_completions: %s",
+                        "Transport %s failed for %s; falling back "
+                        "to chat_completions (exception=%s)",
                         ttype,
                         config.name,
-                        e,
+                        type(exc).__name__,
                     )
                     self._transport = ChatCompletionsTransport()
             else:
@@ -231,9 +370,203 @@ class OpenAICompatibleProvider(ModelProvider):
             "Provider %s initialised (local=%s, key=%s, http2=%s)",
             config.name,
             self._is_local,
-            _redact_key(config.api_key),
-            _http2,
+            _credential_log_status(self._credential_snapshot),
+            self._http2,
         )
+
+    def response_secret_snapshot(self) -> str | None:
+        """Return the immutable credential used by this Provider generation."""
+        # A small set of legacy unit fixtures construct the object with
+        # ``object.__new__`` and inject a fake client. Production construction
+        # always sets the frozen snapshot before any other Provider state.
+        return getattr(
+            self,
+            "_credential_snapshot",
+            getattr(getattr(self, "config", None), "api_key", None),
+        )
+
+    def _get_lifecycle_condition(self) -> asyncio.Condition:
+        """Return lifecycle state, lazily initialising legacy test fixtures."""
+        condition = getattr(self, "_lifecycle_condition", None)
+        if condition is None:
+            condition = asyncio.Condition()
+            self._lifecycle_condition = condition
+            self._lifecycle_state = "CLOSED" if getattr(self, "_closed", False) else "OPEN"
+            self._active_operations = 0
+            self._close_task = None
+        return condition
+
+    @asynccontextmanager
+    async def _operation_lease(self) -> AsyncIterator[None]:
+        """Prevent the SDK client from closing while one operation is active."""
+        condition = self._get_lifecycle_condition()
+        async with condition:
+            if getattr(self, "_lifecycle_state", "OPEN") != "OPEN" or getattr(
+                self, "_closed", False
+            ):
+                raise RuntimeError("provider is closing or closed")
+            self._active_operations = getattr(self, "_active_operations", 0) + 1
+        try:
+            yield
+        finally:
+            async with condition:
+                self._active_operations -= 1
+                if self._active_operations == 0:
+                    condition.notify_all()
+
+    def _freeze_endpoint_generation(self, raw_url: Any) -> None:
+        from js.security.egress import canonical_provider_endpoint_url, endpoint_digest
+
+        canonical = canonical_provider_endpoint_url(raw_url)
+        if canonical is None:
+            raise PermissionError("provider endpoint is invalid")
+        self._endpoint_snapshot = canonical
+        self._endpoint_digest = endpoint_digest(canonical)
+
+    def _immutable_transport_endpoint(self) -> str:
+        from js.security.egress import endpoint_digest
+
+        snapshot = getattr(self, "_endpoint_snapshot", None)
+        if type(snapshot) is not str or not snapshot.strip():
+            raise PermissionError("provider endpoint is invalid")
+        endpoint = snapshot.strip()
+        digest = getattr(self, "_endpoint_digest", None)
+        if digest != endpoint_digest(endpoint):
+            raise PermissionError("provider endpoint generation mismatch")
+        return endpoint
+
+    async def _initialise_client(self) -> AsyncOpenAI:
+        """Build and publish one pinned SDK client for a concurrent wave."""
+        from js.security.net_guard import resolve_and_validate_provider_endpoint
+
+        api_key = self.response_secret_snapshot()
+        endpoint = self._immutable_transport_endpoint()
+
+        validated = await asyncio.to_thread(
+            resolve_and_validate_provider_endpoint,
+            endpoint,
+            allow_private=getattr(self, "_allow_private", False) is True,
+        )
+        if not validated:
+            raise RuntimeError("provider endpoint produced no validated address")
+
+        http2 = getattr(self, "_http2", False)
+        limits = getattr(self, "_http_limits", httpx.Limits())
+        transport = PinnedTransport(
+            validated[0],
+            verify=True,
+            trust_env=False,
+            http2=http2,
+            limits=limits,
+        )
+        http_client = httpx.AsyncClient(
+            trust_env=False,
+            timeout=getattr(self, "_http_timeout", self.config.timeout),
+            limits=limits,
+            http2=http2,
+            follow_redirects=False,
+            transport=transport,
+        )
+        client_kwargs: dict[str, Any] = {
+            "base_url": endpoint,
+            "api_key": api_key or "not-needed",
+            "http_client": http_client,
+            "max_retries": 0,
+        }
+        if (
+            self.config.auth_adapter == "query_param"
+            and api_key
+            and self.config.query_param_name
+        ):
+            client_kwargs["default_query"] = {
+                self.config.query_param_name: api_key
+            }
+            client_kwargs["api_key"] = "not-needed"
+        try:
+            client = AsyncOpenAI(**client_kwargs)
+        except BaseException:
+            await http_client.aclose()
+            raise
+
+        lock = getattr(self, "_client_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_lock = lock
+        async with lock:
+            # This task can only be created while _ensure_client still sees an
+            # OPEN provider.  If close begins afterwards, _finish_close waits
+            # for this exact task (and for its owning operation lease) before
+            # closing the published client.  Rejecting publication here would
+            # abort an operation that was already authorised before CLOSING.
+            existing = cast("AsyncOpenAI | None", getattr(self, "client", None))
+            if existing is not None:
+                await http_client.aclose()
+                return existing
+            self._validated_ips = tuple(validated)
+            self._pinned_transport = transport
+            self._http_client = http_client
+            self.client = client
+            return client
+
+    def _client_initialisation_done(self, task: asyncio.Task[AsyncOpenAI]) -> None:
+        """Consume an orphaned result and make the next failed wave retryable."""
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        asyncio.create_task(self._clear_client_init_task(task))
+
+    async def _clear_client_init_task(self, task: asyncio.Task[AsyncOpenAI]) -> None:
+        lock = getattr(self, "_client_lock", None)
+        if lock is None:
+            return
+        async with lock:
+            if getattr(self, "_client_init_task", None) is task:
+                self._client_init_task = None
+
+    async def _ensure_client(self) -> AsyncOpenAI:
+        """Create one shared SDK client after DNS validation and IP pinning."""
+        if getattr(self, "_closed", False) or getattr(
+            self, "_lifecycle_state", "OPEN"
+        ) != "OPEN":
+            raise RuntimeError("provider is closed")
+        existing = cast("AsyncOpenAI | None", getattr(self, "client", None))
+        if existing is not None:
+            return existing
+
+        lock = getattr(self, "_client_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_lock = lock
+        async with lock:
+            if (
+                getattr(self, "_closed", False)
+                or getattr(self, "_lifecycle_state", "OPEN") != "OPEN"
+            ):
+                raise RuntimeError("provider is closed")
+            existing = cast("AsyncOpenAI | None", getattr(self, "client", None))
+            if existing is not None:
+                return existing
+            task = getattr(self, "_client_init_task", None)
+            if task is None:
+                task = asyncio.create_task(self._initialise_client())
+                self._client_init_task = task
+                task.add_done_callback(self._client_initialisation_done)
+
+        return await asyncio.shield(task)
+
+    async def _get_or_create_pinned_transport(
+        self,
+        *,
+        allow_private: bool = False,
+    ) -> PinnedTransport:
+        if allow_private is not getattr(self, "_allow_private", False):
+            raise ValueError("provider private-network authority mismatch")
+        await self._ensure_client()
+        transport = self._pinned_transport
+        if transport is None:
+            raise RuntimeError("provider transport is unavailable")
+        return transport
 
     def _convert_messages(self, messages: list[ChatMessage]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -267,11 +600,6 @@ class OpenAICompatibleProvider(ModelProvider):
                     self._SEMAPHORES[key] = asyncio.Semaphore(limit)
         return self._SEMAPHORES[key]
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=20),
-        retry=retry_if_exception(_is_retryable_exception),
-    )
     async def chat(
         self,
         messages: list[ChatMessage],
@@ -317,9 +645,10 @@ class OpenAICompatibleProvider(ModelProvider):
                         logger.warning("Suppressed error", exc_info=True)
 
                     # Concurrency gate: prevent overwhelming the endpoint
+                    client = await self._ensure_client()
                     sem = await self._semaphore()
                     async with sem:
-                        response = await self.client.chat.completions.create(**kwargs)
+                        response = await client.chat.completions.create(**kwargs)
 
                     choice = response.choices[0]
                     message = choice.message
@@ -327,18 +656,22 @@ class OpenAICompatibleProvider(ModelProvider):
                     tool_calls: list[dict[str, Any]] = []
                     if message.tool_calls:
                         for tc in message.tool_calls:
-                            tool_calls.append({
-                                "id": tc.id,
-                                "type": tc.type,
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                },
-                            })
+                            tool_calls.append(
+                                {
+                                    "id": tc.id,
+                                    "type": tc.type,
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                            )
 
                     usage: dict[str, int] = {
                         "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                        "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+                        "completion_tokens": response.usage.completion_tokens
+                        if response.usage
+                        else 0,
                         "total_tokens": response.usage.total_tokens if response.usage else 0,
                         "cached_tokens": 0,
                     }
@@ -362,8 +695,32 @@ class OpenAICompatibleProvider(ModelProvider):
                         usage=usage,
                         finish_reason=choice.finish_reason or "stop",
                         reasoning_content=getattr(message, "reasoning_content", "") or "",
+                        usage_source=("provider_actual" if response.usage else "unavailable"),
                     )
                 except Exception as e:
+                    # Convert at the boundary before metrics/logging so a metrics
+                    # secondary failure cannot attach the raw provider exception
+                    # as ``__context__`` into logs / exc_info consumers.
+                    from js.models.capability import (
+                        reraise_safe_provider_error,
+                        safe_provider_error,
+                    )
+
+                    mapped: BaseException = e
+                    if isinstance(e, RuntimeError) and (
+                        "generator didn't stop after throw()" in str(e)
+                        or "generator didn't stop after athrow()" in str(e)
+                    ):
+                        mapped = RuntimeError(
+                            f"Connection to {self.config.name} was interrupted. "
+                            "The remote server may have closed the connection unexpectedly."
+                        )
+                    safe_error = safe_provider_error(
+                        mapped,
+                        api_key=self.response_secret_snapshot(),
+                        query_param_name=getattr(self.config, "query_param_name", None),
+                        retryable=is_retryable_provider_error(mapped),
+                    )
                     latency = time.perf_counter() - start
                     try:
                         get_metrics().model_latency_seconds.labels(
@@ -373,25 +730,25 @@ class OpenAICompatibleProvider(ModelProvider):
                             model=model, provider=self.config.name
                         ).inc()
                     except Exception:
-                        logger.warning("Suppressed error", exc_info=True)
-                    # Map cryptic async-generator protocol errors to something
-                    # users can understand. These usually come from httpx/openai
-                    # internals when a connection is cancelled or closed
-                    # unexpectedly.
-                    if isinstance(e, RuntimeError) and (
-                        "generator didn't stop after throw()" in str(e)
-                        or "generator didn't stop after athrow()" in str(e)
-                    ):
-                        raise RuntimeError(
-                            f"Connection to {self.config.name} was interrupted. "
-                            "The remote server may have closed the connection unexpectedly."
-                        ) from e
-                    raise
+                        logger.warning(
+                            "Suppressed metrics error after provider failure",
+                            exc_info=False,
+                        )
+                    reraise_safe_provider_error(safe_error)
 
         try:
-            return await self.circuit.execute(_do_chat())  # type: ignore[no-any-return]
-        except Exception:
-            raise
+            async with self._operation_lease():
+                return await self.circuit.execute(_do_chat())  # type: ignore[no-any-return]
+        except Exception as exc:
+            from js.models.capability import SafeProviderError
+
+            if isinstance(exc, SafeProviderError):
+                raise
+            _raise_as_safe_provider_error(
+                exc,
+                api_key=self.response_secret_snapshot(),
+                query_param_name=getattr(self.config, "query_param_name", None),
+            )
 
     async def chat_stream(
         self,
@@ -401,6 +758,28 @@ class OpenAICompatibleProvider(ModelProvider):
         temperature: float = 0.7,
         max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
+        async with self._operation_lease():
+            stream = self._chat_stream_with_lease(
+                messages=messages,
+                model=model,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            try:
+                async for token in stream:
+                    yield token
+            finally:
+                await stream.aclose()
+
+    async def _chat_stream_with_lease(
+        self,
+        messages: list[ChatMessage],
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[str, None]:
         if not await self.circuit.can_execute():
             raise RuntimeError(f"Circuit breaker OPEN for {self.config.name}")
 
@@ -418,69 +797,184 @@ class OpenAICompatibleProvider(ModelProvider):
 
         # Try to request usage in the final stream chunk (OpenAI-compatible).
         # Some providers don't support stream_options; we fallback gracefully.
-        stream_options_supported = True
-        kwargs["stream_options"] = {"include_usage": True}
+        stream_options_supported = bool(getattr(self, "_stream_options_supported", True))
+        if stream_options_supported:
+            kwargs["stream_options"] = {"include_usage": True}
 
         self._last_stream_usage = None
 
-        # Retry wrapper for stream initialization
-        last_error: BaseException | None = None
-        max_retries = getattr(self.config, 'max_retries', 3)
-        for attempt in range(max_retries):
+        try:
+            # Use ``async with`` so the stream is closed cleanly even if the
+            # async-for loop is cancelled or interrupted.
+            client = await self._ensure_client()
+            sem = await self._semaphore()
+            async with sem:
+                stream = await client.chat.completions.create(**kwargs)
+            async with stream as stream_ctx:
+                async for chunk in stream_ctx:
+                    if getattr(chunk, "usage", None):
+                        self._last_stream_usage = {
+                            "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                            "completion_tokens": chunk.usage.completion_tokens or 0,
+                            "total_tokens": chunk.usage.total_tokens or 0,
+                            "cached_tokens": 0,
+                        }
+                        details = getattr(chunk.usage, "prompt_tokens_details", None)
+                        if details:
+                            self._last_stream_usage["cached_tokens"] = (
+                                getattr(details, "cached_tokens", 0) or 0
+                            )
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            await self.circuit.record_success()
+            return
+        except Exception as exc:
+            if stream_options_supported and "stream_options" in str(exc):
+                self._stream_options_supported = False
+            if isinstance(exc, RuntimeError) and (
+                "generator didn't stop after throw()" in str(exc)
+                or "generator didn't stop after athrow()" in str(exc)
+            ):
+                exc = RuntimeError(
+                    f"Connection to {self.config.name} was interrupted. "
+                    "The remote server may have closed the connection unexpectedly."
+                )
+            await self.circuit.record_failure()
+            _raise_as_safe_provider_error(
+                exc,
+                api_key=self.response_secret_snapshot(),
+                query_param_name=getattr(self.config, "query_param_name", None),
+            )
+
+    async def chat_stream_events(
+        self,
+        messages: list[ChatMessage],
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        async with self._operation_lease():
+            stream = self._chat_stream_events_with_lease(
+                messages=messages,
+                model=model,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
             try:
-                # Use ``async with`` so the stream is closed cleanly even if
-                # the async-for loop is cancelled or interrupted. This helps
-                # avoid "generator didn't stop after throw()" errors from
-                # httpx/openai internals.
-                sem = await self._semaphore()
-                async with sem:
-                    stream = await self.client.chat.completions.create(**kwargs)
-                async with stream as stream_ctx:
-                    async for chunk in stream_ctx:
-                        # Capture usage from the final chunk when available
-                        if getattr(chunk, "usage", None):
-                            self._last_stream_usage = {
-                                "prompt_tokens": chunk.usage.prompt_tokens or 0,
-                                "completion_tokens": chunk.usage.completion_tokens or 0,
-                                "total_tokens": chunk.usage.total_tokens or 0,
-                                "cached_tokens": 0,
-                            }
-                            # Some providers include cached token details in stream usage
-                            details = getattr(chunk.usage, "prompt_tokens_details", None)
-                            if details:
-                                self._last_stream_usage["cached_tokens"] = getattr(details, "cached_tokens", 0) or 0
-                        if chunk.choices and chunk.choices[0].delta.content:
-                            yield chunk.choices[0].delta.content
-                await self.circuit.record_success()
-                return
-            except Exception as e:
-                # If the provider rejected stream_options, retry without it once
-                if stream_options_supported and attempt == 0 and "stream_options" in str(e):
-                    stream_options_supported = False
-                    kwargs.pop("stream_options", None)
-                    self._last_stream_usage = None
-                    continue
-                # Map cryptic async-generator protocol errors
-                if isinstance(e, RuntimeError) and (
-                    "generator didn't stop after throw()" in str(e)
-                    or "generator didn't stop after athrow()" in str(e)
-                ):
-                    last_error = RuntimeError(
-                        f"Connection to {self.config.name} was interrupted. "
-                        "The remote server may have closed the connection unexpectedly."
-                    )
-                    break
-                last_error = e
-                if not _is_retryable_exception(e):
-                    break
-                if attempt < max_retries - 1:
-                    wait = min(2 ** attempt, 30)
-                    logger.warning(f"Stream retry {attempt + 1} for {self.config.name} after {wait}s: {e}")
-                    await asyncio.sleep(wait)
-        await self.circuit.record_failure()
-        raise last_error or RuntimeError(f"Stream failed for {self.config.name}")
+                async for event in stream:
+                    yield event
+            finally:
+                await stream.aclose()
+
+    async def _chat_stream_events_with_lease(
+        self,
+        messages: list[ChatMessage],
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """OpenAI-compatible structured event stream.
+
+        Unlike the legacy ``chat_stream()`` (which only yields text fragments),
+        this exposes every protocol-level event the OpenAI streaming format
+        carries: text, reasoning content (DeepSeek-R1/QwQ/Kimi-K2-Thinking),
+        partial tool calls, the final usage summary, and a terminal
+        done / error marker. Each event is tagged with the provider name
+        and model id at the boundary so downstream consumers can attribute
+        them without bookkeeping.
+        """
+        from js.models.stream_events import StreamEvent, parse_openai_chunk
+
+        if not await self.circuit.can_execute():
+            yield StreamEvent(
+                kind="error",
+                error=f"Circuit breaker OPEN for {self.config.name}",
+                provider=self.config.name,
+                model=model,
+            )
+            return
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": self._convert_messages(messages),
+            "temperature": temperature,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+
+        stream_options_supported = bool(getattr(self, "_stream_options_supported", True))
+        if not stream_options_supported:
+            kwargs.pop("stream_options", None)
+        done_emitted = False
+        try:
+            client = await self._ensure_client()
+            sem = await self._semaphore()
+            async with sem:
+                stream = await client.chat.completions.create(**kwargs)
+            async with stream as stream_ctx:
+                async for chunk in stream_ctx:
+                    for ev in parse_openai_chunk(chunk):
+                        ev.provider = self.config.name
+                        if not ev.model:
+                            ev.model = model
+                        if ev.kind == "done":
+                            done_emitted = True
+                        yield ev
+            await self.circuit.record_success()
+            if not done_emitted:
+                yield StreamEvent(
+                    kind="done",
+                    finish_reason="stop",
+                    provider=self.config.name,
+                    model=model,
+                )
+            return
+        except Exception as exc:
+            from js.models.capability import safe_provider_error
+
+            compatibility_retry = stream_options_supported and "stream_options" in str(exc)
+            if compatibility_retry:
+                self._stream_options_supported = False
+            if isinstance(exc, RuntimeError) and (
+                "generator didn't stop after throw()" in str(exc)
+                or "generator didn't stop after athrow()" in str(exc)
+            ):
+                exc = RuntimeError(
+                    f"Connection to {self.config.name} was interrupted. "
+                    "The remote server may have closed the connection unexpectedly."
+                )
+            await self.circuit.record_failure()
+            # First exit: convert to SafeProviderError so stream consumers only
+            # see scrubbed text (not a raw credential-bearing SDK exception).
+            safe = safe_provider_error(
+                exc,
+                api_key=self.response_secret_snapshot(),
+                query_param_name=getattr(self.config, "query_param_name", None),
+                retryable=compatibility_retry or is_retryable_provider_error(exc),
+            )
+            yield StreamEvent(
+                kind="error",
+                error=str(safe),
+                provider=self.config.name,
+                model=model,
+                meta={
+                    "retryable": safe.retryable,
+                },
+            )
 
     async def health_check(self) -> bool:
+        async with self._operation_lease():
+            return await self._health_check_with_lease()
+
+    async def _health_check_with_lease(self) -> bool:
         # Fast path: return cached result without lock
         now = time.time()
         # Local providers change state frequently (model loading/unloading) -
@@ -502,7 +996,8 @@ class OpenAICompatibleProvider(ModelProvider):
                 # kwarg in all versions, so we use asyncio.wait_for instead.
                 # Local providers should respond very fast.
                 hc_timeout = 4.0 if self._is_local else 8.0
-                await asyncio.wait_for(self.client.models.list(), timeout=hc_timeout)
+                client = await self._ensure_client()
+                await asyncio.wait_for(client.models.list(), timeout=hc_timeout)
                 self._health_status = True
                 # Do NOT record health-check success to circuit — only real calls should
                 # affect the breaker. Otherwise routine health checks can keep the
@@ -519,7 +1014,7 @@ class OpenAICompatibleProvider(ModelProvider):
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception(_is_retryable_exception),
+        retry=retry_if_exception(is_retryable_provider_error),
     )
     async def embed(
         self,
@@ -527,6 +1022,10 @@ class OpenAICompatibleProvider(ModelProvider):
         model: str | None = None,
     ) -> list[list[float]]:
         """Generate embeddings for a batch of texts."""
+        endpoint = getattr(self, "_endpoint_snapshot", self.config.base_url)
+        hostname = (urlparse(endpoint).hostname or "").lower()
+        if not is_canonical_loopback_literal(hostname):
+            raise PermissionError("remote embedding is disabled")
         if not await self.circuit.can_execute():
             raise RuntimeError(f"Circuit breaker OPEN for {self.config.name}")
 
@@ -546,15 +1045,73 @@ class OpenAICompatibleProvider(ModelProvider):
         )
 
         async def _do_embed() -> list[list[float]]:
+            client = await self._ensure_client()
             sem = await self._semaphore()
             async with sem:
-                response = await self.client.embeddings.create(
+                response = await client.embeddings.create(
                     model=resolved_model,
                     input=texts,
                 )
             return [item.embedding for item in response.data]
 
-        return await self.circuit.execute(_do_embed())  # type: ignore[no-any-return]
+        async with self._operation_lease():
+            return await self.circuit.execute(_do_embed())  # type: ignore[no-any-return]
 
     async def close(self) -> None:
-        await self.client.close()
+        condition = self._get_lifecycle_condition()
+        async with condition:
+            task = getattr(self, "_close_task", None)
+            if getattr(self, "_lifecycle_state", "OPEN") == "CLOSED":
+                return
+            if task is None or task.done():
+                self._lifecycle_state = "CLOSING"
+                self._closed = True
+                task = asyncio.create_task(self._finish_close())
+                self._close_task = task
+                task.add_done_callback(self._close_task_done)
+        await asyncio.shield(task)
+
+    @staticmethod
+    def _close_task_done(task: asyncio.Task[None]) -> None:
+        """Retrieve background close failures without changing await semantics."""
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    async def _finish_close(self) -> None:
+        condition = self._get_lifecycle_condition()
+        client: AsyncOpenAI | None = None
+        try:
+            async with condition:
+                while getattr(self, "_active_operations", 0):
+                    await condition.wait()
+
+            init_task = getattr(self, "_client_init_task", None)
+            if init_task is not None:
+                try:
+                    await asyncio.shield(init_task)
+                except BaseException:
+                    pass
+
+            lock = getattr(self, "_client_lock", None)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._client_lock = lock
+            async with lock:
+                client = getattr(self, "client", None)
+            if client is not None:
+                await client.close()
+            async with lock:
+                if getattr(self, "client", None) is client:
+                    self.client = None
+                    self._http_client = None
+                    self._pinned_transport = None
+                    self._validated_ips = ()
+        except BaseException:
+            async with condition:
+                condition.notify_all()
+            raise
+        async with condition:
+            self._lifecycle_state = "CLOSED"
+            condition.notify_all()

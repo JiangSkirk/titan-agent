@@ -389,16 +389,26 @@ _Dreams are processed memories. Each entry represents a consolidation cycle._
             owner_key_hash=owner_key_hash,
         )
 
-    async def dream(self, llm_summarizer: Any | None = None) -> dict[str, Any]:
-        """Run memory consolidation (dreaming cycle)."""
+    async def dream(
+        self,
+        llm_summarizer: Any | None = None,
+        *,
+        propagate_summarizer_errors: bool = False,
+    ) -> dict[str, Any]:
+        """Run memory consolidation, optionally surfacing summarizer failures."""
         if hasattr(self, "enhanced"):
-            return await self.enhanced.dream(llm_summarizer=llm_summarizer)
+            return await self.enhanced.dream(
+                llm_summarizer=llm_summarizer,
+                propagate_summarizer_errors=propagate_summarizer_errors,
+            )
         return {"phases": []}
 
-    def get_dream_logs(self, limit: int = 20) -> list[dict[str, Any]]:
-        """Get recent dream logs."""
+    def get_dream_logs(
+        self, limit: int = 20, owner_key_hash: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Get recent dream logs for one owner."""
         if hasattr(self, "enhanced"):
-            return self.enhanced.get_dream_logs(limit)
+            return self.enhanced.get_dream_logs(limit, owner_key_hash=owner_key_hash)
         return []
 
     def get_episodes(self, limit: int = 20, owner_key_hash: str | None = None) -> list[Any]:
@@ -682,9 +692,9 @@ _Dreams are processed memories. Each entry represents a consolidation cycle._
 
     _VALID_MEMORY_FILES = {"identity", "user", "dreams"}
 
-    def list_memory_files(self) -> list[str]:
+    def list_memory_files(self, owner_key_hash: str | None = None) -> list[str]:
         """List available memory files (basename without extension)."""
-        memory_dir = self.state_dir / "memory"
+        memory_dir = self._memory_file_path("profile", owner_key_hash).parent
         if not memory_dir.exists():
             return []
         files = []
@@ -692,20 +702,15 @@ _Dreams are processed memories. Each entry represents a consolidation cycle._
             files.append(path.stem)
         return files
 
-    def _memory_file_path(self, name: str) -> Path:
+    def _memory_file_path(self, name: str, owner_key_hash: str | None = None) -> Path:
         """Resolve memory file path, guarding against path traversal."""
-        safe_name = Path(name).name
-        if not safe_name or safe_name.startswith(".") or safe_name == "..":
-            raise ValueError(f"Invalid memory file name: {name}")
-        target = (self.state_dir / "memory" / f"{safe_name}.md").resolve()
-        base = (self.state_dir / "memory").resolve()
-        if not str(target).startswith(str(base)):
-            raise ValueError(f"Memory file path escapes allowed directory: {name}")
-        return target
+        from js.memory.profile_scope import scoped_profile_path
 
-    def read_memory_file(self, name: str) -> str:
+        return scoped_profile_path(self.state_dir, name, owner_key_hash)
+
+    def read_memory_file(self, name: str, owner_key_hash: str | None = None) -> str:
         """Read a memory file's content. Returns empty string if not found."""
-        path = self._memory_file_path(name)
+        path = self._memory_file_path(name, owner_key_hash)
         if not path.exists():
             return ""
         return path.read_text(encoding="utf-8")
@@ -735,8 +740,81 @@ _Dreams are processed memories. Each entry represents a consolidation cycle._
             return self.enhanced.get_conflicting_memories(limit, owner_key_hash=owner_key_hash)
         return []
 
-    def write_memory_file(self, name: str, content: str) -> None:
+    def write_memory_file(
+        self,
+        name: str,
+        content: str,
+        owner_key_hash: str | None = None,
+    ) -> None:
         """Write content to a memory file."""
-        path = self._memory_file_path(name)
+        path = self._memory_file_path(name, owner_key_hash)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+    # ── R6 compression pipeline (lazy, production-owned) ──
+
+    @property
+    def compression_pipeline(self) -> Any:
+        """Lazy R6 CompressionPipeline bound to memory_enhanced.db."""
+        cached = getattr(self, "_compression_pipeline", None)
+        if cached is not None:
+            return cached
+        from js.memory.compression import CompressionPipeline
+
+        cached = CompressionPipeline(self.enhanced.db_path)
+        self._compression_pipeline = cached
+        return cached
+
+    def create_compression_proposal(
+        self,
+        *,
+        authority: Any,
+        source_refs: tuple[Any, ...],
+        proposed_summary: str,
+    ) -> Any:
+        return self.compression_pipeline.create_proposal(
+            authority=authority,
+            source_refs=source_refs,
+            proposed_summary=proposed_summary,
+        )
+
+    def approve_compression_proposal(
+        self,
+        proposal_id: str,
+        *,
+        authority: Any,
+    ) -> Any:
+        return self.compression_pipeline.approve_proposal(
+            proposal_id, authority=authority,
+        )
+
+    def reject_compression_proposal(
+        self,
+        proposal_id: str,
+        *,
+        authority: Any,
+    ) -> Any:
+        return self.compression_pipeline.reject_proposal(
+            proposal_id, authority=authority,
+        )
+
+    def list_compression_proposals(
+        self,
+        *,
+        scope: Any,
+        status: str = "pending",
+        limit: int = 50,
+    ) -> Any:
+        return self.compression_pipeline.list_proposals(
+            scope=scope, status=status, limit=limit,
+        )
+
+    def rehydrate_compression_capsule(
+        self,
+        capsule_id: str,
+        *,
+        authority: Any,
+    ) -> Any:
+        return self.compression_pipeline.rehydrate_capsule(
+            capsule_id, authority=authority,
+        )

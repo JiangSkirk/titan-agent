@@ -42,16 +42,16 @@ export function renderCronJobs(jobs) {
     const nextRun = job.next_run_at ? new Date(job.next_run_at * 1000).toLocaleString('zh-CN', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '-';
     const isEnabled = job.enabled;
     return `<tr class="hover:bg-gray-800/50">
-      <td class="p-3"><span class="${statusColor} text-xs">● ${job.status}</span></td>
+      <td class="p-3"><span class="${statusColor} text-xs">● ${escapeHtml(String(job.status || ''))}</span></td>
       <td class="p-3">${escapeHtml(job.name)}</td>
       <td class="p-3 text-gray-400 text-xs">${escapeHtml(job.schedule_summary || job.cron_expr)}</td>
-      <td class="p-3 text-xs"><span class="bg-gray-800 px-2 py-0.5 rounded">${job.task_type}</span></td>
+      <td class="p-3 text-xs"><span class="bg-gray-800 px-2 py-0.5 rounded">${escapeHtml(String(job.task_type || ''))}</span></td>
       <td class="p-3 text-gray-400 text-xs">${nextRun}</td>
       <td class="p-3 text-xs">${job.run_count} / ${job.fail_count}</td>
       <td class="p-3 text-right">
-        <button onclick="runCronJob('${job.id}')" class="text-xs text-blue-400 hover:text-blue-300 mr-2" title="立即执行"><i class="fas fa-play"></i></button>
-        <button onclick="toggleCronJob('${job.id}', ${!isEnabled})" class="text-xs ${isEnabled ? 'text-yellow-400' : 'text-green-400'} hover:opacity-80 mr-2" title="${isEnabled ? '暂停' : '启用'}"><i class="fas fa-${isEnabled ? 'pause' : 'play'}"></i></button>
-        <button onclick="deleteCronJob('${job.id}')" class="text-xs text-red-400 hover:text-red-300" title="删除"><i class="fas fa-trash"></i></button>
+        <button onclick="runCronJob('${escapeHtml(String(job.id || ''))}')" class="text-xs text-blue-400 hover:text-blue-300 mr-2" title="立即执行"><i class="fas fa-play"></i></button>
+        <button onclick="toggleCronJob('${escapeHtml(String(job.id || ''))}', ${!isEnabled})" class="text-xs ${isEnabled ? 'text-yellow-400' : 'text-green-400'} hover:opacity-80 mr-2" title="${isEnabled ? '暂停' : '启用'}"><i class="fas fa-${isEnabled ? 'pause' : 'play'}"></i></button>
+        <button onclick="deleteCronJob('${escapeHtml(String(job.id || ''))}')" class="text-xs text-red-400 hover:text-red-300" title="删除"><i class="fas fa-trash"></i></button>
       </td>
     </tr>`;
   }).join('');

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -95,6 +96,13 @@ class TestSSRFCanaries:
 
 
 class TestDiscoverPolicy:
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
+
     def test_loopback_allowed_for_local_models(self) -> None:
         ips = resolve_and_validate("http://127.0.0.1:1234/v1", allow_loopback=True, allow_private=False)
         assert ips == ["127.0.0.1"]
@@ -107,7 +115,7 @@ class TestDiscoverPolicy:
     def test_private_allowed_when_opted_in(self) -> None:
         resolver = _fixed_resolver({"gpu.lan": ["192.168.1.50"]})
         ips = resolve_and_validate(
-            "http://gpu.lan:1234/v1", allow_loopback=True, allow_private=True, resolver=resolver
+            "https://gpu.lan:1234/v1", allow_loopback=True, allow_private=True, resolver=resolver
         )
         assert ips == ["192.168.1.50"]
 

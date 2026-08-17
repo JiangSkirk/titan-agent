@@ -1,5 +1,10 @@
 """Tests for search engines."""
 
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
+
+import httpx
 import pytest
 
 from js.search.engines import DuckDuckGoEngine, SearchManager, SearchResult
@@ -32,6 +37,59 @@ class TestDuckDuckGoEngine:
             pytest.skip("DuckDuckGo unavailable in this environment")
         finally:
             await engine.close()
+
+    @pytest.mark.asyncio
+    async def test_fixed_search_endpoint_is_resolved_and_connection_pinned(
+        self,
+        engine: DuckDuckGoEngine,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        resolved_urls: list[str] = []
+
+        def resolve(url: str, **_kwargs):
+            resolved_urls.append(url)
+            return ["93.184.216.34"]
+
+        response = httpx.Response(
+            200,
+            text="<html></html>",
+            request=httpx.Request("GET", "https://lite.duckduckgo.com/lite/"),
+        )
+        monkeypatch.setattr("js.search.engines.resolve_and_validate", resolve)
+        monkeypatch.setattr("js.search.engines.asyncio.sleep", AsyncMock())
+
+        class _Client:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+
+            async def __aenter__(self) -> Any:
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                return None
+
+            def stream(self, method: str, url: str, **kwargs: Any) -> Any:
+                class _CM:
+                    async def __aenter__(self) -> httpx.Response:
+                        return response
+
+                    async def __aexit__(self, *args: Any) -> None:
+                        return None
+
+                return _CM()
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        try:
+            with adjacent_network_consent(tmp_path):
+                await engine._search_via_lite("echo", 1)
+        finally:
+            await engine.close()
+
+        assert resolved_urls == ["https://lite.duckduckgo.com/lite/"]
 
     def test_parse_html_standard_layout(self, engine: DuckDuckGoEngine) -> None:
         html = """

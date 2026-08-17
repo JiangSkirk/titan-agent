@@ -186,7 +186,7 @@ export async function loadMemory() {
           <div class="bg-gray-800 rounded-lg px-3 py-2">
             <div class="flex items-center justify-between">
               <span class="text-xs font-mono text-cyan-400">${escapeHtml(w.key || 'unknown')}</span>
-              <span class="text-[10px] text-gray-500">${w.category || 'general'} · 重要性 ${w.importance || 0}</span>
+              <span class="text-[10px] text-gray-500">${escapeHtml(w.category || 'general')} · 重要性 ${escapeHtml(String(w.importance || 0))}</span>
             </div>
             <div class="text-sm text-gray-300 mt-0.5">${escapeHtml(w.value || '')}</div>
           </div>
@@ -504,7 +504,7 @@ function getSourceLabel(source) {
     import: '导入',
     manual: '手动',
   };
-  return map[source] || source || '未知';
+  return escapeHtml(map[source] || source || '未知');
 }
 
 export function renderSemanticMemoryItem(s) {
@@ -605,7 +605,7 @@ export async function showMemoryAudit(id) {
       return `
         <div class="border-l-2 border-gray-600 pl-2 mb-1">
           <div class="flex items-center gap-2">
-            <span class="text-gray-300">${actionMap[e.action] || e.action}</span>
+            <span class="text-gray-300">${escapeHtml(actionMap[e.action] || e.action)}</span>
             <span class="text-gray-500">${time}</span>
             <span class="text-gray-600">来源: ${getSourceLabel(e.source)}</span>
           </div>

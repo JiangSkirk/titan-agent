@@ -7,7 +7,7 @@
 #   ./scripts/macos_start.sh                # 启动 Web UI 并打开浏览器
 #   ./scripts/macos_start.sh setup -y       # 透传子命令给 js
 #   DRY_RUN=1 ./scripts/macos_start.sh      # 仅检查环境，不安装、不启动
-#   HOST=0.0.0.0 PORT=8080 ./scripts/macos_start.sh
+#   HOST=127.0.0.1 PORT=8080 ./scripts/macos_start.sh
 #
 set -euo pipefail
 
@@ -17,6 +17,14 @@ cd "$ROOT_DIR"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 DRY_RUN="${DRY_RUN:-0}"
+
+case "$HOST" in
+  127.0.0.1|::1) ;;
+  *)
+    echo "non-loopback bind is not allowed: $HOST" >&2
+    exit 1
+    ;;
+esac
 
 # ── 中文彩色日志（风格对齐 install.sh）──────────────────
 RED='\033[0;31m'
@@ -92,13 +100,12 @@ fi
 VENV_PY=".venv/bin/python"
 STAMP=".venv/.js-agent-installed"
 if [[ ! -f "$STAMP" || "pyproject.toml" -nt "$STAMP" ]]; then
-  log_step "安装/更新依赖（首次或 pyproject.toml 有变更时执行）..."
-  "$VENV_PY" -m pip install --upgrade pip
-  install_target=(-e ".")
-  if [[ "${INSTALL_DEV:-0}" == "1" ]]; then
-    install_target=(-e ".[dev]")
+  log_step "安装/更新依赖（uv sync --frozen --offline）..."
+  if ! command -v uv >/dev/null 2>&1; then
+    log_err "需要 uv 才能离线冻结安装依赖；拒绝在线 pip 范围解析。"
+    exit 1
   fi
-  "$VENV_PY" -m pip install "${install_target[@]}"
+  uv sync --frozen --offline
   "$VENV_PY" -m pip check
   touch "$STAMP"
   log_ok "依赖就绪"

@@ -1,6 +1,10 @@
 # JS Agent — 本地个人 Agent Harness
 
-> **⚠️ 当前版本: v0.1.3-alpha — API 可能变更，欢迎反馈！**
+> **当前版本: v0.1.5 本地 release candidate / 受控试用 — 欢迎反馈！**
+>
+> 包装版本是 `0.1.5`。集成分支名 `0.2.0-beta.1` 是工程轨道，不是包版本。
+>
+> 受控试用合同见 [docs/release/PUBLIC_BETA_CONTRACT.md](docs/release/PUBLIC_BETA_CONTRACT.md)。这不是 `stable_ready`，也不是公证发布。
 >
 > [English README](README_en.md)
 
@@ -26,7 +30,7 @@ JS Agent 不是聊天机器人，而是一套**本地个人 Agent Harness**—�
 
 ### 🛡️ 安全护栏（Defense in Depth）
 - **策略模式防御**: 工具调用防御不是硬编码 if-else，是可注入、可排序的策略对象
-- **Fail-Open 语义**: 安全子系统自身崩溃/故障时不阻断主系统（防止安全成为单点故障）
+- **Fail-Closed 语义**: Echo 授权与 ledger 在缺失、异常或不可验证时 fail-closed，不 bypass 主路径
 - **行为审计**: 完整记录每个工具调用，哈希链式日志可检测篡改/截断
 - **路径保护**: 防止误删系统文件，Workspace 外写操作需确认
 - **秘密管理**: 自动检测和屏蔽 API keys、tokens，持久化加密存储
@@ -69,7 +73,14 @@ JS Agent 不是聊天机器人，而是一套**本地个人 Agent Harness**—�
 手动安装：
 
 ```bash
+# 核心安装（不含 Office/PDF 重依赖）
 pip install -e .
+
+# 可选 extras：Excel 读写
+pip install -e ".[office]"   # openpyxl + pandas
+
+# 可选 extras：PDF 读取与生成
+pip install -e ".[pdf]"      # pypdf + pdfplumber + reportlab
 
 # 一键配置（自动检测 LM Studio / Ollama）
 js setup
@@ -108,9 +119,9 @@ pytest tests -q -p no:cacheprovider
 | 能力 | OpenClaw | Hermes | **JS Agent** |
 |------|----------|--------|-----------|
 | 运行时 | Node.js (3700 chunks) | Python + Node UI | **Python 3.12+ 统一** |
-| 安全 | 外部插件 (ClawAegis) | Tirith + 审批 | **内置 + 策略模式 + Fail-Open** |
+| 安全 | 外部插件 (ClawAegis) | Tirith + 审批 | **内置 + 策略模式 + Fail-Closed** |
 | 上下文压缩 | ❌ | ✅ 最强 | ✅ **Hermes 式压缩器 + 上下文胶囊** |
-| Checkpoint | ❌ | ✅ Git Shadow | ✅ **Git Shadow Repo** |
+| Checkpoint | ❌ | ✅ Git Shadow | ⚠️ **已移除 checkpoints，不随包发布** |
 | 配置缓存 | ❌ | ✅ Stat-based | ⚠️ 已移除 (YAGNI) |
 | 断路器 | ❌ | ❌ | ✅ **自动恢复探测** |
 | 模型发现 | ❌ 手动配置 | ❌ 手动配置 | ✅ **自动探测** |
@@ -193,6 +204,20 @@ Web 界面的 Skills 面板支持：
 - 点击展开查看完整内容
 - 在线安装/卸载/信任调整
 
+## Skill Promotion Gate（v0.1.5）
+
+自动 curator 与 evolver **不再**直接修改 skill 信任等级或覆盖 entry 文件。两者只会向 `skill_promotions.db` 写入 `proposed` 事件，由操作员显式批准后才会过 5 步门禁（`protected → validate → security → tests → smoke`，smoke 默认 30 s 超时）。门禁失败不修改任何状态，也不污染 `skill_usage` 统计。
+
+| 操作 | CLI | Web | 认证 |
+|---|---|---|---|
+| 查看待办列表 | `js skill promote list` | `GET /api/skills/promotions` | 普通认证 |
+| 查看事件详情 | `js skill promote show <event_id>` | `GET /api/skills/promotions/{event_id}` | 普通认证 |
+| 批准并执行门禁 | `js skill promote approve <event_id>` | `POST .../{event_id}/approve` | admin |
+| 拒绝（只改状态） | `js skill promote reject <event_id>` | `POST .../{event_id}/reject` | admin |
+| 回滚已 apply 的事件 | `js skill promote revert <event_id>` | `POST .../{event_id}/revert` | admin |
+
+排障入口：`event.details.failed_step` 指出在哪一步被拒；smoke 超时会额外携带 `details.timeout=True` 与 `details.smoke_error`。Web 响应里**不会**包含 `owner_key_hash`，owner 隔离由后端自动用 `memory_owner(auth)` 注入。详细操作员流程见 [`docs/deployment.md`](docs/deployment.md) 的 *Skill Promotion Operations* 段。
+
 ## 测试
 
 ```bash
@@ -225,8 +250,8 @@ pip install -e ".[dev]"
 python -m build
 
 # 产物位于 dist/
-#   js_agent-0.1.3-py3-none-any.whl
-#   js_agent-0.1.3.tar.gz
+#   js_agent-0.1.5-py3-none-any.whl
+#   js_agent-0.1.5.tar.gz
 ```
 
 ## 已知限制
@@ -235,20 +260,20 @@ python -m build
 - **LM Studio Embeddings**: 需手动在 LM Studio 中开启 Embedding 服务端点，否则自动降级为关键词匹配。
 - **Session Capsule Lite（实验性）**: 当前只提供查看、刷新、清空；失败会回退完整历史；不提供复杂编辑、跨会话长期规划或完整长期记忆保证。
 - **Auto-Fetch Pipeline (实验性)**: Gmail / Slack / Drive / Calendar / GitHub / Notion 连接器目前为 **mock / 实验性**实现，仅用于演示数据流架构。生产环境请使用文件系统连接器 (`file`) 或等待后续稳定版本。
+- **单工具输出预算**: 单次工具调用默认上限 20k 字符（`ToolLimits.tool_output_budget_chars`）。两条路径：`file_read` 在 `offset`/`limit` 分页之后若仍超额，返回空 `output` + `metadata.too_large=True` + 分页建议（`js/tools/files.py`）；其它工具走 registry 截断，`output` 截到预算长度并附 `[output truncated: N chars; ...]` 提示，同时打上 `metadata.truncated=True` / `metadata.original_len=N`（`js/tools/registry.py`）。两条路径都不会把完整大输出塞进 prompt。
+- **Task Review Capsule（MVP）**: 每次 run 结束会落地一条确定性的、owner 隔离的复盘记录（首条 user 消息、末条 assistant 消息、工具调用清单、token/turn 计数、退出状态），存于 `review_capsules.db`。**这是去 LLM 的确定性摘要，不是 LLM 反思或反馈学习。**
+- **Abnormal-Exit Recovery（仅状态标记，非自动续跑）**: 启动时如发现 `SessionLifecycleStore` 中存在心跳超时的 `running` session，会被标记为 `aborted`（`exit_reason="abnormal_exit_recovery"`）。**这只是状态标记，agent 不会自动重跑、重做工具或从 checkpoint 续上**；用户仍需手动开启新 run。Checkpoint 续跑 API 没有变化。
+- **可选 extras**: Office/PDF 工具依赖通过 `pip install -e ".[office]"` / `".[pdf]"` 单独安装；未安装时相关工具会以清晰错误退场，不影响核心 agent。
 
 ## 生产部署
 
-> 注意：绑定 `0.0.0.0` 会让服务暴露到 localhost 之外。生产、局域网或公网部署必须启用 API key；不要用 no-auth 配置对外监听。
+Public Beta 只绑定字面回环地址（`127.0.0.1` 或 `::1`）。非回环明文 HTTP
+（包括 `0.0.0.0`）会被拒绝启动；不要把它当作支持的部署方式。
+完整试用合同见 [docs/release/PUBLIC_BETA_CONTRACT.md](docs/release/PUBLIC_BETA_CONTRACT.md)。
 
 ```bash
-# Web UI
-js web --host 0.0.0.0 --port 8000
-
-# 或 Docker
-docker run -p 8000:8000 -e OPENAI_API_KEY=xxx js-agent
-
-# 或 Gunicorn + Uvicorn
-gunicorn "js.web:create_app()" -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+# Web UI（仅 loopback）
+js web --host 127.0.0.1 --port 8000
 ```
 
 ## License

@@ -9,6 +9,8 @@ IP before the actual HTTP request.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpcore
@@ -34,7 +36,7 @@ class TestResolveAndValidateReturnsIPs:
             return ["93.184.216.34"]  # example.com
 
         ips = resolve_and_validate(
-            "http://example.com/path",
+            "https://example.com/path",
             resolver=mock_resolver,
         )
         assert ips == ["93.184.216.34"]
@@ -45,7 +47,7 @@ class TestResolveAndValidateReturnsIPs:
             return ["1.2.3.4", "1.2.3.5"]
 
         ips = resolve_and_validate(
-            "http://example.com",
+            "https://example.com",
             resolver=mock_resolver,
         )
         assert ips == ["1.2.3.4", "1.2.3.5"]
@@ -56,7 +58,7 @@ class TestResolveAndValidateReturnsIPs:
             return ["127.0.0.1"]
 
         with pytest.raises(OutboundURLError, match="loopback"):
-            resolve_and_validate("http://evil.com", resolver=mock_resolver)
+            resolve_and_validate("https://evil.com", resolver=mock_resolver)
 
     def test_rejects_metadata_ip_even_with_mock_resolver(self) -> None:
         """Cloud metadata addresses are always rejected."""
@@ -64,7 +66,7 @@ class TestResolveAndValidateReturnsIPs:
             return ["169.254.169.254"]
 
         with pytest.raises(OutboundURLError, match="metadata"):
-            resolve_and_validate("http://evil.com", resolver=mock_resolver)
+            resolve_and_validate("https://evil.com", resolver=mock_resolver)
 
 
 class TestPinnedIPBackend:
@@ -144,6 +146,13 @@ class TestCreatePinnedClient:
 class TestDNSRebindingDefense:
     """End-to-end: validated IP is actually used for the connection."""
 
+    @pytest.fixture(autouse=True)
+    def _b2c_network_consent(self, tmp_path: Path) -> Iterator[None]:
+        from tests.test_b2c_non_model_egress import adjacent_network_consent
+
+        with adjacent_network_consent(tmp_path):
+            yield
+
     @pytest.mark.asyncio
     async def test_pinned_connection_uses_validated_ip(self) -> None:
         """Simulate a DNS-rebinding attack: hostname resolves to different
@@ -155,7 +164,7 @@ class TestDNSRebindingDefense:
             return ["1.2.3.4"]
 
         validated_ips = resolve_and_validate(
-            "http://rebinding-test.example/path",
+            "https://rebinding-test.example/path",
             resolver=first_resolve,
         )
         assert validated_ips == ["1.2.3.4"]
@@ -217,11 +226,21 @@ class TestDNSRebindingDefense:
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
 
-            mock_response = MagicMock()
-            mock_response.is_redirect = False
-            mock_response.text = "hello"
-            mock_response.raise_for_status = MagicMock()
-            mock_client.get = AsyncMock(return_value=mock_response)
+            mock_response = httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                content=b"hello",
+                request=httpx.Request("GET", "http://example.com/test"),
+            )
+
+            class _Stream:
+                async def __aenter__(self) -> httpx.Response:
+                    return mock_response
+
+                async def __aexit__(self, *args: object) -> None:
+                    return None
+
+            mock_client.stream = MagicMock(return_value=_Stream())
 
             await tool.fetch("http://example.com/test")
 
@@ -245,7 +264,7 @@ class TestDNSRebindingDefense:
 
         with (
             patch(
-                "js.security.net_guard.resolve_and_validate",
+                "js.security.net_guard.resolve_and_validate_provider_endpoint",
                 return_value=["1.2.3.4"],
             ) as mock_resolve,
             patch(
@@ -268,7 +287,7 @@ class TestDNSRebindingDefense:
             mock_client.get = AsyncMock(return_value=mock_response)
 
             await ProviderManager.discover_models(
-                "http://example.com/v1", api_key="test"
+                "https://example.com/v1", api_key="test"
             )
 
             mock_resolve.assert_called_once()
@@ -278,3 +297,47 @@ class TestDNSRebindingDefense:
             assert "transport" in call_kwargs
             transport = call_kwargs["transport"]
             assert hasattr(transport, "_pool") or isinstance(transport, MagicMock)
+
+    @pytest.mark.asyncio
+    async def test_provider_manager_pins_lmstudio_context_probe(self) -> None:
+        """The LM Studio v0 metadata probe must share the validated pinned transport."""
+        from js.models.provider_manager import ProviderManager
+
+        with (
+            patch(
+                "js.security.net_guard.resolve_and_validate",
+                return_value=["127.0.0.1"],
+            ),
+            patch("js.security.net_guard.PinnedTransport") as transport_class,
+            patch("httpx.AsyncClient") as client_class,
+        ):
+            transport = MagicMock()
+            transport_class.return_value = transport
+            client = AsyncMock()
+            client_class.return_value = client
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(return_value=None)
+
+            v0_response = MagicMock(status_code=200)
+            v0_response.json.return_value = {
+                "data": [
+                    {"id": "model-a", "state": "loaded", "max_context_length": 8192}
+                ]
+            }
+            v1_response = MagicMock(status_code=200)
+            v1_response.json.return_value = {"data": [{"id": "model-a"}]}
+            v1_response.raise_for_status = MagicMock()
+            client.get = AsyncMock(side_effect=[v0_response, v1_response])
+
+            result = await ProviderManager.discover_models(
+                "http://127.0.0.1:1234/v1",
+                api_key="test-key",
+            )
+
+            assert result["models"][0]["context_window"] == 8192
+            client_class.assert_called_once()
+            assert client_class.call_args.kwargs["transport"] is transport
+            assert [call.args[0] for call in client.get.await_args_list] == [
+                "http://127.0.0.1:1234/api/v0/models",
+                "http://127.0.0.1:1234/v1/models",
+            ]

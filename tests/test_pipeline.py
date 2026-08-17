@@ -179,7 +179,7 @@ class TestOrchestrator:
             enabled=True,
             poll_interval_minutes=60,
             sources={
-                "gmail": {"enabled": True, "mock_mode": True},
+                "gmail": {"enabled": True, "mock_mode": True, "experimental": True},
             },
         )
         mem = FakeMemoryStore()
@@ -220,3 +220,14 @@ class TestOrchestrator:
         orch = AutoFetchOrchestrator(config=cfg, memory_store=FakeMemoryStore(), state_dir=tmp_path)
         ctx = orch.get_context_string(max_chars=1000)
         assert ctx == ""
+
+    def test_experimental_connector_stays_disabled_without_flag(self, tmp_path: Path) -> None:
+        cfg = PipelineConfig(
+            enabled=True,
+            sources={"gmail": {"enabled": True, "mock_mode": True}},
+        )
+        orch = AutoFetchOrchestrator(
+            config=cfg, memory_store=FakeMemoryStore(), state_dir=tmp_path
+        )
+        assert orch._connectors == []
+

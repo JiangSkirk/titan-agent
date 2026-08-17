@@ -70,6 +70,11 @@ class MetricsCollector:
             "Total number of tool calls",
             ["tool_name"],
         )
+        self.tool_batches_total = Counter(
+            "tool_batches_total",
+            "Total number of tool call batches",
+            ["all_failed", "tool_count"],
+        )
         self.tool_errors_total = Counter(
             "tool_errors_total",
             "Total number of tool execution errors",
@@ -125,6 +130,11 @@ class MetricsCollector:
             "Skill success rate distribution",
             ["skill_id"],
             buckets=[0.0, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0],
+        )
+        self.skill_promotion_events_total = Counter(
+            "skill_promotion_events_total",
+            "Skill promotion gate decisions (pass/fail per step)",
+            ["decision", "failed_step"],
         )
         # Memory metrics
         self.memory_store_latency_seconds = Histogram(
@@ -194,10 +204,13 @@ def start_span(
                     except Exception:
                         logger.warning("Operation failed", exc_info=True)
             yield span
-    except Exception:
+    except Exception as exc:
         # Failing open: log but **never** suppress the original exception.
         # Using ``yield`` inside an ``except`` block of a @contextmanager
         # generator triggers ``RuntimeError: generator didn't stop after
         # throw()`` — we must re-raise instead.
-        logger.warning("Span cleanup failed", exc_info=True)
+        if isinstance(exc, PermissionError):
+            logger.debug("Span exited with expected permission error: %s", type(exc).__name__)
+        else:
+            logger.warning("Span cleanup failed", exc_info=True)
         raise

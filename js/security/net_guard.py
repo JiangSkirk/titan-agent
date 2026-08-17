@@ -36,9 +36,13 @@ import httpx
 __all__ = [
     "OutboundURLError",
     "resolve_and_validate",
+    "resolve_and_validate_provider_endpoint",
     "is_blocked_ip",
+    "is_canonical_loopback_literal",
     "PinnedIPBackend",
     "PinnedTransport",
+    "PinnedSyncTransport",
+    "validate_provider_url",
 ]
 
 # Hostnames that must never be reachable even when loopback/private is allowed.
@@ -60,6 +64,35 @@ _METADATA_ADDRESSES = frozenset(
         "fd00:ec2::254",
         "100.100.100.200",  # Alibaba Cloud metadata
     }
+)
+
+_PRIVATE_PROVIDER_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+    )
+)
+
+_ALWAYS_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "0.0.0.0/8",
+        "100.64.0.0/10",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.88.99.0/24",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "2001:db8::/32",
+        "fec0::/10",
+        "ff00::/8",
+    )
 )
 
 
@@ -85,6 +118,74 @@ def _default_resolver(host: str, port: int | None) -> list[str]:
     return addrs
 
 
+def is_canonical_loopback_literal(hostname: str) -> bool:
+    """Return True if *hostname* is a canonical literal loopback address.
+
+    Only bare IPv4 in 127.0.0.0/8 and bare IPv6 ``::1`` are recognised.
+    ``localhost``, ``0.0.0.0``, ``127.1``, integer/hex encodings, and any
+    domain containing ``localhost`` are NOT canonical literals and must go
+    through DNS resolution.
+    """
+    host = hostname.lower()
+    if host == "::1":
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        isinstance(addr, ipaddress.IPv4Address)
+        and addr.is_loopback
+        and host == str(addr)
+    )
+
+
+def validate_provider_url(url: str) -> str:
+    """Validate a provider base_url and return the normalised form.
+
+    Rejects URLs with userinfo, query, or fragment.  Rejects non-http/https
+    schemes.  Returns the URL unchanged if it passes validation.
+    """
+    if not isinstance(url, str) or not url or len(url) > 4096:
+        raise OutboundURLError("provider URL is invalid")
+    if "\\" in url or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in url):
+        raise OutboundURLError("provider URL contains forbidden characters")
+    if "?" in url:
+        raise OutboundURLError("URL must not contain a query string")
+    if "#" in url:
+        raise OutboundURLError("URL must not contain a fragment")
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        username = parsed.username
+        password = parsed.password
+        hostname = parsed.hostname
+        _port = parsed.port
+    except ValueError as exc:
+        raise OutboundURLError("provider URL host or port is invalid") from exc
+    if scheme not in ("http", "https"):
+        raise OutboundURLError("URL must start with http:// or https://")
+    if username is not None or password is not None:
+        raise OutboundURLError("URL must not contain userinfo")
+    if not parsed.netloc or not hostname:
+        raise OutboundURLError("URL has no host")
+    if "%" in hostname:
+        raise OutboundURLError("provider URL host must not contain a zone identifier")
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    if authority.startswith("["):
+        try:
+            bracketed = ipaddress.ip_address(hostname)
+        except ValueError as exc:
+            raise OutboundURLError("provider URL has an invalid IP literal") from exc
+        if not isinstance(bracketed, ipaddress.IPv6Address):
+            raise OutboundURLError("provider URL has an invalid IP literal")
+    if scheme == "http" and not is_canonical_loopback_literal(hostname):
+        raise OutboundURLError(
+            "HTTP is only allowed for canonical loopback addresses (127.0.0.0/8, ::1)"
+        )
+    return url
+
+
 def is_blocked_ip(
     addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
     *,
@@ -104,6 +205,11 @@ def is_blocked_ip(
 
     if str(addr) in _METADATA_ADDRESSES:
         return "cloud metadata address is blocked"
+    # Loopback is checked before reserved/private because IPv6 ::1 is
+    # both is_loopback and is_reserved; the loopback policy must take
+    # precedence so canonical ::1 is allowed when allow_loopback is set.
+    if addr.is_loopback:
+        return None if allow_loopback else "loopback address is blocked"
     if addr.is_link_local:
         return "link-local address is blocked"
     if addr.is_reserved:
@@ -112,12 +218,12 @@ def is_blocked_ip(
         return "multicast address is blocked"
     if addr.is_unspecified:
         return "unspecified address is blocked"
-    # Loopback is checked before the generic private check because ``is_private``
-    # is also True for loopback; an allowed loopback must not fall through.
-    if addr.is_loopback:
-        return None if allow_loopback else "loopback address is blocked"
-    if addr.is_private and not allow_private:
-        return "private/internal address is blocked"
+    if any(addr in network for network in _ALWAYS_BLOCKED_NETWORKS):
+        return "non-routable or special-purpose address is blocked"
+    if any(addr in network for network in _PRIVATE_PROVIDER_NETWORKS):
+        return None if allow_private else "private/internal address is blocked"
+    if not addr.is_global:
+        return "non-global address is blocked"
     return None
 
 
@@ -133,27 +239,36 @@ def resolve_and_validate(
     Raises :class:`OutboundURLError` if the scheme is unsupported, the host is
     missing/blocked, resolution fails, or *any* resolved address violates the
     policy (fail-closed: if one address is internal, the whole URL is rejected,
-    which defeats split-horizon DNS tricks).
+    which defeats split-horizon DNS tricks).  Provider-only URL shape rules
+    such as forbidding query strings live in
+    :func:`resolve_and_validate_provider_endpoint`; generic browser/search
+    callers intentionally retain their existing query semantics here.
 
     The returned IP list lets callers pin the connection to a validated address
     to defeat DNS-rebinding between this check and the actual request.
     """
-    parsed = urlparse(url)
-    scheme = parsed.scheme.lower()
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise OutboundURLError("URL host or port is invalid") from exc
     if scheme not in ("http", "https"):
         raise OutboundURLError("URL must start with http:// or https://")
 
-    hostname = parsed.hostname
     if not hostname:
         raise OutboundURLError("URL has no host")
 
     host_lower = hostname.lower().rstrip(".")
+    effective_allow_loopback = allow_loopback and is_canonical_loopback_literal(hostname)
+
     if host_lower in _BLOCKED_HOSTNAMES:
         raise OutboundURLError("metadata hostname is blocked")
 
     resolve = resolver or _default_resolver
     try:
-        resolved = resolve(hostname, parsed.port)
+        resolved = resolve(hostname, port)
     except OutboundURLError:
         raise
     except Exception as exc:  # noqa: BLE001 — resolution failure is fail-closed
@@ -168,12 +283,34 @@ def resolve_and_validate(
             addr = ipaddress.ip_address(ip_str)
         except ValueError as exc:
             raise OutboundURLError(f"resolver returned invalid address {ip_str!r}") from exc
-        reason = is_blocked_ip(addr, allow_loopback=allow_loopback, allow_private=allow_private)
+        reason = is_blocked_ip(
+            addr,
+            allow_loopback=effective_allow_loopback,
+            allow_private=allow_private,
+        )
         if reason is not None:
             raise OutboundURLError(f"blocked destination ({reason})")
         validated.append(ip_str)
 
     return validated
+
+
+def resolve_and_validate_provider_endpoint(
+    url: str,
+    *,
+    allow_private: bool = False,
+    resolver: Callable[[str, int | None], list[str]] | None = None,
+) -> list[str]:
+    """Apply the stricter model-provider endpoint policy and resolve safely."""
+    validate_provider_url(url)
+    hostname = urlparse(url).hostname or ""
+    literal_loopback = is_canonical_loopback_literal(hostname)
+    return resolve_and_validate(
+        url,
+        allow_loopback=literal_loopback,
+        allow_private=allow_private,
+        resolver=resolver,
+    )
 
 
 # ── DNS-rebinding defense: pin connections to validated IPs ──
@@ -199,7 +336,7 @@ class PinnedIPBackend(httpcore.AsyncNetworkBackend):
         backend: httpcore.AsyncNetworkBackend | None = None,
     ) -> None:
         self.pinned_ip = pinned_ip
-        self._backend = backend or httpcore.AsyncNetworkBackend()
+        self._backend = backend or httpcore.AnyIOBackend()
 
     async def connect_tcp(
         self,
@@ -258,6 +395,9 @@ class PinnedTransport(httpx.AsyncHTTPTransport):
         pinned_ip: str,
         **kwargs: typing.Any,
     ) -> None:
+        # Client(trust_env=False) does not override a custom transport's
+        # SSLContext construction, so enforce the no-environment invariant here.
+        kwargs["trust_env"] = False
         super().__init__(**kwargs)
         # Replace the pool created by the parent with one that pins to the
         # validated IP.  We do not aclose the old pool here (__init__ is sync);
@@ -292,3 +432,69 @@ def create_pinned_client(
     if not validated_ips:
         raise OutboundURLError("no validated IPs to pin to")
     return httpx.AsyncClient(transport=PinnedTransport(validated_ips[0]), **client_kwargs)
+
+
+class PinnedSyncTransport(httpx.HTTPTransport):
+    """Synchronous HTTPTransport that pins TCP connections to a pre-validated IP.
+
+    Used by synchronous clients (e.g. :class:`js.memory.embeddings.LLMEmbedder`)
+    so they share the same DNS-rebinding defense as async clients.
+    """
+
+    def __init__(
+        self,
+        pinned_ip: str,
+        **kwargs: typing.Any,
+    ) -> None:
+        kwargs["trust_env"] = False
+        super().__init__(**kwargs)
+        self._pinned_ip = pinned_ip
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=getattr(self._pool, "_ssl_context", None),
+            max_connections=getattr(self._pool, "_max_connections", None),
+            max_keepalive_connections=getattr(
+                self._pool, "_max_keepalive_connections", None
+            ),
+            keepalive_expiry=getattr(self._pool, "_keepalive_expiry", None),
+            http1=getattr(self._pool, "_http1", True),
+            http2=getattr(self._pool, "_http2", False),
+            local_address=getattr(self._pool, "_local_address", None),
+            retries=getattr(self._pool, "_retries", 0),
+            socket_options=getattr(self._pool, "_socket_options", None),
+            network_backend=_PinnedSyncIPBackend(pinned_ip),
+        )
+
+
+class _PinnedSyncIPBackend(httpcore.NetworkBackend):
+    """Synchronous network backend that forces TCP connections to a pinned IP."""
+
+    def __init__(
+        self,
+        pinned_ip: str,
+        backend: httpcore.NetworkBackend | None = None,
+    ) -> None:
+        self.pinned_ip = pinned_ip
+        self._backend = backend or httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: typing.Iterable[typing.Any] | None = None,
+    ) -> httpcore.NetworkStream:
+        return self._backend.connect_tcp(
+            self.pinned_ip, port, timeout, local_address, socket_options
+        )
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: typing.Iterable[typing.Any] | None = None,
+    ) -> httpcore.NetworkStream:
+        return self._backend.connect_unix_socket(path, timeout, socket_options)
+
+    def sleep(self, seconds: float) -> None:
+        return self._backend.sleep(seconds)

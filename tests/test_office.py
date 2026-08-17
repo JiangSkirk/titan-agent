@@ -46,11 +46,9 @@ class TestOfficeTools:
 
     @pytest.mark.asyncio
     async def test_csv_encoding_gbk(self, office: OfficeTools, tmp_path: Path) -> None:
-        """Write Chinese content with GBK encoding and read it back."""
-        result = await office.csv_write("chinese.csv", data='[["姓名","年龄"],["张三",30]]', encoding="utf-8")
-        assert result.success
-
-        result = await office.csv_read("chinese.csv", encoding="utf-8")
+        """Generic JS Agent keeps Python codec support for legacy Chinese CSVs."""
+        (tmp_path / "chinese.csv").write_bytes("姓名,年龄\n张三,30\n".encode("gbk"))
+        result = await office.csv_read("chinese.csv", encoding="gbk")
         assert result.success
         assert "张三" in result.output
 
@@ -140,6 +138,32 @@ class TestOfficeTools:
         result = await office.excel_read("append.xlsx")
         rows = __import__("json").loads(result.output)
         assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_excel_write_rejects_symlink_target(
+        self, office: OfficeTools, tmp_path: Path
+    ) -> None:
+        real = tmp_path / "real.xlsx"
+        await office.excel_create("real.xlsx")
+        link = tmp_path / "link.xlsx"
+        link.symlink_to(real)
+        result = await office.excel_write("link.xlsx", data='[["hijack"]]', start_cell="A1")
+        assert not result.success
+        assert "symlink" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_pdf_generate_rejects_symlink_target(
+        self, office: OfficeTools, tmp_path: Path
+    ) -> None:
+        real = tmp_path / "real.pdf"
+        real.write_bytes(b"%PDF-1.4\n")
+        link = tmp_path / "link.pdf"
+        link.symlink_to(real)
+        data = '[["Product", "Price"], ["Apple", 1.5]]'
+        result = await office.pdf_generate("link.pdf", title="Sales", data=data)
+        assert not result.success
+        assert "symlink" in result.error.lower()
+        assert real.read_bytes() == b"%PDF-1.4\n"
 
     # ------------------------------------------------------------------
     # PDF

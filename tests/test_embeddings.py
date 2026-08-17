@@ -47,7 +47,7 @@ class TestKeywordEmbedder:
 class TestLLMEmbedder:
     def test_health_reports_zero_failures_initially(self) -> None:
         # We don't call the real API; just verify the object state.
-        emb = LLMEmbedder(base_url="http://localhost:1234/v1", api_key="dummy")
+        emb = LLMEmbedder(base_url="http://127.0.0.1:1234/v1", api_key="dummy")
         h = emb.health()
         assert h.provider == "LLMEmbedder(text-embedding-3-small)"
         assert h.active is True

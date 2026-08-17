@@ -4,7 +4,11 @@ An AI agent harness, not a chatbot. JS Agent wraps your chosen model with persis
 
 The model is the engine. The harness is the complete frame that lets the engine work.
 
-> **Status**: v0.1.3-alpha — APIs may change. Feedback welcome!
+> **Status**: v0.1.5 local release candidate / controlled trial — feedback welcome!
+>
+> The package version is `0.1.5`. The integration branch name `0.2.0-beta.1` is an engineering track, not the package version.
+>
+> The controlled-trial contract is [docs/release/PUBLIC_BETA_CONTRACT.md](docs/release/PUBLIC_BETA_CONTRACT.md). It is not `stable_ready` and not a notarized release.
 
 ## Core Harness Capabilities
 
@@ -24,7 +28,7 @@ The model is the engine. The harness is the complete frame that lets the engine 
 
 ### 🛡️ Safety Guardrails (Defense in Depth)
 - **Strategy-pattern defense**: Tool-call defenses are injectable, ordered strategy objects—not hardcoded if-else chains
-- **Fail-Open semantics**: When the security subsystem itself crashes/fails, it does not block the main system (prevents security from becoming a single point of failure)
+- **Fail-Closed semantics**: Echo authorization and the durable ledger fail closed when missing, unhealthy, or unverifiable — side effects are not bypassed
 - **Behavior audit**: Immutable hash-chained audit log of every tool call; tampering/truncation detectable
 - **Path protection**: Prevents accidental deletion of system files; writes outside workspace require confirmation
 - **Secret management**: Auto-detects and redacts API keys, tokens, and passwords; stores them encrypted at rest
@@ -55,11 +59,30 @@ The model is the engine. The harness is the complete frame that lets the engine 
 - **Audit log**: Complete tool-call history with traceability
 - **Skill panel**: Install, uninstall, adjust trust levels, and view content online
 
+## Skill Promotion Gate (v0.1.5)
+
+Auto curator and evolver **no longer** mutate trust levels or overwrite entry files directly. Both record `proposed` events in `skill_promotions.db`, which an operator must explicitly approve. Approval runs a 5-step gate (`protected → validate → security → tests → smoke`, smoke bounded by a 30 s timeout). A failed gate changes nothing — no trust flip, no file overwrite, no `skill_usage` pollution.
+
+| Action | CLI | Web | Auth |
+|---|---|---|---|
+| List open proposals | `js skill promote list` | `GET /api/skills/promotions` | normal auth |
+| Show event detail | `js skill promote show <event_id>` | `GET /api/skills/promotions/{event_id}` | normal auth |
+| Approve + run gate | `js skill promote approve <event_id>` | `POST .../{event_id}/approve` | admin |
+| Reject (status only) | `js skill promote reject <event_id>` | `POST .../{event_id}/reject` | admin |
+| Roll back an applied event | `js skill promote revert <event_id>` | `POST .../{event_id}/revert` | admin |
+
+Troubleshooting starts at `event.details.failed_step` (one of `protected/validate/security/tests/smoke`); smoke timeouts also carry `details.timeout=True` and `details.smoke_error`. Web responses **never** expose `owner_key_hash` — isolation is enforced server-side via `memory_owner(auth)`. See [`docs/deployment.md`](docs/deployment.md) → *Skill Promotion Operations* for the full operator runbook.
+
 ## Quick Start
 
 ```bash
-# Install
-pip install -e ".[dev]"
+# Core install (no heavy Office/PDF deps)
+pip install -e .
+
+# Optional extras
+pip install -e ".[office]"  # openpyxl + pandas (Excel read/write)
+pip install -e ".[pdf]"     # pypdf + pdfplumber + reportlab (PDF read/generate)
+pip install -e ".[dev]"     # dev tooling
 
 # One-shot setup (auto-detects LM Studio / Ollama)
 js setup
@@ -79,9 +102,9 @@ js search "latest AI developments"
 | Capability | OpenClaw | Hermes | **JS Agent** |
 |---|---|---|---|
 | Runtime | Node.js (3700 chunks) | Python + Node UI | **Unified Python 3.12** |
-| Security | External plugin (ClawAegis) | Tirith + approval | **Built-in + Strategy pattern + Fail-Open** |
+| Security | External plugin (ClawAegis) | Tirith + approval | **Built-in + Strategy pattern + Fail-Closed** |
 | Context Compression | ❌ | ✅ Best-in-class | ✅ **Hermes-style compressor + Context capsules** |
-| Checkpoint | ❌ | ✅ Git Shadow | ✅ **Git Shadow Repo** |
+| Checkpoint | ❌ | ✅ Git Shadow | ⚠️ **Checkpoints removed — not shipped in this package** |
 | Circuit Breaker | ❌ | ❌ | ✅ **Auto-recovery probes** |
 | Model Discovery | ❌ Manual | ❌ Manual | ✅ **Auto-detection** |
 | Search | ❌ Plugin needed | Tavily (config needed) | ✅ **DuckDuckGo out-of-box** |
@@ -108,20 +131,21 @@ The release gate covers lint, typing, full tests, mock benchmarks, and release s
 
 - **Session Capsule Lite is experimental**: the API/UI currently support view, refresh, and clear only. Failures fall back to full history; it does not provide complex editing, cross-session planning, or full long-term memory guarantees.
 - **Auto-Fetch Pipeline is experimental**: Gmail / Slack / Drive / Calendar / GitHub / Notion connectors are mock/experimental for architecture demos.
+- **Tool output budget**: each tool call is capped at `ToolLimits.tool_output_budget_chars` (default 20k chars). Two code paths handle oversize: `file_read` checks after `offset`/`limit` paging — if still oversize it returns empty `output` with `metadata.too_large=True` plus a paging suggestion (`js/tools/files.py`); all other tools fall through to the registry, which truncates `output` to the budget, appends an `[output truncated: N chars; ...]` notice and sets `metadata.truncated=True` / `metadata.original_len=N` (`js/tools/registry.py`). Neither path stuffs the full payload into the prompt.
+- **Task Review Capsule (deterministic MVP)**: each run persists an owner-scoped, deterministic record (first user message, last assistant message, tool-call summary, token/turn counts, exit status) to `review_capsules.db`. **This is a deterministic post-run summary, not an LLM-generated reflection or learning signal.**
+- **Abnormal-exit recovery is a status marker, not auto-resume**: on startup, sessions whose heartbeat has gone stale are marked `aborted` with `exit_reason="abnormal_exit_recovery"`. **The agent does not automatically re-run, re-tool, or continue an aborted session from its last checkpoint.** Users still need to start a new run; the existing checkpoint-resume APIs are unchanged.
+- **Optional extras**: Office/PDF tools require `pip install -e ".[office]"` / `".[pdf]"`; without them the related tools fail with a clear error and core agent still works.
 
 ## Production Deployment
 
-> Note: binding to `0.0.0.0` exposes the service beyond localhost. Production, LAN, or public deployments must require an API key; never expose no-auth mode outside the local machine.
+Public Beta binds only literal loopback addresses (`127.0.0.1` or `::1`).
+Cleartext non-loopback HTTP, including `0.0.0.0`, is refused at startup and
+is not a supported deployment mode. The full trial contract is
+[docs/release/PUBLIC_BETA_CONTRACT.md](docs/release/PUBLIC_BETA_CONTRACT.md).
 
 ```bash
-# Web UI
-js web --host 0.0.0.0 --port 8000
-
-# Or Docker
-docker run -p 8000:8000 -e OPENAI_API_KEY=xxx js-agent
-
-# Or Gunicorn + Uvicorn
-gunicorn "js.web:create_app()" -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+# Web UI (loopback only)
+js web --host 127.0.0.1 --port 8000
 ```
 
 ## License

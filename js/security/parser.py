@@ -343,9 +343,27 @@ def extract_redirect_targets(ast: ChainedCommands) -> list[str]:
 
 
 def has_subshell(ast: ChainedCommands) -> bool:
-    """Check whether the command line contains any subshell expression."""
-    raw = str(ast)
-    return "$(" in raw or "`" in raw
+    """Check whether the command line contains any subshell expression.
+
+    Inspects parsed arguments and redirection targets rather than
+    ``str(ast)``.  Process substitution ``<(...)`` / ``>(...)`` is recorded
+    by the tokenizer as a redirect whose target starts with ``(``.
+    """
+    for item in ast.commands:
+        if isinstance(item, PipeNode):
+            commands = item.stages
+        elif isinstance(item, CommandNode):
+            commands = [item]
+        else:
+            continue
+        for command in commands:
+            for arg in command.args:
+                if "$(" in arg or "`" in arg:
+                    return True
+            for redirect in command.redirects:
+                if redirect.target.startswith("("):
+                    return True
+    return False
 
 
 def _basename(path: str) -> str:
