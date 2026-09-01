@@ -14,9 +14,10 @@ from typing import Any, cast
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "js" / "echo" / "mode_contract.py"
+MODULE_PATH = ROOT / "packages" / "echo-core" / "echo_core" / "mode_contract.py"
 CHANGE_INVENTORY_ALLOWED_FILES = {
     "js/echo/mode_contract.py",
+    "packages/echo-core/echo_core/mode_contract.py",
     "tests/echo/test_r1_client_task_adapter.py",
     "tests/echo/test_r1_mode_contract.py",
     "tests/echo/test_r1_mode_manifest.py",
@@ -28,7 +29,7 @@ def contract() -> Any:
 
 
 def module_source() -> str:
-    assert MODULE_PATH.exists(), "js.echo.mode_contract must exist"
+    assert MODULE_PATH.exists(), "echo_core.mode_contract must exist"
     return MODULE_PATH.read_text(encoding="utf-8")
 
 
@@ -81,7 +82,9 @@ class AlwaysEqual:
 def test_task_ref_constructor_and_mode_field_are_strict_mypy_friendly() -> None:
     source = module_source()
     tree = ast.parse(source)
-    task_ref = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TaskRef")
+    task_ref = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TaskRef"
+    )
 
     dataclass_decorator = next(
         dec
@@ -100,7 +103,10 @@ def test_task_ref_constructor_and_mode_field_are_strict_mypy_friendly() -> None:
         if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
     }
     assert field_annotations["mode"] == "AppMode"
-    assert "AppMode | str" not in source.split("class TaskRef:", maxsplit=1)[1].split("def __init__", maxsplit=1)[0]
+    assert (
+        "AppMode | str"
+        not in source.split("class TaskRef:", maxsplit=1)[1].split("def __init__", maxsplit=1)[0]
+    )
 
     overload_inits = [
         stmt
@@ -127,7 +133,9 @@ def test_task_ref_constructor_and_mode_field_are_strict_mypy_friendly() -> None:
     real_mode = next(arg for arg in real_init.args.kwonlyargs if arg.arg == "mode")
     assert ast.unparse(real_mode.annotation) == "AppMode | str"
 
-    typing_import = next(node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "typing")
+    typing_import = next(
+        node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "typing"
+    )
     assert {alias.name for alias in typing_import.names} in (
         {"Final", "TypeVar", "cast", "overload"},
         {"Final", "cast", "overload"},
@@ -140,7 +148,9 @@ def test_error_construction_is_strict_mypy_friendly() -> None:
     has_typevar = "_E = TypeVar('_E', bound='ModeContractError')" in source or (
         '_E = TypeVar("_E", bound="ModeContractError")' in source
     )
-    err_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_err"]
+    err_functions = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_err"
+    ]
     if err_functions:
         err_fn = err_functions[0]
         assert has_typevar
@@ -155,7 +165,18 @@ def test_app_mode_from_json_accepts_only_exact_builtin_personal_or_work() -> Non
     assert mod.app_mode_from_json("personal") is mod.AppMode.PERSONAL
     assert mod.app_mode_from_json("work") is mod.AppMode.WORK
 
-    bad_values = ["js-agent", "js-work", "Personal", "WORK", "", None, True, 1, AlwaysEqual(), MyStr("work")]
+    bad_values = [
+        "js-agent",
+        "js-work",
+        "Personal",
+        "WORK",
+        "",
+        None,
+        True,
+        1,
+        AlwaysEqual(),
+        MyStr("work"),
+    ]
     for value in bad_values:
         with pytest.raises(mod.ModeMappingError) as caught:
             mod.app_mode_from_json(value)
@@ -227,7 +248,19 @@ def test_mode_from_product_id_is_strict_compat_helper() -> None:
     assert mod.mode_from_product_id("js-agent") is mod.AppMode.PERSONAL
     assert mod.mode_from_product_id("js-work") is mod.AppMode.WORK
 
-    for value in ("personal", "work", " js-work", "js-work ", "JS-WORK", "", None, True, 1, MyStr("js-work"), AlwaysEqual()):
+    for value in (
+        "personal",
+        "work",
+        " js-work",
+        "js-work ",
+        "JS-WORK",
+        "",
+        None,
+        True,
+        1,
+        MyStr("js-work"),
+        AlwaysEqual(),
+    ):
         with pytest.raises(mod.ModeMappingError) as caught:
             mod.mode_from_product_id(value)
         assert "js-work " not in str(caught.value)
@@ -244,11 +277,15 @@ def test_assert_mode_product_compatible_rejects_conflicts_and_bad_types() -> Non
     for value in (None, True, 1, [], {}, MyStr("js-work")):
         with pytest.raises(mod.ModeMappingError) as caught:
             mod.assert_mode_product_compatible(mode="work", product_id=value)
-        assert_error(caught.value, code="invalid_type", field="product_id", detail="product_id must be text")
+        assert_error(
+            caught.value, code="invalid_type", field="product_id", detail="product_id must be text"
+        )
 
     with pytest.raises(mod.ModeMappingError) as unknown:
         mod.assert_mode_product_compatible(mode="work", product_id="unknown-product")
-    assert_error(unknown.value, code="invalid_value", field="product_id", detail="unknown legacy product_id")
+    assert_error(
+        unknown.value, code="invalid_value", field="product_id", detail="unknown legacy product_id"
+    )
 
 
 def test_task_ref_from_dict_requires_exact_builtin_dict_root() -> None:
@@ -331,7 +368,9 @@ def test_task_ref_requires_all_canonical_fields_in_schema_order() -> None:
         payload.pop(field)
         with pytest.raises(mod.TaskRefValidationError) as caught:
             mod.TaskRef.from_dict(payload)
-        assert_error(caught.value, code="missing_field", field=field, detail="missing TaskRef field")
+        assert_error(
+            caught.value, code="missing_field", field=field, detail="missing TaskRef field"
+        )
 
     payload = base_payload()
     payload.pop("owner")
@@ -408,7 +447,9 @@ def test_direct_and_from_dict_shared_field_errors_are_identical_except_decoded_a
     assert direct_error.value.detail == from_dict_error.value.detail
 
 
-def test_from_dict_multi_error_order_unknown_wins_before_missing_schema_mode_and_field_types() -> None:
+def test_from_dict_multi_error_order_unknown_wins_before_missing_schema_mode_and_field_types() -> (
+    None
+):
     mod = contract()
     payload = {
         "schema_version": 2,
@@ -436,7 +477,9 @@ def test_from_dict_multi_error_order_missing_wins_before_schema_mode_and_field_t
 def test_from_dict_multi_error_order_schema_wins_before_mode_and_shared_field_validation() -> None:
     mod = contract()
     with pytest.raises(mod.TaskRefValidationError) as caught:
-        mod.TaskRef.from_dict(base_payload(schema_version=1.0, mode="bad-mode", owner=True, workspace="bad:path"))
+        mod.TaskRef.from_dict(
+            base_payload(schema_version=1.0, mode="bad-mode", owner=True, workspace="bad:path")
+        )
     assert_error(
         caught.value,
         code="invalid_type",
@@ -448,7 +491,9 @@ def test_from_dict_multi_error_order_schema_wins_before_mode_and_shared_field_va
 def test_from_dict_multi_error_order_mode_wins_before_shared_field_validation() -> None:
     mod = contract()
     with pytest.raises(mod.ModeMappingError) as caught:
-        mod.TaskRef.from_dict(base_payload(mode="bad-mode", owner=True, session=1, run=[], workspace=True))
+        mod.TaskRef.from_dict(
+            base_payload(mode="bad-mode", owner=True, session=1, run=[], workspace=True)
+        )
     assert_error(
         caught.value,
         code="invalid_value",
@@ -460,7 +505,10 @@ def test_from_dict_multi_error_order_mode_wins_before_shared_field_validation() 
 def test_post_init_shared_field_order_owner_session_run_workspace() -> None:
     mod = contract()
     bad = {"owner": True, "session": 1, "run": [], "workspace": True}
-    for factory in (lambda: make_direct(mod, **bad), lambda: mod.TaskRef.from_dict(base_payload(**bad))):
+    for factory in (
+        lambda: make_direct(mod, **bad),
+        lambda: mod.TaskRef.from_dict(base_payload(**bad)),
+    ):
         with pytest.raises(mod.TaskRefValidationError) as caught:
             factory()
         assert_error(caught.value, code="invalid_type", field="owner", detail="owner must be text")
@@ -470,7 +518,19 @@ def test_owner_uses_owner_specific_grammar_and_length() -> None:
     mod = contract()
     assert make_direct(mod, owner="o").owner == "o"
     assert make_direct(mod, owner="a" * 192).owner == "a" * 192
-    for value in ("", " owner", "owner ", "a" * 193, "owner/a", "_owner", "-owner", "owner@example", "拥有者", "own\x00er", "e\u0301"):
+    for value in (
+        "",
+        " owner",
+        "owner ",
+        "a" * 193,
+        "owner/a",
+        "_owner",
+        "-owner",
+        "owner@example",
+        "拥有者",
+        "own\x00er",
+        "e\u0301",
+    ):
         with pytest.raises(mod.TaskRefValidationError):
             make_direct(mod, owner=value)
 
@@ -480,7 +540,19 @@ def test_session_uses_session_specific_grammar_and_length() -> None:
     assert make_direct(mod, session="s").session == "s"
     assert make_direct(mod, session="session/a:b-1_2.3").session == "session/a:b-1_2.3"
     assert make_direct(mod, session="a" * 192).session == "a" * 192
-    for value in ("", " session", "session ", "a" * 193, r"session\bad", 'session"bad', "session<bad", "s\x00", "会话", "e\u0301", "_session"):
+    for value in (
+        "",
+        " session",
+        "session ",
+        "a" * 193,
+        r"session\bad",
+        'session"bad',
+        "session<bad",
+        "s\x00",
+        "会话",
+        "e\u0301",
+        "_session",
+    ):
         with pytest.raises(mod.TaskRefValidationError):
             make_direct(mod, session=value)
 
@@ -490,7 +562,19 @@ def test_run_uses_run_specific_grammar_and_length() -> None:
     assert make_direct(mod, run="r").run == "r"
     assert make_direct(mod, run="run/a:b-1_2.3").run == "run/a:b-1_2.3"
     assert make_direct(mod, run="a" * 192).run == "a" * 192
-    for value in ("", " run", "run ", "a" * 193, r"run\bad", 'run"bad', "run<bad", "r\x00", "运行", "e\u0301", "_run"):
+    for value in (
+        "",
+        " run",
+        "run ",
+        "a" * 193,
+        r"run\bad",
+        'run"bad',
+        "run<bad",
+        "r\x00",
+        "运行",
+        "e\u0301",
+        "_run",
+    ):
         with pytest.raises(mod.TaskRefValidationError):
             make_direct(mod, run=value)
 
@@ -527,7 +611,12 @@ def test_work_workspace_accepts_only_v1_opaque_handle_without_colon() -> None:
         if value == "":
             assert_error(caught.value, code="workspace_mode_mismatch", field="workspace")
         else:
-            assert_error(caught.value, code="invalid_value", field="workspace", detail="workspace must be an opaque handle")
+            assert_error(
+                caught.value,
+                code="invalid_value",
+                field="workspace",
+                detail="workspace must be an opaque handle",
+            )
 
 
 def test_work_workspace_rejects_paths_uri_drive_and_dot_shapes() -> None:
@@ -549,7 +638,12 @@ def test_work_workspace_rejects_paths_uri_drive_and_dot_shapes() -> None:
     ):
         with pytest.raises(mod.TaskRefValidationError) as caught:
             make_direct(mod, workspace=value)
-        assert_error(caught.value, code="invalid_value", field="workspace", detail="workspace must be an opaque handle")
+        assert_error(
+            caught.value,
+            code="invalid_value",
+            field="workspace",
+            detail="workspace must be an opaque handle",
+        )
 
 
 def test_task_ref_to_dict_has_schema_version_and_no_legacy_product() -> None:
@@ -580,7 +674,10 @@ def test_task_ref_canonical_bytes_are_unique_rfc8785_identity() -> None:
         }
     )
     canonical = ref.canonical_bytes()
-    assert canonical == b'{"mode":"work","owner":"owner-a","run":"run-a","schema_version":1,"session":"session-a","workspace":"work-a"}'
+    assert (
+        canonical
+        == b'{"mode":"work","owner":"owner-a","run":"run-a","schema_version":1,"session":"session-a","workspace":"work-a"}'
+    )
     assert b"schema_version" in canonical
     assert b"product" not in canonical
     assert ref.canonical_bytes() == canonical
@@ -590,9 +687,9 @@ def test_task_ref_canonical_hash_uses_hardcoded_domain_and_nul_separator() -> No
     mod = contract()
     ref = make_direct(mod)
     assert mod.TASK_REF_HASH_DOMAIN == b"js-agent:task-ref:v1\0"
-    expected = "sha256:" + hashlib.sha256(
-        b"js-agent:task-ref:v1\0" + ref.canonical_bytes()
-    ).hexdigest()
+    expected = (
+        "sha256:" + hashlib.sha256(b"js-agent:task-ref:v1\0" + ref.canonical_bytes()).hexdigest()
+    )
     assert ref.canonical_hash() == expected
     assert ref.canonical_hash() != "sha256:" + hashlib.sha256(ref.canonical_bytes()).hexdigest()
     assert list(inspect.signature(mod.TaskRef.canonical_hash).parameters) == ["self"]
@@ -633,6 +730,7 @@ def test_mode_contract_imports_only_allowlisted_modules() -> None:
         ("typing", ("Final", "TypeVar", "cast", "overload")),
         ("typing", ("Final", "cast", "overload")),
         ("js.echo.primitives", ("canonical_json_bytes",)),
+        ("echo_core.primitives", ("canonical_json_bytes",)),
     }
     allowed_plain_imports = {"hashlib", "re", "unicodedata"}
     forbidden_roots = {
@@ -791,30 +889,88 @@ EXACT_STRUCTURAL_CONSTANT_VALUES = {
     "_DIRECTORY_GRANT_FIELDS": {"schema_version", "mode", "workspace", "root"},
     "_DIRECTORY_GRANT_FIELD_ORDER": ("schema_version", "mode", "workspace", "root"),
     "_ATTENTION_ITEM_FIELDS": {
-        "schema_version", "kind", "mode", "owner", "session", "run",
-        "workspace", "effect_digest", "args_digest", "eligible_approver", "ttl_seconds",
+        "schema_version",
+        "kind",
+        "mode",
+        "owner",
+        "session",
+        "run",
+        "workspace",
+        "effect_digest",
+        "args_digest",
+        "eligible_approver",
+        "ttl_seconds",
     },
     "_ATTENTION_ITEM_FIELD_ORDER": (
-        "schema_version", "kind", "mode", "owner", "session", "run",
-        "workspace", "effect_digest", "args_digest", "eligible_approver", "ttl_seconds",
+        "schema_version",
+        "kind",
+        "mode",
+        "owner",
+        "session",
+        "run",
+        "workspace",
+        "effect_digest",
+        "args_digest",
+        "eligible_approver",
+        "ttl_seconds",
     ),
     "_ARTIFACT_REF_FIELDS": {
-        "schema_version", "mode", "owner", "session", "workspace", "kind", "uri", "digest", "acl", "created_by_run",
+        "schema_version",
+        "mode",
+        "owner",
+        "session",
+        "workspace",
+        "kind",
+        "uri",
+        "digest",
+        "acl",
+        "created_by_run",
     },
     "_ARTIFACT_REF_FIELD_ORDER": (
-        "schema_version", "mode", "owner", "session", "workspace", "kind", "uri", "digest", "acl", "created_by_run",
+        "schema_version",
+        "mode",
+        "owner",
+        "session",
+        "workspace",
+        "kind",
+        "uri",
+        "digest",
+        "acl",
+        "created_by_run",
     ),
     "_CONNECTOR_MANIFEST_FIELDS": {
-        "schema_version", "connector_type", "capabilities", "read_scopes", "write_scopes", "approval_policy",
+        "schema_version",
+        "connector_type",
+        "capabilities",
+        "read_scopes",
+        "write_scopes",
+        "approval_policy",
     },
     "_CONNECTOR_MANIFEST_FIELD_ORDER": (
-        "schema_version", "connector_type", "capabilities", "read_scopes", "write_scopes", "approval_policy",
+        "schema_version",
+        "connector_type",
+        "capabilities",
+        "read_scopes",
+        "write_scopes",
+        "approval_policy",
     ),
     "_CONNECTION_REF_FIELDS": {
-        "schema_version", "mode", "owner", "workspace", "connector_type", "connection_id", "authorized_by",
+        "schema_version",
+        "mode",
+        "owner",
+        "workspace",
+        "connector_type",
+        "connection_id",
+        "authorized_by",
     },
     "_CONNECTION_REF_FIELD_ORDER": (
-        "schema_version", "mode", "owner", "workspace", "connector_type", "connection_id", "authorized_by",
+        "schema_version",
+        "mode",
+        "owner",
+        "workspace",
+        "connector_type",
+        "connection_id",
+        "authorized_by",
     ),
 }
 
@@ -835,7 +991,9 @@ def canonical_security_sensitive_bindings() -> set[str]:
         and node.target.id.endswith(("_FIELDS", "_ORDER"))
     }
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare) or not any(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
+        if not isinstance(node, ast.Compare) or not any(
+            isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops
+        ):
             continue
         for operand in (node.left, *node.comparators):
             if isinstance(operand, ast.Name) and operand.id in class_names:
@@ -863,7 +1021,13 @@ def io_dynamic_call_offenders(source: str) -> list[str]:
         if isinstance(expr, ast.Name):
             return expr.id
         if isinstance(expr, ast.Attribute):
-            if isinstance(expr.value, ast.Call) and expr.attr in {"__init__", "hexdigest", "startswith", "issubset", "intersection"}:
+            if isinstance(expr.value, ast.Call) and expr.attr in {
+                "__init__",
+                "hexdigest",
+                "startswith",
+                "issubset",
+                "intersection",
+            }:
                 return f"CALL.{expr.attr}"
             base = call_shape(expr.value)
             if base == "<dynamic>":
@@ -897,7 +1061,10 @@ def io_dynamic_call_offenders(source: str) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             shape = call_shape(node.func)
-            if shape not in STRICT_ALLOWED_CALL_SHAPES and shape not in STRUCTURAL_EXTRA_CALL_SHAPES:
+            if (
+                shape not in STRICT_ALLOWED_CALL_SHAPES
+                and shape not in STRUCTURAL_EXTRA_CALL_SHAPES
+            ):
                 if shape == "open" and not is_shadowed_call_name(node, "open"):
                     offenders.append("open")
                 else:
@@ -965,6 +1132,7 @@ def protected_binding_offenders(source: str) -> list[str]:
         ("enum", "StrEnum", "StrEnum"),
         ("hashlib", "hashlib", "hashlib"),
         ("js.echo.primitives", "canonical_json_bytes", "canonical_json_bytes"),
+        ("echo_core.primitives", "canonical_json_bytes", "canonical_json_bytes"),
         ("re", "re", "re"),
         ("typing", "Final", "Final"),
         ("typing", "cast", "cast"),
@@ -1010,7 +1178,9 @@ def protected_binding_offenders(source: str) -> list[str]:
             return call_shape(expr.func)
         return "<dynamic>"
 
-    def is_exact_legal_top_level_assignment(node: ast.Assign | ast.AnnAssign | ast.AugAssign | ast.NamedExpr) -> bool:
+    def is_exact_legal_top_level_assignment(
+        node: ast.Assign | ast.AnnAssign | ast.AugAssign | ast.NamedExpr,
+    ) -> bool:
         if not is_top_level(node):
             return False
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -1023,7 +1193,14 @@ def protected_binding_offenders(source: str) -> list[str]:
             return False
         if (
             isinstance(target, ast.Name)
-            and target.id in ("_WORKSPACE_RE", "_MODE_MANIFEST_ID_RE", "_DIRECTORY_GRANT_ROOT_RE", "_DIGEST_RE", "_ARTIFACT_URI_RE")
+            and target.id
+            in (
+                "_WORKSPACE_RE",
+                "_MODE_MANIFEST_ID_RE",
+                "_DIRECTORY_GRANT_ROOT_RE",
+                "_DIGEST_RE",
+                "_ARTIFACT_URI_RE",
+            )
             and isinstance(value, ast.Call)
             and call_shape(value.func) == "re.compile"
         ):
@@ -1066,18 +1243,17 @@ def protected_binding_offenders(source: str) -> list[str]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 bound = alias.asname or alias.name.split(".", maxsplit=1)[0]
-                if (
-                    is_protected(bound)
-                    and not (is_top_level(node) and (alias.name, alias.name, bound) in legal_top_level_imports)
+                if is_protected(bound) and not (
+                    is_top_level(node)
+                    and (alias.name, alias.name, bound) in legal_top_level_imports
                 ):
                     offenders.append(f"protected_binding:{bound}")
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             for alias in node.names:
                 bound = alias.asname or alias.name
-                if (
-                    is_protected(bound)
-                    and not (is_top_level(node) and (module, alias.name, bound) in legal_top_level_imports)
+                if is_protected(bound) and not (
+                    is_top_level(node) and (module, alias.name, bound) in legal_top_level_imports
                 ):
                     offenders.append(f"protected_binding:{bound}")
         elif isinstance(node, ast.Assign):
@@ -1097,7 +1273,9 @@ def protected_binding_offenders(source: str) -> list[str]:
                 if item.optional_vars is not None:
                     append_target_offenders(item.optional_vars, offenders)
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            if not (is_top_level(node) and node.name in legal_top_level_defs) and is_protected(node.name):
+            if not (is_top_level(node) and node.name in legal_top_level_defs) and is_protected(
+                node.name
+            ):
                 offenders.append(f"protected_binding:{node.name}")
             for param in function_params(node):
                 if is_protected(param.arg):
@@ -1115,21 +1293,30 @@ def protected_binding_offenders(source: str) -> list[str]:
     return offenders
 
 
-
 def test_no_io_dynamic_call_helper_catches_alias_and_getattr_mutations() -> None:
     assert io_dynamic_call_offenders("open('x')") == ["open"]
-    assert io_dynamic_call_offenders("reader = open\nreader('x')") == ["disallowed_call_shape:reader"]
-    assert io_dynamic_call_offenders("reader: object = open\nreader('x')") == ["disallowed_call_shape:reader"]
+    assert io_dynamic_call_offenders("reader = open\nreader('x')") == [
+        "disallowed_call_shape:reader"
+    ]
+    assert io_dynamic_call_offenders("reader: object = open\nreader('x')") == [
+        "disallowed_call_shape:reader"
+    ]
     assert io_dynamic_call_offenders("a = open\nb = a\nb('x')") == ["disallowed_call_shape:b"]
-    assert io_dynamic_call_offenders("__builtins__['open']('x')") == ["disallowed_call_shape:<dynamic>"]
-    assert io_dynamic_call_offenders("getattr(__builtins__, 'open')('x')") == ["disallowed_call_shape:<dynamic>"]
+    assert io_dynamic_call_offenders("__builtins__['open']('x')") == [
+        "disallowed_call_shape:<dynamic>"
+    ]
+    assert io_dynamic_call_offenders("getattr(__builtins__, 'open')('x')") == [
+        "disallowed_call_shape:<dynamic>"
+    ]
     assert io_dynamic_call_offenders("reader = getattr(__builtins__, 'open')\nreader('x')") == [
         "disallowed_call_shape:reader"
     ]
-    assert io_dynamic_call_offenders("reader = open\nreader = canonical_json_bytes\nreader({})") == [
-        "disallowed_call_shape:reader"
+    assert io_dynamic_call_offenders(
+        "reader = open\nreader = canonical_json_bytes\nreader({})"
+    ) == ["disallowed_call_shape:reader"]
+    assert io_dynamic_call_offenders("def f(open):\n    open('x')") == [
+        "disallowed_call_shape:open"
     ]
-    assert io_dynamic_call_offenders("def f(open):\n    open('x')") == ["disallowed_call_shape:open"]
 
 
 def test_no_io_structural_helper_allows_current_leaf_and_plain_legal_snippet() -> None:
@@ -1167,31 +1354,33 @@ def test_no_io_protected_binding_integrity_rejects_allowed_call_root_rebinding()
         "protected_binding:_coerce_app_mode"
     ]
     assert protected_binding_offenders("any = open\nany([])") == ["protected_binding:any"]
-    assert protected_binding_offenders("def f(_validate_workspace):\n    return _validate_workspace(None)") == [
-        "protected_binding:_validate_workspace"
-    ]
-    assert protected_binding_offenders("def f():\n    _validate_workspace = open\n    return _validate_workspace(None)") == [
-        "protected_binding:_validate_workspace"
-    ]
+    assert protected_binding_offenders(
+        "def f(_validate_workspace):\n    return _validate_workspace(None)"
+    ) == ["protected_binding:_validate_workspace"]
+    assert protected_binding_offenders(
+        "def f():\n    _validate_workspace = open\n    return _validate_workspace(None)"
+    ) == ["protected_binding:_validate_workspace"]
     assert protected_binding_offenders("[x for _validate_workspace in items]") == [
         "protected_binding:_validate_workspace"
     ]
-    assert protected_binding_offenders("canonical_json_bytes = open\ncanonical_json_bytes('x')") == [
-        "protected_binding:canonical_json_bytes"
-    ]
+    assert protected_binding_offenders(
+        "canonical_json_bytes = open\ncanonical_json_bytes('x')"
+    ) == ["protected_binding:canonical_json_bytes"]
     assert protected_binding_offenders("hashlib.sha256 = open\nhashlib.sha256('x')") == [
         "protected_binding:hashlib.sha256"
     ]
-    assert protected_binding_offenders("def f(canonical_json_bytes):\n    return canonical_json_bytes({})") == [
-        "protected_binding:canonical_json_bytes"
-    ]
-    assert protected_binding_offenders("def f():\n    canonical_json_bytes = open\n    return canonical_json_bytes('x')") == [
-        "protected_binding:canonical_json_bytes"
-    ]
+    assert protected_binding_offenders(
+        "def f(canonical_json_bytes):\n    return canonical_json_bytes({})"
+    ) == ["protected_binding:canonical_json_bytes"]
+    assert protected_binding_offenders(
+        "def f():\n    canonical_json_bytes = open\n    return canonical_json_bytes('x')"
+    ) == ["protected_binding:canonical_json_bytes"]
     assert protected_binding_offenders("canonical_json_bytes: object = open") == [
         "protected_binding:canonical_json_bytes"
     ]
-    assert protected_binding_offenders("del canonical_json_bytes") == ["protected_binding:canonical_json_bytes"]
+    assert protected_binding_offenders("del canonical_json_bytes") == [
+        "protected_binding:canonical_json_bytes"
+    ]
     assert protected_binding_offenders("[x for canonical_json_bytes in items]") == [
         "protected_binding:canonical_json_bytes"
     ]
@@ -1275,7 +1464,9 @@ def test_no_callsite_batch1_strict_zero_reference_policy_is_fail_closed() -> Non
     path = ROOT / "js" / "echo" / "x.py"
     assert mode_contract_reference_offenders_for_source(path, "TARGET = 'js.echo.mode_contract'")
     assert mode_contract_reference_offenders_for_source(path, "print('js.echo.mode_contract')")
-    assert mode_contract_reference_offenders_for_source(path, "TARGET = 'js.echo.' + 'mode_contract'")
+    assert mode_contract_reference_offenders_for_source(
+        path, "TARGET = 'js.echo.' + 'mode_contract'"
+    )
 
 
 def test_no_callsite_batch1_strict_zero_reference_policy_is_bounded_and_deduplicated() -> None:
@@ -1284,10 +1475,13 @@ def test_no_callsite_batch1_strict_zero_reference_policy_is_bounded_and_deduplic
         path,
         "from ..mode_contract import TaskRef\nTARGET = 'js.echo.mode_contract'",
     ) == [str(path)]
-    assert mode_contract_reference_offenders_for_source(
-        path,
-        "from ..not_mode_contract import TaskRef\nTARGET = 'js.echo.other'",
-    ) == []
+    assert (
+        mode_contract_reference_offenders_for_source(
+            path,
+            "from ..not_mode_contract import TaskRef\nTARGET = 'js.echo.other'",
+        )
+        == []
+    )
     assert mode_contract_reference_offenders_for_source(
         ROOT / "js" / "echo" / "x.py",
         "from . import mode_contract",
@@ -1318,7 +1512,16 @@ def test_mode_contract_is_not_imported_by_existing_production_modules_in_batch1(
             # purity are enforced by ledger/test_core_contract.py.
             if rel in task4_projection_consumers:
                 continue
-            if rel.startswith(("js/connectors/", "js/mobile/", "js/friends/", "js/memory/layers/", "js/appshell/inbox.py", "js/appshell/work_context.py")):
+            if rel.startswith(
+                (
+                    "js/connectors/",
+                    "js/mobile/",
+                    "js/friends/",
+                    "js/memory/layers/",
+                    "js/appshell/inbox.py",
+                    "js/appshell/work_context.py",
+                )
+            ):
                 continue
             if rel == "js/memory/compression.py":
                 continue
@@ -1335,6 +1538,7 @@ def test_mode_contract_is_not_imported_by_existing_production_modules_in_batch1(
 def test_change_inventory_gate_is_documented_as_separate_acceptance_condition() -> None:
     assert {
         "js/echo/mode_contract.py",
+        "packages/echo-core/echo_core/mode_contract.py",
         "tests/echo/test_r1_client_task_adapter.py",
         "tests/echo/test_r1_mode_contract.py",
         "tests/echo/test_r1_mode_manifest.py",

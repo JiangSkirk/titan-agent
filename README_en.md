@@ -72,13 +72,15 @@ Troubleshooting starts at `event.details.failed_step` (one of `protected/validat
 
 ## Quick Start
 
-Release installs that do not use `uv.lock` must consume the hashed
-`constraints.txt` at the repo root instead of letting pip resolve ranges:
+Release installs that do not use `uv.lock` must consume hashed third-party
+pins in `constraints.txt` (workspace packages `echo-core` / `orin-*` live
+in `packages/` and are not on PyPI):
 
 ```bash
-pip install js-agent -c constraints.txt
-# To verify transitive hashes:
-# pip install --require-hashes -r constraints.txt && pip install --no-deps js-agent
+uv sync --frozen
+# Or: hashed third-party pins, then local packages
+# pip install --require-hashes -r constraints.txt
+# pip install --no-deps ./packages/echo-core ./packages/orin-proto ./packages/orin-guard .
 ```
 
 Developers should prefer `uv sync --frozen`. Editable installs are for a

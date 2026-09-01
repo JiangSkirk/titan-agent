@@ -46,6 +46,11 @@ def test_constraints_file_is_hashed_and_matches_lock() -> None:
     assert "--hash=" in text
     pins = [line for line in text.splitlines() if line and not line.startswith("#")]
     assert not any(line.startswith("js-agent") for line in pins)
+    assert not any(line.startswith("-e ") for line in pins)
+    pin_names = "\n".join(pins)
+    assert "echo-core" not in pin_names
+    assert "orin-guard" not in pin_names
+    assert "orin-proto" not in pin_names
     assert module.check_constraints(path, expected) == 0
 
 

@@ -31,7 +31,12 @@ def test_generate_never_writes_applied_files(tmp_path: Path) -> None:
     assert not applied.exists() or not list(applied.glob("*.json"))
 
 
-def test_approve_applies_when_benchmark_holds(tmp_path: Path) -> None:
+def test_approve_without_benchmark_is_eval_gate_failure(tmp_path: Path) -> None:
+    cycle = EvolutionCycle(tmp_path)
+    proposal = cycle.generate("owner-a", max_proposals=1)[0]
+    updated = cycle.approve_and_apply(proposal.proposal_id, "owner-a", decided_by="admin")
+    assert updated.status == STATUS_REGRESSED
+    assert not Path(updated.applied_path or "").is_file()
     cycle = EvolutionCycle(tmp_path)
     proposal = cycle.generate("owner-a", max_proposals=1)[0]
     updated = cycle.approve_and_apply(

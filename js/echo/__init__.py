@@ -12,6 +12,8 @@ public contract name, but it is an alias of the sole durable implementation,
 
 from __future__ import annotations
 
+from echo_core.primitives import ECHO_3_ARCHITECTURE
+
 from js.echo.ledger.journal import (
     CommitRecord as FrameRecord,
 )
@@ -37,6 +39,7 @@ from js.echo.primitives import (
 
 __all__ = [
     "ECHO_2_ARCHITECTURE",
+    "ECHO_3_ARCHITECTURE",
     "BudgetClock",
     "BudgetLimits",
     "BudgetReservation",

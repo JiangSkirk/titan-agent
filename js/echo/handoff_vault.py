@@ -16,6 +16,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Final, cast
 
+from echo_core import taint as orin_taint
+
 from js.echo.mode_contract import (
     AppMode,
     ClientTaskRequestV1,
@@ -23,7 +25,6 @@ from js.echo.mode_contract import (
     TaskRef,
 )
 from js.echo.primitives import canonical_json_bytes
-from js.orin import taint as orin_taint
 from js.utils.log import get_logger
 
 _LOGGER = get_logger("js.echo.handoff_vault")
@@ -186,9 +187,17 @@ class HandoffTokenV1:
 class HandoffVaultV1:
     """Internal trusted-run provenance vault."""
 
-    __slots__ = ("_mac_key", "_clock", "_max_entries", "_reserve_ttl_ns",
-                 "_commit_ttl_ns", "_entries", "_lock",
-                 "_reference_factory", "_build_record_override")
+    __slots__ = (
+        "_mac_key",
+        "_clock",
+        "_max_entries",
+        "_reserve_ttl_ns",
+        "_commit_ttl_ns",
+        "_entries",
+        "_lock",
+        "_reference_factory",
+        "_build_record_override",
+    )
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("HandoffVaultV1 cannot be subclassed")

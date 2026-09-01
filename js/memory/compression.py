@@ -101,6 +101,7 @@ class CompressionPipeline:
             return self._cached_counter
         if self._token_factory is None:
             from js.echo.context_tokenizer import conservative_counter_factory
+
             self._token_factory = conservative_counter_factory
         self._cached_counter = self._token_factory()
         return self._cached_counter
@@ -117,6 +118,8 @@ class CompressionPipeline:
         refs = _validate_source_refs(source_refs)
         refs = _sort_sources(refs)
 
+        # Compression sources have no taint column. Window context_taint is not
+        # the taint of proposed_summary; do not invent USER_TURN and deep-write.
         counter = self._get_counter()
         token_unit_id = counter.token_unit_id
 
@@ -128,7 +131,9 @@ class CompressionPipeline:
                     conn, owner=authority.owner, mode=authority.mode, workspace=authority.workspace
                 )
                 if pending_count >= MAX_PENDING_PROPOSALS_PER_SCOPE:
-                    raise ValueError(f"pending proposals exceed {MAX_PENDING_PROPOSALS_PER_SCOPE} per scope")
+                    raise ValueError(
+                        f"pending proposals exceed {MAX_PENDING_PROPOSALS_PER_SCOPE} per scope"
+                    )
                 scope = authority.scope
 
                 resolved = self._resolver.resolve_sources(conn, scope=scope, refs=refs)
@@ -146,7 +151,11 @@ class CompressionPipeline:
                     source_token_count += count
 
                 summary_count = counter(summary.encode("utf-8"))
-                if not isinstance(summary_count, int) or summary_count < 0 or summary_count > (2**63 - 1):
+                if (
+                    not isinstance(summary_count, int)
+                    or summary_count < 0
+                    or summary_count > (2**63 - 1)
+                ):
                     raise ValueError("tokenizer returned invalid count for summary")
 
                 token_savings = max(0, source_token_count - summary_count)
@@ -167,7 +176,11 @@ class CompressionPipeline:
                 conflict_flags = sorted(set(conflict_flags))
 
                 source_entries = [
-                    {"kind": str(r.ref.kind), "record_id": r.ref.record_id, "content_hash": r.content_hash}
+                    {
+                        "kind": str(r.ref.kind),
+                        "record_id": r.ref.record_id,
+                        "content_hash": r.content_hash,
+                    }
                     for r in resolved
                 ]
 
@@ -217,13 +230,16 @@ class CompressionPipeline:
                 inserted = self._repo.insert_proposal(conn, proposal=proposal)
                 if not inserted:
                     existing = self._repo.read_proposal(
-                        conn, proposal_id,
+                        conn,
+                        proposal_id,
                         owner=authority.owner,
                         mode=authority.mode,
                         workspace=authority.workspace,
                     )
                     if existing is None or existing.proposal_digest != proposal_digest:
-                        raise ValueError("corrupt_compression_state: proposal_id collision with different digest")
+                        raise ValueError(
+                            "corrupt_compression_state: proposal_id collision with different digest"
+                        )
 
                 conn.commit()
                 return proposal
@@ -249,7 +265,8 @@ class CompressionPipeline:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 proposal = self._repo.read_proposal(
-                    conn, proposal_id,
+                    conn,
+                    proposal_id,
                     owner=authority.owner,
                     mode=authority.mode,
                     workspace=authority.workspace,
@@ -293,29 +310,41 @@ class CompressionPipeline:
                     (proposal.proposal_id,),
                 ).fetchall()
                 if len(child_rows) != len(resolved):
-                    return self._stale_proposal(conn, proposal, authority, "child_row_count_mismatch")
+                    return self._stale_proposal(
+                        conn, proposal, authority, "child_row_count_mismatch"
+                    )
                 for _idx, (cr, r) in enumerate(zip(child_rows, resolved, strict=True)):
                     if str(cr[1]) != r.content_hash:
-                        return self._stale_proposal(conn, proposal, authority, "child_hash_mismatch")
+                        return self._stale_proposal(
+                            conn, proposal, authority, "child_hash_mismatch"
+                        )
 
                 source_token_count = 0
                 for r in resolved:
                     snapshot_bytes = _snapshot_to_bytes(r.canonical_snapshot)
                     count = counter(snapshot_bytes)
                     if not isinstance(count, int) or count < 0:
-                        return self._stale_proposal(conn, proposal, authority, "token_count_invalid")
+                        return self._stale_proposal(
+                            conn, proposal, authority, "token_count_invalid"
+                        )
                     source_token_count += count
 
                 if source_token_count != proposal.source_token_count:
-                    return self._stale_proposal(conn, proposal, authority, "source_token_count_drift")
+                    return self._stale_proposal(
+                        conn, proposal, authority, "source_token_count_drift"
+                    )
 
                 summary_count = counter(proposal.proposed_summary.encode("utf-8"))
                 if summary_count != proposal.summary_token_count:
-                    return self._stale_proposal(conn, proposal, authority, "summary_token_count_drift")
+                    return self._stale_proposal(
+                        conn, proposal, authority, "summary_token_count_drift"
+                    )
 
                 source_set_hash = compute_source_set_hash(current_hashes)
                 if source_set_hash != proposal.source_set_hash:
-                    return self._stale_proposal(conn, proposal, authority, "source_set_hash_mismatch")
+                    return self._stale_proposal(
+                        conn, proposal, authority, "source_set_hash_mismatch"
+                    )
 
                 capsule_id = compute_capsule_id(
                     proposal_id=proposal.proposal_id,
@@ -440,7 +469,8 @@ class CompressionPipeline:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 proposal = self._repo.read_proposal(
-                    conn, proposal_id,
+                    conn,
+                    proposal_id,
                     owner=authority.owner,
                     mode=authority.mode,
                     workspace=authority.workspace,
@@ -464,7 +494,8 @@ class CompressionPipeline:
                 )
                 conn.commit()
                 return self._repo.read_proposal(
-                    conn, proposal_id,
+                    conn,
+                    proposal_id,
                     owner=authority.owner,
                     mode=authority.mode,
                     workspace=authority.workspace,
@@ -482,7 +513,8 @@ class CompressionPipeline:
         """Rehydrate a capsule with full summary and source payloads."""
         with db_connection(self._db_path) as conn:
             capsule = self._repo.read_capsule(
-                conn, capsule_id,
+                conn,
+                capsule_id,
                 owner=authority.owner,
                 mode=authority.mode,
                 workspace=authority.workspace,
@@ -625,7 +657,10 @@ class CompressionPipeline:
         return self._row_to_capsule(row)
 
     def _return_existing_capsule(
-        self, conn: sqlite3.Connection, proposal: CompressionProposal, authority: MemoryCompressionAuthorityV1
+        self,
+        conn: sqlite3.Connection,
+        proposal: CompressionProposal,
+        authority: MemoryCompressionAuthorityV1,
     ) -> CompressionResult:
         """Return existing approved capsule for idempotent retry."""
         ws_clause = "AND workspace IS ?" if authority.workspace is None else "AND workspace = ?"
@@ -638,23 +673,31 @@ class CompressionPipeline:
         ).fetchone()
         if row is None:
             return CompressionResult(
-                success=False, error_code="corrupt_state",
+                success=False,
+                error_code="corrupt_state",
                 error="proposal marked approved but no capsule found",
             )
         capsule = self._repo.read_capsule(
-            conn, str(row[0]),
-            owner=authority.owner, mode=authority.mode, workspace=authority.workspace,
+            conn,
+            str(row[0]),
+            owner=authority.owner,
+            mode=authority.mode,
+            workspace=authority.workspace,
         )
         if capsule is None:
             return CompressionResult(
-                success=False, error_code="corrupt_state",
+                success=False,
+                error_code="corrupt_state",
                 error="capsule not found after approved status",
             )
         return CompressionResult(success=True, proposal=proposal, capsule=capsule)
 
     def _stale_proposal(
-        self, conn: sqlite3.Connection, proposal: CompressionProposal,
-        authority: MemoryCompressionAuthorityV1, reason: str,
+        self,
+        conn: sqlite3.Connection,
+        proposal: CompressionProposal,
+        authority: MemoryCompressionAuthorityV1,
+        reason: str,
     ) -> CompressionResult:
         """CAS proposal to stale and return error."""
         self._repo.cas_status(
@@ -670,18 +713,19 @@ class CompressionPipeline:
         )
         conn.commit()
         return CompressionResult(
-            success=False, error_code="stale_proposal",
+            success=False,
+            error_code="stale_proposal",
             error=f"proposal is stale: {reason}",
         )
 
     @staticmethod
     def _row_to_proposal(row: tuple[Any, ...]) -> CompressionProposal:
         import json as _json
+
         source_ids = tuple(_json.loads(str(row[4])))
         source_hashes = tuple(_json.loads(str(row[5])))
         source_refs = tuple(
-            MemorySourceRefV1(kind=MemoryRecordKind("claim"), record_id=rid)
-            for rid in source_ids
+            MemorySourceRefV1(kind=MemoryRecordKind("claim"), record_id=rid) for rid in source_ids
         )
         return CompressionProposal(
             schema_version=2,
@@ -712,6 +756,7 @@ class CompressionPipeline:
     @staticmethod
     def _row_to_capsule(row: tuple[Any, ...]) -> ColdCapsule:
         import json as _json
+
         return ColdCapsule(
             schema_version=2,
             capsule_id=str(row[0]),
@@ -739,14 +784,17 @@ class CompressionPipeline:
 
 def _snapshot_to_bytes(snapshot: Any) -> bytes:
     from js.echo.primitives import canonical_json_bytes
+
     return canonical_json_bytes(dict(snapshot))
 
 
 def _snapshot_to_json(snapshot: Any) -> str:
     from js.echo.primitives import canonical_json_bytes
+
     return canonical_json_bytes(dict(snapshot)).decode("utf-8")
 
 
 def compute_snapshot_hash_safe(snapshot: Any) -> str:
     from js.memory.layers.contracts import compute_snapshot_hash
+
     return compute_snapshot_hash(dict(snapshot))

@@ -196,7 +196,7 @@ def test_linux_unshare_mount_namespace_is_not_claimed_as_fs_isolation(
     executor = SandboxExecutor(workspace=tmp_path, strict_isolation=True)
     executor._has_unshare = True
     executor._has_bwrap = False
-    monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Linux")
 
     with pytest.raises(RuntimeError, match="Filesystem isolation requested"):
         executor._wrap_filesystem_isolation(["/bin/echo", "ok"], fs_restricted=True)
@@ -284,7 +284,7 @@ def test_macos_profile_denies_nested_git_writes(
     nested_git, gitfile = _make_nested_git_layout(workspace)
     executor = SandboxExecutor(workspace=workspace)
     executor._has_sandbox_exec = True
-    monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Darwin")
 
     wrapped = executor._wrap_filesystem_isolation(["/bin/echo", "ok"], fs_restricted=True)
 
@@ -317,7 +317,7 @@ def test_linux_bwrap_ro_binds_nested_git_components(
     nested_git, gitfile = _make_nested_git_layout(workspace)
     executor = SandboxExecutor(workspace=workspace)
     executor._has_bwrap = True
-    monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Linux")
 
     wrapped = executor._wrap_filesystem_isolation(["/bin/echo", "ok"], fs_restricted=True)
 
@@ -344,7 +344,7 @@ def test_macos_profile_regex_denies_uncreated_git_dirs(
     workspace = tmp_path.resolve()
     executor = SandboxExecutor(workspace=workspace)
     executor._has_sandbox_exec = True
-    monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Darwin")
 
     wrapped = executor._wrap_filesystem_isolation(["/bin/echo", "ok"], fs_restricted=True)
 
@@ -536,7 +536,7 @@ def test_macos_profile_denies_runtime_tcb_writes(
     (package / "web" / "static").mkdir(parents=True)
     executor = SandboxExecutor(workspace=workspace)
     executor._has_sandbox_exec = True
-    monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Darwin")
 
     with override_runtime_package_root(package):
         wrapped = executor._wrap_filesystem_isolation(["/bin/echo", "ok"], fs_restricted=True)
@@ -570,7 +570,7 @@ def test_linux_bwrap_ro_binds_package_then_rw_static(
     static_dir.mkdir(parents=True)
     executor = SandboxExecutor(workspace=workspace)
     executor._has_bwrap = True
-    monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Linux")
 
     with override_runtime_package_root(package):
         wrapped = executor._wrap_filesystem_isolation(["/bin/echo", "ok"], fs_restricted=True)

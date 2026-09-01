@@ -36,16 +36,27 @@ jobs:
           uv sync --frozen --extra dev --extra monitor --extra echo-tokenizer
 
       - name: Lint with Ruff
-        run: uv run ruff check js/ js_work/ tests/ scripts/
+        run: uv run ruff check js/ js_work/ tests/ scripts/ packages/
 
       - name: Type check with mypy
-        run: uv run mypy js/ js_work/ --no-error-summary
+        run: uv run mypy js/ js_work/ packages/echo-core/echo_core packages/orin-proto/orin_proto packages/orin-guard/orin_guard --no-error-summary
+
+      - name: Import firewall and self-dev audit
+        run: |
+          uv run python scripts/import_firewall.py
+          uv run python scripts/self_dev_audit.py --src packages/echo-core/echo_core --package echo_core --notices packages/echo-core/THIRD_PARTY_NOTICES.md
+          uv run python scripts/self_dev_audit.py --src packages/orin-proto/orin_proto --package orin_proto --notices packages/orin-proto/THIRD_PARTY_NOTICES.md
+          uv run python scripts/self_dev_audit.py --src packages/orin-guard/orin_guard --package orin_guard,echo_core,orin_proto --notices packages/orin-guard/THIRD_PARTY_NOTICES.md
 
       - name: Test with pytest
         run: uv run pytest tests/ -v --tb=short
 
       - name: Build release artifacts
-        run: uv run python -m build --wheel --sdist --outdir dist
+        run: |
+          uv run python -m build --wheel --sdist --outdir dist
+          uv run python -m build --wheel --outdir dist packages/echo-core
+          uv run python -m build --wheel --outdir dist packages/orin-proto
+          uv run python -m build --wheel --outdir dist packages/orin-guard
 
       - name: Verify and audit the built wheel in clean virtual environments
         run: uv run python scripts/verify_installed_artifact.py --artifact-dir dist --audit
@@ -111,7 +122,7 @@ jobs:
       - name: Coverage floors
         run: |
           uv run pytest tests/ -q --tb=line \
-            --cov=js --cov=js_work --cov-branch \
+            --cov=js --cov=js_work --cov=echo_core --cov=orin_guard --cov=orin_proto --cov-branch \
             --cov-report=json:coverage.json \
             --cov-report=term:skip-covered
           uv run python scripts/check_coverage_floors.py --json coverage.json

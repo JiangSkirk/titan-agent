@@ -53,4 +53,21 @@ def remaining_step_allowed(
         return True
     if deny_write:
         return False
-    return not bool(context_taint & DIRTY_MIDTURN)
+    if context_taint & DIRTY_MIDTURN:
+        return False
+    from orin_guard.kernel.exec_kernel import (
+        ExecKernel,
+        ExecKernelDenied,
+        ExecPlan,
+    )
+    from orin_guard.kernel.exec_kernel import (
+        PlanStep as ExecStep,
+    )
+
+    try:
+        ExecKernel().check(
+            ExecPlan(steps=(ExecStep(tool=step.tool, slot_taint=context_taint),), privileged=True)
+        )
+    except ExecKernelDenied:
+        return False
+    return True

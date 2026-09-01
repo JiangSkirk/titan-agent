@@ -590,7 +590,7 @@ class TestHermesGuardSandbox:
     ) -> None:
         # Simulate a platform with no sandbox backend: never fall back to a
         # bare-host subprocess for attacker-controlled guard code.
-        monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "FreeBSD")
+        monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "FreeBSD")
         result = _try_hermes_guard_scan(hostile_hermes_home / "skills" / "evil-skill")
 
         assert result is None

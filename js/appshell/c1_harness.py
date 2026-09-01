@@ -577,6 +577,19 @@ def _build_read_only_runtime_image(resolved_root: Path) -> tuple[Path, bool]:
             repository_root / "resources" / "tokenizer",
             runtime_image / "resources" / "tokenizer",
         )
+
+        def _pkg_ignore(_source: str, names: list[str]) -> set[str]:
+            return {
+                name
+                for name in names
+                if name == "__pycache__" or name.endswith((".pyc", ".pyo")) or name == ".DS_Store"
+            }
+
+        for pkg in ("echo-core/echo_core", "orin-proto/orin_proto", "orin-guard/orin_guard"):
+            src = repository_root / "packages" / pkg
+            if src.is_dir():
+                shutil.copytree(src, runtime_image / Path(pkg).name, ignore=_pkg_ignore)
+
         # Package facades are files in the host-built, read-only image.  They
         # preserve only the imports required by JSAgent initialization and do
         # not expose registration, grant, approval, issue, or admin methods.

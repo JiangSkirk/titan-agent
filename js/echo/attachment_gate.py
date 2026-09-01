@@ -640,7 +640,7 @@ def attachment_entry_taint(has_attachments: bool) -> int:
     context is present, so attachment-derived text keeps its provenance.
     """
 
-    from js.orin.taint import ATTACHMENT
+    from echo_core.taint import ATTACHMENT
 
     return ATTACHMENT if has_attachments else 0
 

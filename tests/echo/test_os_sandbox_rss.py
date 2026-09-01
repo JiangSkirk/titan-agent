@@ -36,7 +36,7 @@ def test_bwrap_placeholder_for_missing_git(tmp_path, monkeypatch) -> None:
     workspace.mkdir()
     executor = SandboxExecutor(workspace, strict_isolation=False)
     monkeypatch.setattr(executor, "_has_bwrap", True)
-    monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Linux")
     wrapped = executor._wrap_filesystem_isolation(
         ["echo", "ok"],
         fs_restricted=True,

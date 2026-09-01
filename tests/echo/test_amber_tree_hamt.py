@@ -344,7 +344,7 @@ def test_amber_tree_module_is_a_real_implementation() -> None:
     """A real HAMT cannot be 30 lines — guard against an accidental revert
     to flat-dict masquerade."""
     here = os.path.dirname(__file__)
-    src = os.path.join(here, "..", "..", "js", "echo", "amber_tree.py")
+    src = os.path.join(here, "..", "..", "packages", "echo-core", "echo_core", "amber_tree.py")
     with open(src, encoding="utf-8") as f:
         content = f.read()
     assert "HAMT" in content or "trie" in content.lower()

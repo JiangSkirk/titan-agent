@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Export hashed constraints.txt from the frozen lockfile.
+"""Export hashed third-party constraints.txt from the frozen lockfile.
 
-Downstream ``pip install js-agent -c constraints.txt --require-hashes``
-must not resolve version ranges. ``--check`` fails if the committed file
-drifts from ``uv export``.
+Workspace members (echo-core / orin-proto / orin-guard) are omitted:
+they are not on PyPI, and ``--require-hashes`` cannot mix unhashed
+``-e`` lines. ``--check`` fails if the committed file drifts from
+``uv export``.
 """
 
 from __future__ import annotations
@@ -15,15 +16,19 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO / "constraints.txt"
-HEADER = """# Hashed install constraints exported from uv.lock.
+HEADER = """# Hashed third-party constraints exported from uv.lock.
 # Do not edit by hand. Regenerate with:
 #   uv run python scripts/export_constraints.py
 #
-# Downstream install (range install is not a supported release path):
+# Workspace packages (echo-core, orin-proto, orin-guard) are omitted on
+# purpose: they live in packages/ and are not on PyPI. Editable -e lines
+# have no --hash= and would break pip --require-hashes.
+#
+# From this clone (understands the workspace):
+#   uv sync --frozen
+# Hashed third-party pins, then local packages:
 #   pip install --require-hashes -r constraints.txt
-#   pip install --no-deps js-agent
-# Or pin transitives without requiring a hash for the project itself:
-#   pip install js-agent -c constraints.txt
+#   pip install --no-deps ./packages/echo-core ./packages/orin-proto ./packages/orin-guard .
 #
 """
 EXPORT_CMD = (
@@ -34,6 +39,7 @@ EXPORT_CMD = (
     "--frozen",
     "--no-dev",
     "--no-emit-project",
+    "--no-emit-workspace",
     "--no-annotate",
     "--no-header",
     "--extra",
@@ -66,6 +72,8 @@ def export_body(*, cwd: Path = REPO) -> str:
         raise RuntimeError("uv export produced an empty constraints body")
     if "--hash=" not in body:
         raise RuntimeError("uv export omitted hashes; refuse unsigned constraints")
+    if any(line.startswith("-e ") for line in body.splitlines()):
+        raise RuntimeError("editable pins in hashed constraints; refuse")
     return body if body.endswith("\n") else f"{body}\n"
 
 

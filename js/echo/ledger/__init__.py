@@ -1,17 +1,8 @@
-from __future__ import annotations
+"""Echo ledger package.
 
-__all__ = [
-    "effects",
-    "journal",
-    "kernel",
-    "memory",
-    "plugins",
-    "policy",
-    "privacy",
-    "release_gates",
-    "security_controls",
-    "slo",
-    "slo_contract",
-    "types",
-    "verification",
-]
+Kernel modules are shims to ``echo_core.ledger``. Product release gates
+(``release_gates``, ``evidence_export``, ``final_evidence``, ``service``)
+remain in this tree and may import Host ``desktop/`` / ``scripts/``.
+"""
+
+from __future__ import annotations

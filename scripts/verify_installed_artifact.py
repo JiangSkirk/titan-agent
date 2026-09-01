@@ -10,8 +10,11 @@ from pathlib import Path
 
 IMPORT_CHECK = """
 import importlib.util
+import echo_core
 import js.echo
 import js_work.web
+import orin_guard
+import orin_proto
 
 assert importlib.util.find_spec("js.rivetline") is None
 assert importlib.util.find_spec("js.agent_core") is None
@@ -33,13 +36,25 @@ def clean_environment() -> dict[str, str]:
     return env
 
 
-def find_wheel(artifact_dir: Path) -> Path:
+def find_wheels(artifact_dir: Path) -> list[Path]:
     wheels = sorted(artifact_dir.glob("*.whl"))
-    if len(wheels) != 1:
-        raise RuntimeError(
-            f"Expected exactly one wheel in {artifact_dir}, found {len(wheels)}."
-        )
-    return wheels[0]
+    if not wheels:
+        raise RuntimeError(f"Expected at least one wheel in {artifact_dir}.")
+    return wheels
+
+
+def find_wheel(artifact_dir: Path) -> Path:
+    """Return the js-agent wheel, which may sit beside workspace wheels."""
+
+    wheels = find_wheels(artifact_dir)
+    js_wheels = [wheel for wheel in wheels if "js_agent" in wheel.name or "js-agent" in wheel.name]
+    if len(js_wheels) == 1:
+        return js_wheels[0]
+    if len(wheels) == 1:
+        return wheels[0]
+    raise RuntimeError(
+        f"Expected exactly one js-agent wheel in {artifact_dir}, found {len(js_wheels)}."
+    )
 
 
 def verify_wheel(wheel: Path, venv_dir: Path, *, audit: bool = False) -> None:
@@ -47,11 +62,13 @@ def verify_wheel(wheel: Path, venv_dir: Path, *, audit: bool = False) -> None:
     env["HOME"] = str(venv_dir)
     env["XDG_CONFIG_HOME"] = str(venv_dir / ".config")
     env["XDG_STATE_HOME"] = str(venv_dir / ".local" / "state")
+    extra = sorted(p.resolve() for p in wheel.parent.glob("*.whl"))
+    install_targets = extra if extra else [wheel]
     python = venv_dir / "bin" / "python"
     commands = (
         ([sys.executable, "-m", "venv", str(venv_dir)], venv_dir.parent),
         ([str(python), "-m", "pip", "--isolated", "install", "--upgrade", "pip"], venv_dir),
-        ([str(python), "-m", "pip", "--isolated", "install", str(wheel)], venv_dir),
+        ([str(python), "-m", "pip", "--isolated", "install", *[str(p) for p in install_targets]], venv_dir),
         ([str(venv_dir / "bin" / "js"), "--help"], venv_dir),
         ([str(venv_dir / "bin" / "js"), "work", "--help"], venv_dir),
         ([str(venv_dir / "bin" / "js-work"), "--help"], venv_dir),

@@ -196,6 +196,8 @@ class EvolutionCycle:
         proposal = self.get(proposal_id, owner)
         if proposal is None or proposal.status != STATUS_PROPOSED:
             raise ValueError("proposal is not open")
+        from echo_core.evolve.eval_gate import EvalGateDenied, eval_gate
+
         from js.orin.policy_lattice import reject_evolution_policy_mutation
 
         reject_evolution_policy_mutation(proposal.payload)
@@ -206,9 +208,12 @@ class EvolutionCycle:
             raise
         score: float | None = None
         try:
-            score = 1.0 if benchmark is None else float(benchmark())
             threshold = load_baseline_score() if baseline_score is None else float(baseline_score)
-            passed = score >= threshold
+            score = eval_gate(benchmark, baseline=threshold)
+            passed = True
+        except EvalGateDenied as exc:
+            passed = False
+            score = getattr(exc, "score", None)
         except Exception:
             passed = False
         if not passed:

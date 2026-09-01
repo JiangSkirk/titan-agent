@@ -16,7 +16,7 @@ import inspect
 import pathlib
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-ECHO_DIR = REPO_ROOT / "js" / "echo"
+ECHO_CORE_DIR = REPO_ROOT / "packages" / "echo-core" / "echo_core"
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ _FORBIDDEN_IMPORT_PREFIXES = (
 
 
 def _iter_echo_python_files() -> list[pathlib.Path]:
-    assert ECHO_DIR.is_dir(), f"js/echo/ not found at {ECHO_DIR}"
+    assert ECHO_CORE_DIR.is_dir(), f"echo_core/ not found at {ECHO_CORE_DIR}"
     kernel_modules = (
         "amber.py",
         "core.py",
@@ -164,7 +164,7 @@ def _iter_echo_python_files() -> list[pathlib.Path]:
         "timing_wheel.py",
         "types.py",
     )
-    return [ECHO_DIR / name for name in kernel_modules]
+    return [ECHO_CORE_DIR / name for name in kernel_modules]
 
 
 def test_echo_kernel_does_not_import_legacy() -> None:

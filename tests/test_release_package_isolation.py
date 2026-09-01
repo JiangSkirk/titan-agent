@@ -102,8 +102,16 @@ def release_artifacts(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Pat
             text=True,
         )
 
-    wheels = list(output_dir.glob("*.whl"))
-    sdists = list(output_dir.glob("*.tar.gz"))
+    def _js_agent_artifacts(paths: list[Path]) -> list[Path]:
+        named = [
+            path
+            for path in paths
+            if "js_agent" in path.name.replace("-", "_") or path.name.startswith("js-agent")
+        ]
+        return named if named else paths
+
+    wheels = _js_agent_artifacts(list(output_dir.glob("*.whl")))
+    sdists = _js_agent_artifacts(list(output_dir.glob("*.tar.gz")))
     assert len(wheels) == 1
     assert len(sdists) == 1
 
@@ -196,7 +204,17 @@ def test_artifact_isolated_install_smoke(
     subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
     python = venv_dir / "bin" / "python"
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(release_artifacts["dependencies"])
+    # Workspace packages are editable (.pth) in the host venv, so they are
+    # omitted from the site-packages copy.  Point PYTHONPATH at the source
+    # trees so the js-agent wheel can import them without a PyPI index.
+    workspace_roots = (
+        REPO_ROOT / "packages" / "echo-core",
+        REPO_ROOT / "packages" / "orin-proto",
+        REPO_ROOT / "packages" / "orin-guard",
+    )
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(path) for path in workspace_roots] + [str(release_artifacts["dependencies"])]
+    )
     env["PIP_NO_INDEX"] = "1"
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     env["HOME"] = str(venv_dir)

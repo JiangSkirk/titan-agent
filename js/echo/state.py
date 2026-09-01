@@ -38,6 +38,16 @@ class AgentState:
     compression_stats: dict[str, Any] = field(default_factory=dict)
     model: str = ""
 
+    @property
+    def context_taint(self) -> int:
+        """OR of live message taint bits. Not persisted (see ``to_dict``)."""
+
+        from echo_core.taint import recompute_context_taint
+
+        return recompute_context_taint(
+            [int(getattr(message, "taint", 0) or 0) for message in self.messages]
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,

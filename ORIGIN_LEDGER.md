@@ -41,3 +41,11 @@ operate, or absence of infringement.
 - Trademark review for public naming.
 - Clean-room reviewer sign-off.
 - Dependency license review against the final lockfile and SBOM.
+
+## Echo 3.0 / Orin 2.0 extraction
+
+- Packages: `packages/echo-core`, `packages/orin-proto`, `packages/orin-guard`
+- Tests: `tests/echo_core`, `tests/orin_proto`, `tests/orin_guard`
+- Clean-room: concepts from OpenClaw / Hermes / CaMeL / FIDES / GEPA were
+  used only as design constraints. No source, class names, or APIs were copied.
+

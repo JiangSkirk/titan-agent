@@ -11,7 +11,8 @@ from js.echo.ledger.types import EffectIntent, IntakeEvent, KernelSnapshot
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 LEDGER_DIR = REPO_ROOT / "js" / "echo" / "ledger"
-MODE_CONTRACT_PATH = REPO_ROOT / "js" / "echo" / "mode_contract.py"
+ECHO_CORE_LEDGER_DIR = REPO_ROOT / "packages" / "echo-core" / "echo_core" / "ledger"
+MODE_CONTRACT_PATH = REPO_ROOT / "packages" / "echo-core" / "echo_core" / "mode_contract.py"
 
 
 def test_decide_is_deterministic_and_does_not_sample_time() -> None:
@@ -151,22 +152,25 @@ def test_echo_ledger_package_avoids_legacy_runtime_imports_except_echo_primitive
 
 def test_task4_projection_contract_edges_are_exact_and_leaf_remains_runtime_free() -> None:
     expected_edges = {
-        (LEDGER_DIR / "effects.py", ("ArtifactRefV1",)),
+        (ECHO_CORE_LEDGER_DIR / "effects.py", ("ArtifactRefV1",)),
         (
-            LEDGER_DIR / "partition_retention.py",
+            ECHO_CORE_LEDGER_DIR / "partition_retention.py",
             ("AppMode", "ArtifactRefV1"),
         ),
         (LEDGER_DIR / "service.py", ("AppMode", "ArtifactRefV1")),
     }
     actual_edges: set[tuple[pathlib.Path, tuple[str, ...]]] = set()
     for source_path in (
-        LEDGER_DIR / "effects.py",
-        LEDGER_DIR / "partition_retention.py",
+        ECHO_CORE_LEDGER_DIR / "effects.py",
+        ECHO_CORE_LEDGER_DIR / "partition_retention.py",
         LEDGER_DIR / "service.py",
     ):
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "js.echo.mode_contract":
+            if isinstance(node, ast.ImportFrom) and node.module in {
+                "js.echo.mode_contract",
+                "echo_core.mode_contract",
+            }:
                 assert node.level == 0
                 assert all(alias.asname is None and alias.name != "*" for alias in node.names)
                 actual_edges.add((source_path, tuple(alias.name for alias in node.names)))
@@ -204,10 +208,7 @@ def test_task4_projection_contract_edges_are_exact_and_leaf_remains_runtime_free
     assert not [
         module
         for module in imported_modules
-        if any(
-            module == prefix or module.startswith(prefix + ".")
-            for prefix in runtime_prefixes
-        )
+        if any(module == prefix or module.startswith(prefix + ".") for prefix in runtime_prefixes)
     ]
 
 

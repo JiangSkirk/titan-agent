@@ -432,7 +432,13 @@ _FORBIDDEN_IO = (
     "requests",
     "pathlib",
 )
-_AMBER_TREE = pathlib.Path(__file__).resolve().parents[2] / "js" / "echo" / "amber_tree.py"
+_AMBER_TREE = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "packages"
+    / "echo-core"
+    / "echo_core"
+    / "amber_tree.py"
+)
 
 
 def test_amber_tree_no_legacy_imports() -> None:

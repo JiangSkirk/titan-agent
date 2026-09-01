@@ -36,7 +36,7 @@ def test_echo_ledger_is_the_only_persistent_safety_service() -> None:
     from js.echo.ledger.journal import FileEchoLedger
     from js.echo.ledger.service import EchoSafetyService
 
-    assert FileEchoLedger.__module__ == "js.echo.ledger.journal"
+    assert FileEchoLedger.__module__ in {"js.echo.ledger.journal", "echo_core.ledger.journal"}
     assert EchoSafetyService.__module__ == "js.echo.ledger.service"
 
 

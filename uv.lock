@@ -13,6 +13,14 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 
+[manifest]
+members = [
+    "echo-core",
+    "js-agent",
+    "orin-guard",
+    "orin-proto",
+]
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
@@ -681,6 +689,34 @@ wheels = [
 ]
 
 [[package]]
+name = "echo-core"
+version = "3.0.0"
+source = { editable = "packages/echo-core" }
+dependencies = [
+    { name = "psutil" },
+    { name = "rfc8785" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13" },
+    { name = "psutil", specifier = ">=6.1,<8" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
+    { name = "rfc8785", specifier = "==0.1.4" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "et-xmlfile"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1139,10 +1175,13 @@ dependencies = [
     { name = "cachetools" },
     { name = "click" },
     { name = "cryptography" },
+    { name = "echo-core" },
     { name = "fastapi" },
     { name = "httpx", extra = ["http2"] },
     { name = "openai" },
     { name = "openpyxl" },
+    { name = "orin-guard" },
+    { name = "orin-proto" },
     { name = "packaging" },
     { name = "platformdirs" },
     { name = "prompt-toolkit" },
@@ -1224,6 +1263,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.1,<9" },
     { name = "cryptography", specifier = ">=49.0.0,<51" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.4,<3" },
+    { name = "echo-core", editable = "packages/echo-core" },
     { name = "fastapi", specifier = ">=0.139,<1" },
     { name = "hatchling", marker = "extra == 'dev'", specifier = ">=1.27" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27,<1" },
@@ -1240,6 +1280,8 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'monitor'", specifier = ">=0.50" },
     { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'monitor'", specifier = ">=0.50" },
     { name = "opentelemetry-sdk", marker = "extra == 'monitor'", specifier = ">=1.29" },
+    { name = "orin-guard", editable = "packages/orin-guard" },
+    { name = "orin-proto", editable = "packages/orin-proto" },
     { name = "packaging", specifier = ">=24.2,<27" },
     { name = "pandas", marker = "extra == 'office'", specifier = ">=2.2" },
     { name = "pdfplumber", marker = "extra == 'pdf'", specifier = ">=0.11" },
@@ -1959,6 +2001,26 @@ sdist = { url = "https://files.pythonhosted.org/packages/6c/d8/7bf5e4cec0578ac3c
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e5/f1/34e047e8f6a3c67e5220acf1af7b9f62868c25d77791bca74457bd2180a6/opentelemetry_util_http-0.63b1-py3-none-any.whl", hash = "sha256:6284194028c59cd439f8acfe388145069a6127f11dc077e1344a2094adacc3f8", size = 8205, upload-time = "2026-05-21T16:36:09.736Z" },
 ]
+
+[[package]]
+name = "orin-guard"
+version = "2.0.0"
+source = { editable = "packages/orin-guard" }
+dependencies = [
+    { name = "echo-core" },
+    { name = "orin-proto" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "echo-core", editable = "packages/echo-core" },
+    { name = "orin-proto", editable = "packages/orin-proto" },
+]
+
+[[package]]
+name = "orin-proto"
+version = "2.0.0"
+source = { editable = "packages/orin-proto" }
 
 [[package]]
 name = "packageurl-python"

@@ -57,10 +57,10 @@ def test_echo2_compatibility_shells_are_removed_and_primitives_are_in_package() 
 
 
 def test_echo_ledger_hash_identity_uses_echo_canonical_primitive() -> None:
-    hashing_file = REPO_ROOT / "js" / "echo" / "ledger" / "_hashing.py"
+    hashing_file = REPO_ROOT / "packages" / "echo-core" / "echo_core" / "ledger" / "_hashing.py"
     source = hashing_file.read_text(encoding="utf-8")
 
-    assert "from js.echo.primitives import stable_payload_hash" in source
+    assert "from echo_core.primitives import stable_payload_hash" in source
     assert "hashlib.sha256" not in source
 
 
@@ -75,9 +75,9 @@ def test_file_echo_ledger_is_the_only_persistent_echo_ledger() -> None:
 
 
 def test_echo_ledger_adr_marks_ledger_as_only_persistent_safety_boundary() -> None:
-    adr_text = (
-        REPO_ROOT / "docs" / "adr" / "0001-echo-ledger-boundary.md"
-    ).read_text(encoding="utf-8")
+    adr_text = (REPO_ROOT / "docs" / "adr" / "0001-echo-ledger-boundary.md").read_text(
+        encoding="utf-8"
+    )
 
     assert "js/echo/ledger/" in adr_text
     assert "only persistent safety ledger" in adr_text
@@ -86,9 +86,9 @@ def test_echo_ledger_adr_marks_ledger_as_only_persistent_safety_boundary() -> No
 
 
 def test_unified_execution_contract_document_exists() -> None:
-    doc_text = (
-        REPO_ROOT / "docs" / "echo" / "ECHO_UNIFIED_EXECUTION_CONTRACT.md"
-    ).read_text(encoding="utf-8")
+    doc_text = (REPO_ROOT / "docs" / "echo" / "ECHO_UNIFIED_EXECUTION_CONTRACT.md").read_text(
+        encoding="utf-8"
+    )
 
     assert "JSAgent.authorized_model_chat" in doc_text
     assert "ToolExecutor.execute_tool" in doc_text

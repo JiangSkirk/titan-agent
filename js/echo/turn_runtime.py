@@ -13,6 +13,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from echo_core import taint as orin_taint
+
 from js.appshell.principal import AppShellOperationV1, current_appshell_epoch_binding
 from js.connectors.contracts import ConnectorExecutionRequestV1, ConnectorRunOutcomeV1
 from js.connectors.manager import build_production_connector_manager
@@ -20,7 +22,6 @@ from js.echo.attachment_gate import AttachmentGateError, validate_chat_attachmen
 from js.echo.effect_interpreter import EffectInterpreter, ModelEffect, ToolEffect
 from js.echo.private_handoff import PrivateHandoffVault
 from js.echo.runtime import EchoPulseRuntime, get_pulse_runtime
-from js.orin import taint as orin_taint
 
 if TYPE_CHECKING:
     from js.models.providers import ChatMessage, ChatResponse

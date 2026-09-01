@@ -43,6 +43,10 @@ they are still welcome as regular issues or pull requests.
 operating-system isolation.** Echo leases, the ledger, the guard, taint,
 tool allowlists, and approval gates are **authorization and defense in depth**,
 not a containment boundary. Any in-process screen of LLM output is a heuristic.
+Echo 3.0 / Orin 2.0 kernels live in `packages/echo-core` and
+`packages/orin-guard`; host shims are `js.echo` / `js.orin`. Source RC notes:
+[`docs/release/ECHO3_ORIN2.md`](docs/release/ECHO3_ORIN2.md). PyPI and
+independent GitHub mirrors are **not** published.
 
 JS Agent supports two OS-level postures:
 
@@ -142,9 +146,10 @@ warning. `enforce` allows them only when `isolation_posture=container-full`.
 - Version ranges in `pyproject.toml` are resolver bounds; reproducible builds
   follow the lockfile.
 - Downstream installs that do not use `uv.lock` must consume repo-root
-  `constraints.txt` (`pip install js-agent -c constraints.txt`; to verify
-  transitive hashes: `pip install --require-hashes -r constraints.txt`
-  then `pip install --no-deps js-agent`).
+  `constraints.txt` for third-party pins. Prefer `uv sync --frozen`.
+  To verify hashes: `pip install --require-hashes -r constraints.txt` then
+  `pip install --no-deps ./packages/echo-core ./packages/orin-proto ./packages/orin-guard .`.
+  Workspace packages are not on PyPI and cannot appear as unhashed `-e` lines.
   `scripts/export_constraints.py` exports it from the lockfile; CI `--check`
   fails on drift.
 

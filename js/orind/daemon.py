@@ -673,6 +673,19 @@ class OrinDaemon:
         if euid != os.geteuid():
             self._audit("peer_rejected", reason="euid mismatch", peer_euid=euid, peer_pid=pid)
             return None
+        from orin_guard.kernel.peer import PeerDenied, authenticate_peer
+
+        try:
+            authenticate_peer(
+                uid=euid,
+                pid=pid,
+                allowed_uids=frozenset({os.geteuid()}),
+                allowed_pids=frozenset({pid}) if pid > 0 else frozenset(),
+                loopback=True,
+            )
+        except PeerDenied:
+            self._audit("peer_rejected", reason="peer authentication failed", peer_euid=euid, peer_pid=pid)
+            return None
         return (euid, pid)
 
     async def _handshake(

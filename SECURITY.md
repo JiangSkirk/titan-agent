@@ -37,6 +37,10 @@ JS Agent 是**单租户本地个人 Agent Harness**，不是多租户 SaaS。
 **对抗性模型输出的唯一承重安全边界是操作系统隔离。**
 Echo 租约、ledger、guard、taint、工具白名单、审批门是**授权与纵深防御**，
 不是对抗边界。任何在 agent 进程内筛查 LLM 输出的组件都是启发式。
+Echo 3.0 / Orin 2.0 内核在 `packages/echo-core` 与 `packages/orin-guard`；
+宿主 shim 在 `js.echo` / `js.orin`。源码 RC 清单见
+[`docs/release/ECHO3_ORIN2.md`](docs/release/ECHO3_ORIN2.md)。
+PyPI 与独立 GitHub mirrors **尚未**发布。
 
 JS Agent 支持两种 OS 隔离姿态：
 
@@ -97,6 +101,14 @@ Host 本身仍在原生进程内。
 - **进程内启发式**（审批正则、输出脱敏、技能扫描、shell allowlist）捕获合作模式
   下的失误，不构成对抗边界。绕过它们本身不是第 3.1 节漏洞。
 
+### 2.3a Echo 3.0 / Orin 2.0 独立包
+
+`echo-core` 与 `orin-guard` 可独立安装，且不得 `import js.*`。
+**Prompt injection 未解**：这些包只提供架构级缓解（租约、污点、合取核、
+OS 隔离），不宣称「防住注入」。独立包的数据目录是 `~/.echo-core/` 与
+`~/.orin-guard/`，不读写 js-agent 状态目录。Stage C / `orin.enforce`
+在合取位未观察前保持 fail-fast，不得宣称 Echo RCE 已收口。
+
 ### 2.4 默认关闭的入站表面
 
 下列旗标默认 `false`，开启即扩大输入表面：
@@ -124,10 +136,11 @@ Host 本身仍在原生进程内。
 - 桌面构建 `desktop/requirements-build.txt` 使用精确 pin + `--hash`。
 - `scripts/install.sh` 拒绝远程 `curl | sh` 与无锁文件安装。
 - `pyproject.toml` 中的版本区间是解析上界；可复现构建以锁文件为准。
-- 不走 `uv.lock` 的下游安装必须使用仓库根目录 `constraints.txt`
-  （`pip install js-agent -c constraints.txt`；要校验传递依赖哈希则
-  `pip install --require-hashes -r constraints.txt` 后再
-  `pip install --no-deps js-agent`）。
+- 不走 `uv.lock` 的下游安装必须使用仓库根目录 `constraints.txt` 钉住第三方传递依赖。
+  推荐 `uv sync --frozen`。要校验哈希：
+  `pip install --require-hashes -r constraints.txt`，再
+  `pip install --no-deps ./packages/echo-core ./packages/orin-proto ./packages/orin-guard .`。
+  工作区包尚未上 PyPI，不能写进 hashed constraints（`-e` 行没有 hash）。
   该文件由 `scripts/export_constraints.py` 从锁文件导出，CI `--check` 防漂移。
 
 ## 3. 范围

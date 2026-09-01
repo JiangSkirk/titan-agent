@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-from js.orin.taint import AUTO_TASK, INBOX_CONTENT, WEB_CONTENT, current_entry_source_taint
+from echo_core.taint import AUTO_TASK, INBOX_CONTENT, WEB_CONTENT, current_entry_source_taint
 
 READONLY_GATEWAY_TOOLS: Final[frozenset[str]] = frozenset(
     {

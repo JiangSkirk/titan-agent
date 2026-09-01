@@ -9,6 +9,9 @@ authors = [
     {name = "JS Team"}
 ]
 dependencies = [
+    "echo-core==3.0.0",
+    "orin-proto==2.0.0",
+    "orin-guard==2.0.0",
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.14.2,<3",
     "rich>=13.9,<16",
@@ -90,7 +93,7 @@ dev = [
 ]
 
 [tool.mutmut]
-source_paths = ["js"]
+source_paths = ["js", "packages/orin-guard/orin_guard", "packages/echo-core/echo_core"]
 only_mutate = [
     "js/security/parser.py",
     "js/security/guard.py",
@@ -98,6 +101,12 @@ only_mutate = [
     "js/security/net_guard.py",
     "js/echo/ledger/strict_json.py",
     "js/echo/ledger/journal.py",
+    "packages/orin-guard/orin_guard/kernel/conjunction.py",
+    "packages/orin-guard/orin_guard/kernel/gate.py",
+    "packages/orin-guard/orin_guard/kernel/exec_parse.py",
+    "packages/orin-guard/orin_guard/kernel/identity.py",
+    "packages/echo-core/echo_core/ledger/strict_json.py",
+    "packages/echo-core/echo_core/ledger/journal.py",
 ]
 pytest_add_cli_args_test_selection = [
     "tests/test_security.py",
@@ -124,6 +133,14 @@ js-work = "js_work.cli:compat_main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.workspace]
+members = ["packages/echo-core", "packages/orin-proto", "packages/orin-guard"]
+
+[tool.uv.sources]
+echo-core = { workspace = true }
+orin-proto = { workspace = true }
+orin-guard = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["js", "js_work"]
@@ -157,6 +174,51 @@ ignore = ["E501", "TC001", "TC003", "SIM105", "SIM108", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/test_r6_memory_persistent.py" = ["N802"]
+"js/echo/os_sandbox.py" = ["F403", "F405"]
+"js/echo/types.py" = ["F403", "F405"]
+"js/echo/primitives.py" = ["F403", "F405"]
+"js/echo/core.py" = ["F403", "F405"]
+"js/echo/amber.py" = ["F403", "F405"]
+"js/echo/amber_tree.py" = ["F403", "F405"]
+"js/echo/tide.py" = ["F403", "F405"]
+"js/echo/tide_controller.py" = ["F403", "F405"]
+"js/echo/wheel.py" = ["F403", "F405"]
+"js/echo/timing_wheel.py" = ["F403", "F405"]
+"js/echo/capability.py" = ["F403", "F405"]
+"js/echo/capability_constants.py" = ["F403", "F405"]
+"js/echo/capability_encoding.py" = ["F403", "F405"]
+"js/echo/capability_exceptions.py" = ["F403", "F405"]
+"js/echo/sandbox.py" = ["F403", "F405"]
+"js/echo/mode_contract.py" = ["F403", "F405"]
+"js/echo/execution_contract.py" = ["F403", "F405"]
+"js/echo/runtime.py" = ["F403", "F405"]
+"js/echo/testing.py" = ["F403", "F405"]
+"js/echo/ledger/_hashing.py" = ["F403", "F405"]
+"js/echo/ledger/archive_store.py" = ["F403", "F405"]
+"js/echo/ledger/compat.py" = ["F403", "F405"]
+"js/echo/ledger/effects.py" = ["F403", "F405"]
+"js/echo/ledger/epoch.py" = ["F403", "F405"]
+"js/echo/ledger/journal.py" = ["F403", "F405"]
+"js/echo/ledger/journal_recovery.py" = ["F403", "F405"]
+"js/echo/ledger/kernel.py" = ["F403", "F405"]
+"js/echo/ledger/memory.py" = ["F403", "F405"]
+"js/echo/ledger/merkle.py" = ["F403", "F405"]
+"js/echo/ledger/partition_retention.py" = ["F403", "F405"]
+"js/echo/ledger/plugins.py" = ["F403", "F405"]
+"js/echo/ledger/policy.py" = ["F403", "F405"]
+"js/echo/ledger/privacy.py" = ["F403", "F405"]
+"js/echo/ledger/sandbox_backend.py" = ["F403", "F405"]
+"js/echo/ledger/slo.py" = ["F403", "F405"]
+"js/echo/ledger/slo_contract.py" = ["F403", "F405"]
+"js/echo/ledger/strict_json.py" = ["F403", "F405"]
+"js/echo/ledger/tip_anchor.py" = ["F403", "F405"]
+"js/echo/ledger/tip_seal.py" = ["F403", "F405"]
+"js/echo/ledger/types.py" = ["F403", "F405"]
+"js/echo/ledger/verification.py" = ["F403", "F405"]
+"js/orin/taint.py" = ["F403", "F405"]
+"js/orin/sinks.py" = ["F403", "F405"]
+"packages/orin-guard/**/*.py" = ["N818"]
+"packages/echo-core/**/*.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -176,6 +238,7 @@ module = [
     "rfc8785.*",
     "tiktoken",
     "telegram.*",
+    "xlrd",
 ]
 ignore_missing_imports = true
 

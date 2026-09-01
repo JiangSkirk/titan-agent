@@ -40,10 +40,13 @@ def runtime_package_root() -> Path:
 @contextmanager
 def override_runtime_package_root(root: Path) -> Iterator[Path]:
     """Point TCB matching at a fake ``js/`` tree for tests."""
+    from echo_core.tcb import override_runtime_package_root as echo_override
+
     resolved = root.resolve()
     token = _package_root_override.set(resolved)
     try:
-        yield resolved
+        with echo_override(resolved):
+            yield resolved
     finally:
         _package_root_override.reset(token)
 

@@ -8,6 +8,10 @@ JS Agent 不是聊天机器人，而是一套**本地个人 Agent Harness**—�
 
 模型只是引擎。Harness 才是让引擎能安全、持续、可复用地完成实际工作的完整车架。
 
+Echo 3.0 / Orin 2.0 已抽成工作区包（`packages/echo-core`、`packages/orin-proto`、
+`packages/orin-guard`）。从本仓库 `uv sync` 安装；**尚未**上 PyPI。清单与红灯见
+[docs/release/ECHO3_ORIN2.md](docs/release/ECHO3_ORIN2.md)。
+
 ## 核心驾驭能力
 
 ### 🧠 记忆与上下文胶囊
@@ -69,12 +73,14 @@ JS Agent 不是聊天机器人，而是一套**本地个人 Agent Harness**—�
 
 手动安装：
 
-发布面或不用 `uv.lock` 的下游安装，用仓库根目录的 hashed `constraints.txt`，不要让 pip 现场解析区间：
+发布面或不用 `uv.lock` 的下游安装，用仓库根目录的 hashed `constraints.txt`
+钉住**第三方**传递依赖（不含 echo-core / orin-*，它们在 `packages/`，尚未上 PyPI）：
 
 ```bash
-pip install js-agent -c constraints.txt
-# 若要校验传递依赖哈希：
-# pip install --require-hashes -r constraints.txt && pip install --no-deps js-agent
+uv sync --frozen
+# 或：先装 hashed 第三方，再装本仓库包
+# pip install --require-hashes -r constraints.txt
+# pip install --no-deps ./packages/echo-core ./packages/orin-proto ./packages/orin-guard .
 ```
 
 开发机推荐 `uv sync --frozen`。仅当确认走锁文件时才用可编辑安装：

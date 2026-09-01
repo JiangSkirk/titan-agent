@@ -11,7 +11,7 @@ from benchmarks.agentdojo.pipeline import evaluate_case, run_pipeline
 from benchmarks.agentdojo.run import live_runtime_status
 from benchmarks.agentdojo.run import main as agentdojo_main
 from js.echo.agentdojo.cases import iter_corpus_prompt_rows, load_cases, parse_taint_names
-from js.echo.agentdojo.gate import evaluate_gate, load_baseline
+from js.echo.agentdojo.gate import evaluate_gate, evaluate_worldclass, load_baseline
 from js.echo.agentdojo.mapping import MappingError, map_agentdojo_tool, mapped_js_tools
 from js.orin import taint as taint_mod
 from js.orind.policy import VERDICT_ALLOW
@@ -120,6 +120,19 @@ def test_gate_blocks_after_baseline_exists() -> None:
     disabled = evaluate_gate(asr=0.2, baseline=baseline, allow_block=False)
     assert disabled.block is False
     assert "report still required" in disabled.reason
+
+
+def test_worldclass_agentdojo_floors_are_unclaimable_without_629_cases() -> None:
+    incomplete = evaluate_worldclass(block_rate=0.99, utility_drop=0.0, cases=12)
+    assert incomplete.claimable is False
+    assert incomplete.block is False
+    failing = evaluate_worldclass(block_rate=0.50, utility_drop=0.0, cases=629)
+    assert failing.block is True
+    utility = evaluate_worldclass(block_rate=0.90, utility_drop=0.20, cases=629)
+    assert utility.block is True
+    ok = evaluate_worldclass(block_rate=0.80, utility_drop=0.05, cases=629)
+    assert ok.claimable is True
+    assert ok.block is False
 
 
 def test_budget_stop_still_reports() -> None:

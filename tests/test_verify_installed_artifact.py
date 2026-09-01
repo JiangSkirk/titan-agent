@@ -64,6 +64,8 @@ def test_verify_wheel_uses_clean_venv_and_normal_dependency_install(
     assert commands[7][:2] == [str(venv_dir / "bin" / "python"), "-c"]
     import_check = commands[7][2]
     assert "import js.echo" in import_check
+    assert "import echo_core" in import_check
+    assert "import orin_guard" in import_check
     assert "import js_work.web" in import_check
     assert "js.rivetline" in import_check
     assert "js.agent_core" in import_check
@@ -80,12 +82,22 @@ def test_verify_wheel_uses_clean_venv_and_normal_dependency_install(
         assert kwargs["cwd"] == (venv_dir.parent if index == 0 else venv_dir)
 
 
+def test_find_wheel_picks_js_agent_among_workspace_wheels(tmp_path: Path) -> None:
+    verifier = _verifier_module()
+    (tmp_path / "echo_core-3.0.0-py3-none-any.whl").touch()
+    js_wheel = tmp_path / "js_agent-0.1.5-py3-none-any.whl"
+    js_wheel.touch()
+    (tmp_path / "orin_guard-2.0.0-py3-none-any.whl").touch()
+    (tmp_path / "orin_proto-2.0.0-py3-none-any.whl").touch()
+    assert verifier.find_wheel(tmp_path) == js_wheel
+
+
 def test_find_wheel_requires_exactly_one_wheel(tmp_path: Path) -> None:
     verifier = _verifier_module()
     (tmp_path / "first.whl").touch()
     (tmp_path / "second.whl").touch()
 
-    with pytest.raises(RuntimeError, match="exactly one wheel"):
+    with pytest.raises(RuntimeError, match="js-agent wheel"):
         verifier.find_wheel(tmp_path)
 
 
@@ -107,7 +119,11 @@ def test_verify_wheel_audits_only_the_clean_installed_artifact_site_packages(
     verifier.verify_wheel(wheel, venv_dir, audit=True)
 
     audit_command = next(command for command, _ in calls if "pip_audit" in command)
-    assert audit_command[:3] == [str(venv_dir.parent / "audit" / "bin" / "python"), "-m", "pip_audit"]
+    assert audit_command[:3] == [
+        str(venv_dir.parent / "audit" / "bin" / "python"),
+        "-m",
+        "pip_audit",
+    ]
     assert "--path" in audit_command
     assert str(venv_dir) in audit_command[audit_command.index("--path") + 1]
     assert "--local" not in audit_command

@@ -207,6 +207,20 @@ class GateKeeper:
         if policy_error is not None:
             self._sign_receipt(kind="issue", verdict=decision.verdict, lease_id="")
             return policy_error
+        from orin_guard.kernel.conjunction import ConjunctionDenied, require_conjunction
+        from orin_guard.kernel.grants import grants_for_tool
+
+        try:
+            require_conjunction(
+                grants_for_tool(
+                    tool_name,
+                    resource_scope=str(lease_params.get("resource_scope", "")),
+                    context_taint=context_taint,
+                )
+            )
+        except ConjunctionDenied as exc:
+            self._sign_receipt(kind="issue", verdict="deny", lease_id="")
+            return {"ok": False, "code": "conjunction", "reason": str(exc)}
         try:
             lease = self._issue_from_params(
                 lease_params,

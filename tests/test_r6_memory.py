@@ -12,6 +12,12 @@ import time
 from pathlib import Path
 
 import pytest
+from echo_core.taint import (
+    USER_TURN,
+    ToolTaintSnapshot,
+    reset_tool_taint_snapshot,
+    set_tool_taint_snapshot,
+)
 
 from js.memory.compression import CompressionPipeline
 from js.memory.compression_schema import ensure_compression_schema
@@ -100,8 +106,21 @@ def _insert_claim(
             created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, '[]', NULL, ?, '[]', ?, ?, ?)
         """,
-        (claim_id, owner, subject_id, predicate, value, now, now, status, confidence,
-         source_authority, evidence, now, now),
+        (
+            claim_id,
+            owner,
+            subject_id,
+            predicate,
+            value,
+            now,
+            now,
+            status,
+            confidence,
+            source_authority,
+            evidence,
+            now,
+            now,
+        ),
     )
 
 
@@ -125,9 +144,7 @@ def _setup_db(db_path: Path, *, owner: str = _OWNER) -> None:
 
 
 def _make_source_refs() -> tuple[MemorySourceRefV1, ...]:
-    return (
-        MemorySourceRefV1(kind=MemoryRecordKind.CLAIM, record_id="clm-1"),
-    )
+    return (MemorySourceRefV1(kind=MemoryRecordKind.CLAIM, record_id="clm-1"),)
 
 
 class TestMemoryRecord:
@@ -135,10 +152,16 @@ class TestMemoryRecord:
 
     def test_valid_personal_record(self) -> None:
         r = MemoryRecord(
-            record_id="rec-1", kind=MemoryRecordKind.CLAIM, owner=_OWNER,
-            mode="personal", workspace=None, layer=MemoryLayer.WORKING,
-            content_hash=compute_content_hash("test"), sensitivity="internal",
-            retention="medium", created_at=time.time(),
+            record_id="rec-1",
+            kind=MemoryRecordKind.CLAIM,
+            owner=_OWNER,
+            mode="personal",
+            workspace=None,
+            layer=MemoryLayer.WORKING,
+            content_hash=compute_content_hash("test"),
+            sensitivity="internal",
+            retention="medium",
+            created_at=time.time(),
         )
         assert r.mode == "personal"
         assert r.workspace is None
@@ -146,10 +169,16 @@ class TestMemoryRecord:
 
     def test_valid_work_record(self) -> None:
         r = MemoryRecord(
-            record_id="rec-1", kind=MemoryRecordKind.CLAIM, owner=_OWNER,
-            mode="work", workspace=_WORKSPACE, layer=MemoryLayer.WORKING,
-            content_hash=compute_content_hash("test"), sensitivity="internal",
-            retention="medium", created_at=time.time(),
+            record_id="rec-1",
+            kind=MemoryRecordKind.CLAIM,
+            owner=_OWNER,
+            mode="work",
+            workspace=_WORKSPACE,
+            layer=MemoryLayer.WORKING,
+            content_hash=compute_content_hash("test"),
+            sensitivity="internal",
+            retention="medium",
+            created_at=time.time(),
         )
         assert r.mode == "work"
         assert r.workspace == _WORKSPACE
@@ -157,23 +186,36 @@ class TestMemoryRecord:
     def test_personal_rejects_workspace(self) -> None:
         with pytest.raises(ValueError, match="workspace"):
             MemoryRecord(
-                record_id="rec-1", kind=MemoryRecordKind.CLAIM, owner=_OWNER,
-                mode="personal", workspace="bad", layer=MemoryLayer.WORKING,
-                content_hash=compute_content_hash("test"), sensitivity="internal",
-                retention="medium", created_at=time.time(),
+                record_id="rec-1",
+                kind=MemoryRecordKind.CLAIM,
+                owner=_OWNER,
+                mode="personal",
+                workspace="bad",
+                layer=MemoryLayer.WORKING,
+                content_hash=compute_content_hash("test"),
+                sensitivity="internal",
+                retention="medium",
+                created_at=time.time(),
             )
 
     def test_record_cannot_be_subclassed(self) -> None:
         with pytest.raises(TypeError):
+
             class Sub(MemoryRecord):
                 pass
 
     def test_record_id_does_not_use_python_hash(self) -> None:
         r1 = MemoryRecord(
-            record_id="rec-sha", kind=MemoryRecordKind.CLAIM, owner=_OWNER,
-            mode="personal", workspace=None, layer=MemoryLayer.WORKING,
-            content_hash=compute_content_hash("hello"), sensitivity="internal",
-            retention="medium", created_at=time.time(),
+            record_id="rec-sha",
+            kind=MemoryRecordKind.CLAIM,
+            owner=_OWNER,
+            mode="personal",
+            workspace=None,
+            layer=MemoryLayer.WORKING,
+            content_hash=compute_content_hash("hello"),
+            sensitivity="internal",
+            retention="medium",
+            created_at=time.time(),
         )
         assert r1.record_id == "rec-sha"
 
@@ -192,10 +234,14 @@ class TestR6CounterexampleFixes:
         auth = _make_authority()
         refs = _make_source_refs()
         p1 = pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary="摘要A",
+            authority=auth,
+            source_refs=refs,
+            proposed_summary="摘要A",
         )
         p2 = pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary="摘要B",
+            authority=auth,
+            source_refs=refs,
+            proposed_summary="摘要B",
         )
         assert p1.proposal_id != p2.proposal_id
 
@@ -207,7 +253,9 @@ class TestR6CounterexampleFixes:
         auth_a = _make_authority(owner=_OWNER)
         refs = _make_source_refs()
         proposal = pipeline.create_proposal(
-            authority=auth_a, source_refs=refs, proposed_summary="摘要",
+            authority=auth_a,
+            source_refs=refs,
+            proposed_summary="摘要",
         )
         auth_b = _make_authority(owner=_OWNER_B)
         result = pipeline.approve_proposal(proposal.proposal_id, authority=auth_b)
@@ -222,11 +270,15 @@ class TestR6CounterexampleFixes:
         auth = _make_authority()
         refs = _make_source_refs()
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary="摘要",
+            authority=auth,
+            source_refs=refs,
+            proposed_summary="摘要",
         )
         pipeline.approve_proposal(proposal.proposal_id, authority=auth)
         pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary="摘要",
+            authority=auth,
+            source_refs=refs,
+            proposed_summary="摘要",
         )
         scope = CompressionScopeV1(owner=_OWNER, mode="personal", workspace=None)
         proposals = pipeline.list_proposals(scope=scope, status="approved")
@@ -241,7 +293,9 @@ class TestR6CounterexampleFixes:
         refs = _make_source_refs()
         summary = "这是一段没有空格的中文摘要用于测试真实分词器"
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary=summary,
+            authority=auth,
+            source_refs=refs,
+            proposed_summary=summary,
         )
         assert proposal.summary_token_count > 1, "无空格中文 BPE token count 应 > 1"
 
@@ -253,12 +307,13 @@ class TestR6CounterexampleFixes:
         auth = _make_authority()
         refs = _make_source_refs()
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary="摘要",
+            authority=auth,
+            source_refs=refs,
+            proposed_summary="摘要",
         )
         with sqlite3.connect(str(db)) as conn:
             conn.execute(
-                "UPDATE compression_proposal_sources SET source_hash = ? "
-                "WHERE proposal_id = ?",
+                "UPDATE compression_proposal_sources SET source_hash = ? WHERE proposal_id = ?",
                 ("sha256:fakehash", proposal.proposal_id),
             )
             conn.commit()
@@ -273,13 +328,16 @@ class TestR6CounterexampleFixes:
         auth = _make_authority()
         refs = _make_source_refs()
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary="这是完整摘要文本",
+            authority=auth,
+            source_refs=refs,
+            proposed_summary="这是完整摘要文本",
         )
         result = pipeline.approve_proposal(proposal.proposal_id, authority=auth)
         assert result.success
         assert result.capsule is not None
         rehydrated = pipeline.rehydrate_capsule(
-            result.capsule.capsule_id, authority=auth,
+            result.capsule.capsule_id,
+            authority=auth,
         )
         assert rehydrated is not None
         assert rehydrated.proposed_summary == "这是完整摘要文本"
@@ -296,12 +354,29 @@ class TestCompressionPipeline:
         pipeline = CompressionPipeline(db)
         auth = _make_authority()
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=_make_source_refs(),
+            authority=auth,
+            source_refs=_make_source_refs(),
             proposed_summary="test summary",
         )
         assert proposal.status == "pending"
         assert len(proposal.source_refs) == 1
         assert proposal.coverage_numerator > 0
+
+    def test_create_proposal_does_not_flush_on_window_taint(self, tmp_path: Path) -> None:
+        """Window USER_TURN must not launder proposed_summary into ExperienceBank."""
+        db = tmp_path / "memory.db"
+        _setup_db(db)
+        pipeline = CompressionPipeline(db)
+        token = set_tool_taint_snapshot(ToolTaintSnapshot(context_taint=USER_TURN))
+        try:
+            pipeline.create_proposal(
+                authority=_make_authority(),
+                source_refs=_make_source_refs(),
+                proposed_summary="web-derived summary must not become trusted experience",
+            )
+        finally:
+            reset_tool_taint_snapshot(token)
+        assert not (tmp_path / "experience_bank.db").exists()
 
     def test_approve_proposal_creates_capsule(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
@@ -309,7 +384,8 @@ class TestCompressionPipeline:
         pipeline = CompressionPipeline(db)
         auth = _make_authority()
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=_make_source_refs(),
+            authority=auth,
+            source_refs=_make_source_refs(),
             proposed_summary="summary",
         )
         result = pipeline.approve_proposal(proposal.proposal_id, authority=auth)
@@ -323,7 +399,8 @@ class TestCompressionPipeline:
         pipeline = CompressionPipeline(db)
         auth = _make_authority()
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=_make_source_refs(),
+            authority=auth,
+            source_refs=_make_source_refs(),
             proposed_summary="summary",
         )
         rejected = pipeline.reject_proposal(proposal.proposal_id, authority=auth)
@@ -336,7 +413,8 @@ class TestCompressionPipeline:
         pipeline = CompressionPipeline(db)
         auth_admin = _make_authority(role="admin")
         proposal = pipeline.create_proposal(
-            authority=auth_admin, source_refs=_make_source_refs(),
+            authority=auth_admin,
+            source_refs=_make_source_refs(),
             proposed_summary="summary",
         )
         auth_user = _make_authority(role="user")
@@ -350,13 +428,15 @@ class TestCompressionPipeline:
         pipeline = CompressionPipeline(db)
         auth = _make_authority()
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=_make_source_refs(),
+            authority=auth,
+            source_refs=_make_source_refs(),
             proposed_summary="summary",
         )
         result = pipeline.approve_proposal(proposal.proposal_id, authority=auth)
         auth_b = _make_authority(owner=_OWNER_B)
         rehydrated = pipeline.rehydrate_capsule(
-            result.capsule.capsule_id, authority=auth_b,
+            result.capsule.capsule_id,
+            authority=auth_b,
         )
         assert rehydrated is None
 
@@ -367,10 +447,14 @@ class TestCompressionPipeline:
         auth = _make_authority()
         refs = _make_source_refs()
         p1 = pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary="same summary",
+            authority=auth,
+            source_refs=refs,
+            proposed_summary="same summary",
         )
         p2 = pipeline.create_proposal(
-            authority=auth, source_refs=refs, proposed_summary="same summary",
+            authority=auth,
+            source_refs=refs,
+            proposed_summary="same summary",
         )
         assert p1.proposal_id == p2.proposal_id
 
@@ -380,7 +464,8 @@ class TestCompressionPipeline:
         pipeline = CompressionPipeline(db)
         auth = _make_authority()
         proposal = pipeline.create_proposal(
-            authority=auth, source_refs=_make_source_refs(),
+            authority=auth,
+            source_refs=_make_source_refs(),
             proposed_summary="summary",
         )
         r1 = pipeline.approve_proposal(proposal.proposal_id, authority=auth)
@@ -397,10 +482,16 @@ class TestChineseMemory:
     def test_chinese_memory_record(self, i: int) -> None:
         content = f"这是第{i}条中文长期记忆测试记录，内容包含一些中文文本。"
         r = MemoryRecord(
-            record_id=f"rec-{_sha_id(content)}", kind=MemoryRecordKind.CLAIM,
-            owner=_OWNER, mode="personal", workspace=None,
-            layer=MemoryLayer.WORKING, content_hash=compute_content_hash(content),
-            sensitivity="internal", retention="medium", created_at=time.time(),
+            record_id=f"rec-{_sha_id(content)}",
+            kind=MemoryRecordKind.CLAIM,
+            owner=_OWNER,
+            mode="personal",
+            workspace=None,
+            layer=MemoryLayer.WORKING,
+            content_hash=compute_content_hash(content),
+            sensitivity="internal",
+            retention="medium",
+            created_at=time.time(),
         )
         assert r.content_hash.startswith("sha256:")
         assert r.content_hash != compute_content_hash("different")

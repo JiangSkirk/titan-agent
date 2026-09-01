@@ -11,6 +11,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from echo_core import taint as orin_taint
+
 from js.echo.attachment_gate import attachment_entry_taint, build_attachment_manifest
 from js.echo.context_runtime import observe_prompt_context
 from js.echo.context_tokenizer import TokenCounter
@@ -84,7 +86,6 @@ from js.models.cascade import (
     set_cascade_intent,
 )
 from js.models.providers import ChatMessage, ChatResponse
-from js.orin import taint as orin_taint
 from js.security.audit import AuditEventType
 from js.security.guard import SecurityDecisionType
 from js.security.secrets import StreamingSecretRedactor

@@ -86,6 +86,17 @@ class TelegramBotIntegration:
                 chat_id,
             )
             return False
+        from orin_guard.kernel.identity import IdentityDenied, resolve_allowlist_identity
+
+        try:
+            resolve_allowlist_identity(
+                platform="telegram",
+                immutable_id=str(chat_id),
+                display_name=None,
+                allow_ids=frozenset(str(item) for item in allowed),
+            )
+        except IdentityDenied:
+            return False
         return True
 
     def _get_session(self, chat_id: int) -> str | None:

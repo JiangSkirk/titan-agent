@@ -1,4 +1,5 @@
 """R1-C: DirectoryGrant pure leaf contract tests."""
+
 from __future__ import annotations
 
 import ast
@@ -14,7 +15,7 @@ from typing import Any
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "js" / "echo" / "mode_contract.py"
+MODULE_PATH = ROOT / "packages" / "echo-core" / "echo_core" / "mode_contract.py"
 PRODUCTION_ROOTS = (ROOT / "js", ROOT / "js_work")
 
 
@@ -22,8 +23,9 @@ def contract() -> Any:
     return importlib.import_module("js.echo.mode_contract")
 
 
-def make_grant(mod: Any, *, mode: Any = None, root: str = "/home/user/docs",
-               workspace: str | None = "ws-a") -> Any:
+def make_grant(
+    mod: Any, *, mode: Any = None, root: str = "/home/user/docs", workspace: str | None = "ws-a"
+) -> Any:
     c = contract()
     actual_mode = mode or c.AppMode.WORK
     if actual_mode is c.AppMode.PERSONAL:
@@ -51,6 +53,7 @@ def test_public_symbols_exist() -> None:
 def test_subclass_rejected() -> None:
     mod = contract()
     with pytest.raises(TypeError):
+
         class EvilGrant(mod.DirectoryGrantV1):
             pass
 
@@ -133,9 +136,10 @@ def test_canonical_hash_format() -> None:
     grant = make_grant(mod)
     h = grant.canonical_hash()
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", h)
-    expected = "sha256:" + hashlib.sha256(
-        mod.DIRECTORY_GRANT_HASH_DOMAIN + grant.canonical_bytes()
-    ).hexdigest()
+    expected = (
+        "sha256:"
+        + hashlib.sha256(mod.DIRECTORY_GRANT_HASH_DOMAIN + grant.canonical_bytes()).hexdigest()
+    )
     assert h == expected
 
 
@@ -251,8 +255,7 @@ def _assert_exact_directory_grant_consumers(root: Path) -> None:
                     string_args = [
                         argument.value
                         for argument in node.args
-                        if isinstance(argument, ast.Constant)
-                        and isinstance(argument.value, str)
+                        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
                     ]
                     assert not any("DirectoryGrant" in value for value in string_args), (
                         f"dynamic directory grant lookup found in {relative}"
@@ -300,13 +303,23 @@ def test_no_io_in_module() -> None:
         if imported:
             assert not any(
                 x in imported
-                for x in ("os", "pathlib", "socket", "urllib", "requests", "subprocess", "time", "random")
+                for x in (
+                    "os",
+                    "pathlib",
+                    "socket",
+                    "urllib",
+                    "requests",
+                    "subprocess",
+                    "time",
+                    "random",
+                )
             ), f"forbidden import: {imported}"
 
 
 # ============================================================
 # R1-F08: Path normalization
 # ============================================================
+
 
 def test_trailing_slash_rejected() -> None:
     """Non-root paths with trailing slash must be rejected."""

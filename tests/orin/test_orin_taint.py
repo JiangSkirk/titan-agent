@@ -178,3 +178,5 @@ class TestChatMessageSerializationIsolation:
         state.messages.append(ChatMessage(role="user", content="hi", taint=t.SECRET))
         dumped = state.to_dict()
         assert all("taint" not in message for message in dumped["messages"])
+        assert "context_taint" not in dumped
+        assert state.context_taint == t.SECRET

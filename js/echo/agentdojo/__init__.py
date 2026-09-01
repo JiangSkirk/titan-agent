@@ -16,7 +16,9 @@ from js.echo.agentdojo.cases import (
 from js.echo.agentdojo.gate import (
     BASELINE_NAME,
     GateDecision,
+    WorldclassDecision,
     evaluate_gate,
+    evaluate_worldclass,
     load_baseline,
 )
 from js.echo.agentdojo.mapping import (
@@ -31,7 +33,9 @@ __all__ = [
     "CaseSplit",
     "GateDecision",
     "MappingError",
+    "WorldclassDecision",
     "evaluate_gate",
+    "evaluate_worldclass",
     "load_baseline",
     "load_cases",
     "map_agentdojo_tool",

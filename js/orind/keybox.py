@@ -59,7 +59,9 @@ def _read_key_strict(path: Path, *, strict_paths: bool = False) -> bytes:
         try:
             encoded = read_private_file(path, max_bytes=128).decode("utf-8").strip()
         except (OSError, UnicodeError, PrivatePathError) as exc:
-            raise KeyBoxError(f"invalid key file {path}: expected a private 32-byte key file") from exc
+            raise KeyBoxError(
+                f"invalid key file {path}: expected a private 32-byte key file"
+            ) from exc
         return _decode_key(path, encoded)
 
     try:
@@ -242,11 +244,10 @@ class KeyBox:
         if self._tier == "production" and os.uname().sysname == "Darwin":
             try:
                 return self._load_production()
-            except KeyBoxError:
-                # Spike fallback: honest dev-tier degradation, documented in
-                # the daemon log; never pretend the Keychain succeeded.
-                self._active_tier = "dev"
-                return self._load_dev()
+            except KeyBoxError as exc:
+                raise KeyBoxError(
+                    "production KeyBox failed; refusing silent dev-tier fallback"
+                ) from exc
         self._active_tier = "dev"
         return self._load_dev()
 
@@ -338,11 +339,15 @@ class KeyBox:
         if self._strict_paths:
             try:
                 identity = verify_private_file(fp_path)
-                recorded = read_private_file(
-                    fp_path,
-                    expected=identity,
-                    max_bytes=128,
-                ).decode("ascii").strip()
+                recorded = (
+                    read_private_file(
+                        fp_path,
+                        expected=identity,
+                        max_bytes=128,
+                    )
+                    .decode("ascii")
+                    .strip()
+                )
             except (PrivatePathError, UnicodeError) as exc:
                 raise KeyBoxError("invalid keybox fingerprint file") from exc
         else:

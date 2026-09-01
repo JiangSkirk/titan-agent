@@ -459,6 +459,13 @@ class ShellTool:
         if allowlist_error is not None:
             return ToolResult(success=False, error=allowlist_error)
 
+        from orin_guard.kernel.exec_parse import ExecParseDenied, reject_lexical_bypass
+
+        try:
+            reject_lexical_bypass(command)
+        except ExecParseDenied as exc:
+            return ToolResult(success=False, error=f"Security: {exc}")
+
         from js.orin.hooks import inspect_canary_text
 
         canary_block = inspect_canary_text(command, surface="shell")

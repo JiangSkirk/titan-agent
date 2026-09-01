@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Final
 
-from js.orin.sinks import TOOL_SINKS
+from echo_core.sinks import TOOL_SINKS
 
 # AgentDojo suite tool → js-agent registry name.
 # Workspace / slack / gmail / calendar / banking / travel names from

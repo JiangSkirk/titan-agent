@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal
 
-from js.orin import taint as taint_mod
+from echo_core import taint as taint_mod
 
 CaseSplit = Literal["ci", "held_out"]
 

@@ -100,3 +100,21 @@ def test_adopted_ledger_replays_in_place(tmp_path: Path) -> None:
     stored = reloaded._issued[lease.lease_id]
     assert stored.mac == lease.mac
     reloaded.consume(stored, now=now + 1)
+
+
+def test_production_keybox_refuses_silent_dev_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = _make_state(tmp_path)
+
+    class _Uname:
+        sysname = "Darwin"
+
+    monkeypatch.setattr("js.orind.keybox.os.uname", lambda: _Uname())
+
+    def _fail(self: KeyBox) -> bytes:
+        raise KeyBoxError("keychain missing")
+
+    monkeypatch.setattr(KeyBox, "_load_production", _fail)
+    with pytest.raises(KeyBoxError, match="refusing silent"):
+        KeyBox(state_dir, tier="production")

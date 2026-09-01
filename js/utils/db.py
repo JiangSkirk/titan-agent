@@ -45,6 +45,9 @@ PRODUCT_STATE_DB_NAMES: tuple[str, ...] = (
     "bots.db",
     "evolution_proposals.db",
     "friends.db",
+    "phylogeny.db",
+    "experience_bank.db",
+    "evolution_staging.db",
 )
 
 
@@ -265,6 +268,10 @@ def db_connection(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=10.0)
     try:
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            pass
         _set_busy_timeout(conn, _BOOTSTRAP_BUSY_TIMEOUT_MS)
         _ensure_wal(conn, db_path)
         _set_busy_timeout(conn, _NORMAL_BUSY_TIMEOUT_MS)
@@ -290,6 +297,10 @@ async def adb_connection(
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(str(db_path), timeout=15.0) as conn:
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            pass
         await _set_busy_timeout_async(conn, _BOOTSTRAP_BUSY_TIMEOUT_MS)
         await _ensure_wal_async(conn, db_path)
         await _set_busy_timeout_async(conn, _NORMAL_BUSY_TIMEOUT_MS)

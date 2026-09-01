@@ -62,7 +62,7 @@ def test_linux_unshare_is_not_reported_as_filesystem_isolation(
     backend._executor._has_sandbox_exec = False
     backend._executor._has_unshare = True
     backend._executor._has_bwrap = False
-    monkeypatch.setattr("js.echo.os_sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Linux")
 
     probe = backend.probe()
 

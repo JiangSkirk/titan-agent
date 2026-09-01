@@ -14,7 +14,7 @@ import pytest
 from js.echo.turn_context import runtime_partition_key
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "js" / "echo" / "mode_contract.py"
+MODULE_PATH = ROOT / "packages" / "echo-core" / "echo_core" / "mode_contract.py"
 
 
 class MyStr(str):
@@ -263,7 +263,9 @@ def test_client_request_session_accepts_only_v1_identity_or_null(value: str | No
         ("e\u0301", "noncanonical_unicode", "session must be NFC-normalized"),
     ],
 )
-def test_client_request_session_errors_are_exact_subtype(value: object, code: str, detail: str) -> None:
+def test_client_request_session_errors_are_exact_subtype(
+    value: object, code: str, detail: str
+) -> None:
     """Session coercion or subtype leakage would blur the transport boundary."""
     mod = contract()
     with pytest.raises(Exception) as caught:
@@ -298,9 +300,16 @@ def test_client_request_personal_and_work_workspace_invariants() -> None:
     )
 
     for handle in ("w", "work-default", "team.alpha_01", "a" * 128):
-        assert mod.ClientTaskRequestV1.from_dict({"mode": "work", "workspace": handle}).workspace == handle
+        assert (
+            mod.ClientTaskRequestV1.from_dict({"mode": "work", "workspace": handle}).workspace
+            == handle
+        )
 
-    for payload in ({"mode": "work"}, {"mode": "work", "workspace": None}, {"mode": "work", "workspace": ""}):
+    for payload in (
+        {"mode": "work"},
+        {"mode": "work", "workspace": None},
+        {"mode": "work", "workspace": ""},
+    ):
         with pytest.raises(Exception) as missing:
             mod.ClientTaskRequestV1.from_dict(payload)
         assert_exact_error(
@@ -335,13 +344,17 @@ def test_client_request_personal_and_work_workspace_invariants() -> None:
         "a" * 129,
     ],
 )
-def test_client_request_work_workspace_rejects_types_paths_and_dot_shapes(workspace: object) -> None:
+def test_client_request_work_workspace_rejects_types_paths_and_dot_shapes(
+    workspace: object,
+) -> None:
     """A workspace handle must never be interpreted as a filesystem path or URI."""
     mod = contract()
     with pytest.raises(Exception) as caught:
         mod.ClientTaskRequestV1.from_dict({"mode": "work", "workspace": workspace})
     code = "invalid_type" if type(workspace) is not str else "invalid_value"
-    detail = "workspace must be text" if code == "invalid_type" else "workspace must be an opaque handle"
+    detail = (
+        "workspace must be text" if code == "invalid_type" else "workspace must be an opaque handle"
+    )
     assert_exact_error(
         mod,
         caught.value,
@@ -361,7 +374,9 @@ def test_client_request_serialization_is_minimal_canonical_and_authority_free() 
         "session": "session-a",
         "workspace": "work-a",
     }
-    assert request.canonical_bytes() == b'{"mode":"work","session":"session-a","workspace":"work-a"}'
+    assert (
+        request.canonical_bytes() == b'{"mode":"work","session":"session-a","workspace":"work-a"}'
+    )
     assert set(request.to_dict()) == {"mode", "session", "workspace"}
 
 
@@ -603,7 +618,10 @@ def test_adapter_rejects_raw_and_subclass_request_or_authority() -> None:
     class AuthoritySubclass(mod.ResolvedTaskAuthorityV1):
         pass
 
-    bad_requests = [work_request_payload(), RequestSubclass(mode=mod.AppMode.WORK, session="session-a", workspace="work-a")]
+    bad_requests = [
+        work_request_payload(),
+        RequestSubclass(mode=mod.AppMode.WORK, session="session-a", workspace="work-a"),
+    ]
     for bad_request in bad_requests:
         with pytest.raises(Exception) as caught:
             mod.task_ref_from_client_request_v1(
@@ -714,13 +732,23 @@ def test_adapter_signature_and_task_ref_dataflow_are_narrow() -> None:
         if isinstance(node, ast.FunctionDef) and node.name == "task_ref_from_client_request_v1"
     )
     body_source = ast.unparse(fn)
-    for forbidden in ("account_id", "principal", "key_hash", "product_id", "settings", "auth.get", "uuid"):
+    for forbidden in (
+        "account_id",
+        "principal",
+        "key_hash",
+        "product_id",
+        "settings",
+        "auth.get",
+        "uuid",
+    ):
         assert forbidden not in body_source
 
     task_ref_calls = [
         node
         for node in ast.walk(fn)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "TaskRef"
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "TaskRef"
     ]
     assert len(task_ref_calls) == 1
     keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in task_ref_calls[0].keywords}
@@ -736,8 +764,14 @@ def test_adapter_signature_and_task_ref_dataflow_are_narrow() -> None:
 def test_client_from_dict_never_builds_internal_task_ref() -> None:
     """The client DTO parser must not delegate to the internal TaskRef parser."""
     tree = module_tree()
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ClientTaskRequestV1")
-    from_dict = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "from_dict")
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ClientTaskRequestV1"
+    )
+    from_dict = next(
+        node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "from_dict"
+    )
     assert "TaskRef.from_dict" not in ast.unparse(from_dict)
 
 
@@ -774,7 +808,9 @@ def test_batch2_contract_remains_a_leaf_without_production_callsites() -> None:
             source = path.read_text(encoding="utf-8")
             tree = ast.parse(source)
             for node in ast.walk(tree):
-                if isinstance(node, ast.Import) and any(alias.name == target for alias in node.names):
+                if isinstance(node, ast.Import) and any(
+                    alias.name == target for alias in node.names
+                ):
                     offenders.append(str(path.relative_to(ROOT)))
                     break
                 if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == target:

@@ -33,7 +33,13 @@ def _is_product(path: str) -> bool:
     norm = f"/{_norm(path)}"
     if "/tests/" in norm or "/.venv/" in norm:
         return False
-    return "/js/" in norm or "/js_work/" in norm
+    return (
+        "/js/" in norm
+        or "/js_work/" in norm
+        or "/echo_core/" in norm
+        or "/orin_guard/" in norm
+        or "/orin_proto/" in norm
+    )
 
 
 def _under(path: str, package: str) -> bool:
@@ -68,8 +74,14 @@ def evaluate(
     files = report.get("files")
     if not isinstance(files, dict) or not files:
         return 1, {"error": "coverage report has no files"}
-    security = _summary(files, lambda p: _is_product(p) and _under(p, "js/security"))
-    echo = _summary(files, lambda p: _is_product(p) and _under(p, "js/echo"))
+    security = _summary(
+        files,
+        lambda p: _is_product(p) and (_under(p, "js/security") or _under(p, "orin_guard")),
+    )
+    echo = _summary(
+        files,
+        lambda p: _is_product(p) and (_under(p, "js/echo") or _under(p, "echo_core")),
+    )
     lib = _summary(files, _is_product)
     data = {
         "security_line": round(security[0], 2),

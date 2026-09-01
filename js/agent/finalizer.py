@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from js.agent.base import AgentBase
@@ -299,6 +300,24 @@ class FinalizerMixin(AgentBase):
                 "tokens": state.total_tokens,
             },
         )
+
+        try:
+            from types import SimpleNamespace
+
+            from js.evolution.recorder import PhylogenyRecorder
+
+            tools_failed = any(not r.success for r in state.tool_results)
+            PhylogenyRecorder(Path(self.settings.state_dir)).record_turn(
+                SimpleNamespace(
+                    owner=owner_key_hash or "",
+                    success=state.status == "completed",
+                    taint=int(state.context_taint),
+                    tools_failed=tools_failed,
+                    should_have_denied=False,
+                )
+            )
+        except Exception:
+            self.logger.debug("Phylogeny recorder failed", exc_info=True)
 
         # Record for self-learning
         if self.learner is not None:
