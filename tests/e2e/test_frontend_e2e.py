@@ -820,7 +820,10 @@ class TestAttachmentAPI:
     def test_upload_list_preview_session_isolation_and_delete(
         self, live_server: str, live_server_api_key: str, page: Page
     ) -> None:
-        page.goto(live_server, wait_until="domcontentloaded")
+        page.goto(
+            f"{live_server}/#bootstrap-api-key={live_server_api_key}",
+            wait_until="domcontentloaded",
+        )
         page.wait_for_function("() => window.__shellReady === true")
         session_id = "browser-synthetic-attachment"
         filename = "synthetic-note.txt"

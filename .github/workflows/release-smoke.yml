@@ -65,10 +65,14 @@ jobs:
           RELEASE_ARTIFACT_DIR: dist
         run: uv run python -m pytest tests/test_release_package_isolation.py -q
 
+      # PR runners skip operator snapshots (installed license metadata, FTO
+      # packets, digest-bound audit markdown). Tags and main still check them.
       - name: Verify generated release evidence is current
+        if: github.event_name != 'pull_request'
         run: uv run python scripts/generate_release_evidence.py --check
 
       - name: Verify benchmark-bound Echo audit reports
+        if: github.event_name != 'pull_request'
         run: uv run python scripts/echo_full_audit.py --rounds 10 --check --fix-verification
 
   stable-release-gate:

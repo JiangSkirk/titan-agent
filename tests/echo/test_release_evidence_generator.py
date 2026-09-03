@@ -56,6 +56,14 @@ def test_check_mode_reuses_the_existing_sbom_timestamp(tmp_path: Path) -> None:
     assert _existing_generated_at(sbom) == "2026-07-11T00:00:00Z"
 
 
+def test_check_mode_compares_lockfile_artifacts_not_command_packets() -> None:
+    source = Path(release_evidence.__file__).read_text(encoding="utf-8")
+    check_branch = source.split("if args.check:", 1)[1].split("now = current_time", 1)[0]
+    assert "generate_static_artifacts" in check_branch
+    assert "generate_all" not in check_branch
+    assert "collect_command_evidence" not in check_branch
+
+
 def test_release_smoke_evidence_removes_nondeterministic_log_noise() -> None:
     raw = "\n".join(
         [
@@ -141,9 +149,7 @@ def test_lockfile_evidence_accepts_any_complete_nonempty_package_graph(
 
     packages = release_evidence.read_lock_packages()
 
-    assert [(package.name, package.version) for package in packages] == [
-        ("example-root", "1.0")
-    ]
+    assert [(package.name, package.version) for package in packages] == [("example-root", "1.0")]
 
 
 def test_lockfile_evidence_rejects_a_missing_declared_dependency(

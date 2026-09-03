@@ -41,7 +41,11 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Do not update evidence artifacts; run gates in disposable temporary state.",
+        help=(
+            "Do not update artifacts. Compare lockfile-derived SBOM and license "
+            "scan only; command-embedded FTO/clean-room packets are operator "
+            "snapshots, not a GitHub Actions gate."
+        ),
     )
     args = parser.parse_args()
 
@@ -53,16 +57,7 @@ def main() -> int:
         if now is None:
             print("release evidence is stale: docs/security/SBOM.spdx.json", file=sys.stderr)
             return 1
-    else:
-        now = current_time
-    base_generated = generate_static_artifacts(packages, now)
-    if not args.check:
-        for path, content in base_generated.items():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
-
-    generated = generate_all(packages, now)
-    if args.check:
+        generated = generate_static_artifacts(packages, now)
         stale = [
             str(path.relative_to(ROOT))
             for path, content in generated.items()
@@ -73,6 +68,8 @@ def main() -> int:
             return 1
         return 0
 
+    now = current_time
+    generated = generate_all(packages, now)
     for path, content in generated.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -333,13 +330,9 @@ def _spdx_license_value(value: str) -> str:
     if mapped := classifier_map.get(stripped):
         return mapped
     classifier_values = {
-        classifier_map[part]
-        for part in stripped.split("; ")
-        if part in classifier_map
+        classifier_map[part] for part in stripped.split("; ") if part in classifier_map
     }
-    if len(classifier_values) == 1 and all(
-        part in classifier_map for part in stripped.split("; ")
-    ):
+    if len(classifier_values) == 1 and all(part in classifier_map for part in stripped.split("; ")):
         return classifier_values.pop()
     if re.fullmatch(r"[A-Za-z0-9-.+]+(?:\s+(?:AND|OR|WITH)\s+[A-Za-z0-9-.+]+)*", stripped):
         return stripped
