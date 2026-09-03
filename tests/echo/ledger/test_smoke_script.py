@@ -54,6 +54,18 @@ def test_echo_architecture_benchmark_has_explicit_slo_gate() -> None:
     assert args.enforce_slo
 
 
+def test_release_smoke_echo_benchmark_omits_slo_gate_on_github_actions(
+    tmp_path: Path,
+) -> None:
+    import scripts.release_smoke as release_smoke
+
+    gha = release_smoke.echo_architecture_benchmark_argv(tmp_path, enforce_slo=False)
+    local = release_smoke.echo_architecture_benchmark_argv(tmp_path, enforce_slo=True)
+    assert "--enforce-slo" not in gha
+    assert "--enforce-slo" in local
+    assert "--baseline" in gha
+
+
 def test_echo_architecture_benchmark_reuses_embedded_clean_export_baseline() -> None:
     import scripts.echo_architecture_benchmark as benchmark
 
@@ -150,18 +162,10 @@ def test_echo_long_context_provider_payload_contains_expected_bounded_markers_on
         marker
         for message in captured_messages[-1]
         if isinstance(message.content, str)
-        for marker in (
-            f"benchmark long history message {index}"
-            for index in range(26, 40)
-        )
+        for marker in (f"benchmark long history message {index}" for index in range(26, 40))
         if marker in message.content.split(" context ", maxsplit=1)[0]
     )
-    expected = Counter(
-        {
-            f"benchmark long history message {index}": 1
-            for index in range(26, 40)
-        }
-    )
+    expected = Counter({f"benchmark long history message {index}": 1 for index in range(26, 40)})
 
     assert result["failures"] == []
     assert observed == expected
@@ -468,10 +472,7 @@ def _stream_slo_mutation_result(*, first_text_p95_ms: float, terminal_p95_ms: fl
     return {
         "modes": {
             "echo": {
-                **{
-                    name: {"latency": {"n": 1, "p95_ms": 1.0}}
-                    for name in benchmark.SLO_THRESHOLDS
-                },
+                **{name: {"latency": {"n": 1, "p95_ms": 1.0}} for name in benchmark.SLO_THRESHOLDS},
                 "ws_stream_timing": timing,
             }
         },
@@ -616,8 +617,7 @@ def test_echo_benchmark_aggregates_the_median_of_group_p95_values() -> None:
 
     def run_result(p95_ms: float) -> dict[str, object]:
         scenarios = {
-            name: {"latency": {"n": 50, "p95_ms": p95_ms}}
-            for name in benchmark.SLO_THRESHOLDS
+            name: {"latency": {"n": 50, "p95_ms": p95_ms}} for name in benchmark.SLO_THRESHOLDS
         }
         scenarios["api_full_agent"]["prompt_tokens"] = {
             "p50": 3_000.0,
@@ -739,8 +739,7 @@ def test_echo_architecture_slo_fails_closed_without_concurrency_evidence() -> No
     result = {
         "modes": {
             "echo": {
-                name: {"latency": {"n": 1, "p95_ms": 1.0}}
-                for name in benchmark.SLO_THRESHOLDS
+                name: {"latency": {"n": 1, "p95_ms": 1.0}} for name in benchmark.SLO_THRESHOLDS
             }
         },
         "token_comparison": {

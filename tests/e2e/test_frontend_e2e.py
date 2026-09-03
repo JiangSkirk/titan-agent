@@ -141,7 +141,8 @@ class TestPageLoad:
         page.wait_for_function("() => typeof window.loadStatus === 'function'")
         # Filter out non-JS errors (e.g., favicon, websocket, resource 404)
         js_errors = [
-            e for e in errors
+            e
+            for e in errors
             if "favicon" not in e.lower()
             and "websocket" not in e.lower()
             and "Failed to load resource" not in e
@@ -263,9 +264,7 @@ class TestAppShellSwitchFailClosed:
 
         base_url, work_state, legacy_key = appshell_legacy_key_server
         bootstrap_headers: list[dict[str, str]] = []
-        page.add_init_script(
-            f"localStorage.setItem('js-api-key', {json.dumps(legacy_key)});"
-        )
+        page.add_init_script(f"localStorage.setItem('js-api-key', {json.dumps(legacy_key)});")
 
         def record_bootstrap(request: object) -> None:
             bootstrap_headers.append(request.headers)  # type: ignore[attr-defined]
@@ -286,9 +285,10 @@ class TestAppShellSwitchFailClosed:
         assert len(bootstrap_headers) == 1
         assert "x-api-key" not in bootstrap_headers[0]
         assert page.evaluate("localStorage.getItem('js-api-key')") is None
-        assert page.evaluate(
-            "import('/static/state/store.js').then(module => module.state.apiKey)"
-        ) == ""
+        assert (
+            page.evaluate("import('/static/state/store.js').then(module => module.state.apiKey)")
+            == ""
+        )
         with pytest.raises(AuthRequiredError):
             AuthManager(work_state).verify(legacy_key)
 
@@ -554,9 +554,7 @@ class TestRealAppShellBrowserRoute:
         requests: list[str] = []
         page.on("request", lambda request: requests.append(request.url))
         page.goto(appshell_live_server, wait_until="domcontentloaded")
-        page.wait_for_function(
-            "() => typeof window.switchProductWorkspace === 'function'"
-        )
+        page.wait_for_function("() => typeof window.switchProductWorkspace === 'function'")
 
         page.wait_for_function(
             """async () => {
@@ -643,9 +641,7 @@ class TestStreamingUI:
         expect(progress).to_contain_text("失败")
         expect(page.locator("#chat-messages")).to_contain_text("错误: synthetic failure")
 
-    def test_tool_progress_keeps_real_step_states(
-        self, live_server: str, page: Page
-    ) -> None:
+    def test_tool_progress_keeps_real_step_states(self, live_server: str, page: Page) -> None:
         _open_with_fake_websocket(page, live_server)
 
         _emit(
@@ -754,9 +750,7 @@ class TestStreamingUI:
         expect(step).to_contain_text("失败")
         expect(step).to_have_attribute("data-progress-state", "failed")
 
-    def test_tool_call_fragments_reuse_index_bound_step(
-        self, live_server: str, page: Page
-    ) -> None:
+    def test_tool_call_fragments_reuse_index_bound_step(self, live_server: str, page: Page) -> None:
         _open_with_fake_websocket(page, live_server)
         _emit(
             page,
@@ -795,9 +789,7 @@ class TestStreamingUI:
             cancelled.append(request.url.rsplit("/", 1)[-1])
             route.fulfill(  # type: ignore[attr-defined]
                 status=200,
-                body=json.dumps(
-                    {"session_id": cancelled[-1], "cancelled": True}
-                ),
+                body=json.dumps({"session_id": cancelled[-1], "cancelled": True}),
                 content_type="application/json",
             )
 
@@ -828,6 +820,8 @@ class TestAttachmentAPI:
     def test_upload_list_preview_session_isolation_and_delete(
         self, live_server: str, live_server_api_key: str, page: Page
     ) -> None:
+        page.goto(live_server, wait_until="domcontentloaded")
+        page.wait_for_function("() => window.__shellReady === true")
         session_id = "browser-synthetic-attachment"
         filename = "synthetic-note.txt"
         content = b"synthetic browser attachment"

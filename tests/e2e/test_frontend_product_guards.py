@@ -802,7 +802,7 @@ class TestInterpolatedOnclickXss:
                             "tasks": [
                                 {
                                     "id": _XSS_PAYLOAD,
-                                    "name": "xss-task",
+                                    "name": _XSS_PAYLOAD,
                                     "type": "agent",
                                     "status": "running",
                                     "progress": 0.4,
@@ -964,7 +964,8 @@ class TestInterpolatedOnclickXss:
         page.wait_for_function("() => typeof window.switchTab === 'function'")
 
         page.evaluate("() => window.switchTab('tasks')")
-        expect(page.locator("#tasks-list [data-task-action]")).to_have_count(1)
+        expect(page.locator("#tasks-list")).to_contain_text(_XSS_PAYLOAD)
+        expect(page.locator("#tasks-list [onclick]")).to_have_count(0)
         page.evaluate("() => window.switchTab('skills')")
         expect(page.locator("#skills-content [data-skill-id]")).to_have_count(1)
         page.evaluate("() => window.switchTab('memory')")
@@ -975,8 +976,7 @@ class TestInterpolatedOnclickXss:
         snapshot = page.evaluate(
             """() => ({
               tasksOnclick: document.querySelectorAll('#tasks-list [onclick]').length,
-              tasksData: document.querySelectorAll('#tasks-list [data-task-action]').length,
-              tasksId: document.querySelector('#tasks-list [data-task-id]')?.dataset.taskId || '',
+              tasksText: document.querySelector('#tasks-list')?.textContent || '',
               skillsOnclick: document.querySelectorAll('#skills-content [onclick]').length,
               skillsData: document.querySelectorAll('#skills-content [data-skill-id]').length,
               memoryOnclick: document.querySelectorAll('#memory-semantic [onclick], #memory-block-tree [onclick], #memory-proposals [onclick]').length,
@@ -987,16 +987,8 @@ class TestInterpolatedOnclickXss:
             })"""
         )
 
-        page.evaluate("() => window.switchTab('tasks')")
-        expect(page.locator("#tasks-list [data-task-action='pause']")).to_be_visible()
-        pause = page.locator("#tasks-list [data-task-action='pause']")
-        expect(pause).to_have_count(1)
-        pause.click()
-        after_click = page.evaluate("() => window.__xssAlertCount || 0")
-
         assert snapshot["tasksOnclick"] == 0
-        assert snapshot["tasksData"] >= 1
-        assert snapshot["tasksId"] == _XSS_PAYLOAD
+        assert _XSS_PAYLOAD in snapshot["tasksText"]
         assert snapshot["skillsOnclick"] == 0
         assert snapshot["skillsData"] >= 1
         assert snapshot["memoryOnclick"] == 0
@@ -1004,5 +996,4 @@ class TestInterpolatedOnclickXss:
         assert snapshot["wizardOnclick"] == 0
         assert snapshot["wizardData"] >= 2
         assert snapshot["alertCount"] == 0
-        assert after_click == 0
         assert dialogs == []

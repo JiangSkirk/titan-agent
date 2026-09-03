@@ -781,31 +781,47 @@ def check_echo_ledger(base: Path) -> None:
         raise SmokeError(f"Echo internal safety ledger journal append SLO 失败: p95={journal_p95}")
 
 
-def check_echo(base: Path) -> None:
-    env = _env(base)
+def echo_architecture_benchmark_argv(
+    base: Path,
+    *,
+    enforce_slo: bool | None = None,
+) -> list[str]:
+    """Build the Echo architecture-benchmark command for release smoke.
+
+    ``--enforce-slo`` is a quiet-host contract (see ``SLO_CONTRACT``). Shared
+    GitHub Actions runners are not that host: they still run the benchmark for
+    functional/security/token evidence, but must not fail a 45ms p95 measured
+    on a developer Mac.
+    """
+
     baseline = (
         Path(__file__).resolve().parents[1] / "docs" / "security" / "ECHO_BASELINE_65CC545.json"
     )
     if not baseline.is_file():
         raise SmokeError(f"Echo detached baseline evidence missing: {baseline}")
+    if enforce_slo is None:
+        enforce_slo = os.environ.get("GITHUB_ACTIONS") != "true"
+    argv = [
+        sys.executable,
+        "scripts/echo_architecture_benchmark.py",
+        "--iterations",
+        "50",
+        "--warmup",
+        "10",
+        "--baseline",
+        str(baseline),
+        "--output",
+        str(base / "echo-slo-benchmark.json"),
+    ]
+    if enforce_slo:
+        argv.insert(6, "--enforce-slo")
+    return argv
+
+
+def check_echo(base: Path) -> None:
+    env = _env(base)
     _run([sys.executable, "scripts/echo_smoke.py"], env=env, timeout=120)
-    _run(
-        [
-            sys.executable,
-            "scripts/echo_architecture_benchmark.py",
-            "--iterations",
-            "50",
-            "--warmup",
-            "10",
-            "--enforce-slo",
-            "--baseline",
-            str(baseline),
-            "--output",
-            str(base / "echo-slo-benchmark.json"),
-        ],
-        env=env,
-        timeout=180,
-    )
+    _run(echo_architecture_benchmark_argv(base), env=env, timeout=180)
 
 
 def check_work(base: Path) -> None:

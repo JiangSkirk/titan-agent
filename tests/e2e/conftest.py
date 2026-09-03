@@ -279,6 +279,8 @@ def work_live_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     config_path.write_text(
         "\n".join(
             (
+                "first_run_completed: true",
+                "onboarding_status: skipped",
                 "security:",
                 "  api_key_required: false",
                 "providers: []",
@@ -295,6 +297,10 @@ def work_live_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         {
             "JS_WORK_CONFIG_PATH": str(config_path),
             "JS_WORK_ECHO_ENGINE": "on",
+            "JS_E2E_WORK_CONFIG": str(config_path),
+            "JS_E2E_WORK_HOME": str(base),
+            "JS_E2E_WORK_PORT": str(port),
+            "JS_E2E_WORK_PROFILE": "office",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
             "PYTHONUNBUFFERED": "1",
@@ -306,28 +312,29 @@ def work_live_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         "JS_ECHO_ENGINE",
         "JS_WARM_START",
         "JS_ALLOWED_ORIGINS",
+        "JS_API_KEY_REQUIRED",
     ):
         env.pop(name, None)
-    work_executable = Path(sys.executable).with_name("js-work")
-    if not work_executable.is_file():
-        pytest.fail(f"Work CLI entry point is missing: {work_executable}", pytrace=False)
+    # ``js-work web`` is an AppShell shim; this gate needs the standalone Work
+    # Host (product_id=js-work) that ``serve_work_web`` still provides.
+    launcher = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "from js_work.tools import WorkToolProfile\n"
+        "from js_work.web import serve_work_web\n"
+        "serve_work_web(\n"
+        "    config=os.environ['JS_E2E_WORK_CONFIG'],\n"
+        "    home=Path(os.environ['JS_E2E_WORK_HOME']),\n"
+        "    personal_roots=None,\n"
+        "    profile=WorkToolProfile(os.environ['JS_E2E_WORK_PROFILE']),\n"
+        "    host='127.0.0.1',\n"
+        "    port=int(os.environ['JS_E2E_WORK_PORT']),\n"
+        ")\n"
+    )
     log_path = base / "work-server.log"
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
-            [
-                str(work_executable),
-                "--config",
-                str(config_path),
-                "--home",
-                str(base),
-                "--profile",
-                "office",
-                "web",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-            ],
+            [sys.executable, "-c", launcher],
             stdout=log,
             stderr=subprocess.STDOUT,
             text=True,
