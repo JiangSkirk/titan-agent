@@ -14,7 +14,12 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e.test_ui_shell import _goto_shell, _wait_product, _wait_shell_ready
+from tests.e2e.test_ui_shell import (
+    _goto_shell,
+    _wait_body_product,
+    _wait_product,
+    _wait_shell_ready,
+)
 from tests.e2e.test_ui_work_context import _enter_work
 
 pytestmark = pytest.mark.playwright
@@ -67,9 +72,7 @@ class TestVisualQAScreenshots:
             page.locator("#product-personal-btn").click()
             page.wait_for_load_state("load")
             _wait_shell_ready(page)
-            page.wait_for_function(
-                "() => document.body.dataset.product === 'js-agent'", timeout=15_000
-            )
+            _wait_body_product(page, "js-agent")
         for theme in THEMES:
             _set_theme(page, theme)
             self._assert_layout_intact(page, product="personal")
@@ -96,17 +99,13 @@ class TestVisualQAScreenshots:
             page.locator("#product-personal-btn").click()
             page.wait_for_load_state("load")
             _wait_shell_ready(page)
-            page.wait_for_function(
-                "() => document.body.dataset.product === 'js-agent'", timeout=15_000
-            )
+            _wait_body_product(page, "js-agent")
         self._assert_layout_intact(page, product="personal")
         _shot(page, "personal-light-1280x800")
         page.locator("#product-work-btn").click()
         page.wait_for_load_state("load")
         _wait_shell_ready(page)
-        page.wait_for_function(
-            "() => document.body.dataset.product === 'js-work'", timeout=15_000
-        )
+        _wait_body_product(page, "js-work")
         self._assert_layout_intact(page, product="work")
         _shot(page, "work-light-1280x800")
 

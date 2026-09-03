@@ -7,7 +7,12 @@ import time
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e.test_ui_shell import _goto_shell, _wait_product, _wait_shell_ready
+from tests.e2e.test_ui_shell import (
+    _goto_shell,
+    _wait_body_product,
+    _wait_product,
+    _wait_shell_ready,
+)
 
 pytestmark = pytest.mark.playwright
 
@@ -20,9 +25,7 @@ def _enter_work(page: Page, server: tuple[str, str]) -> None:
         page.locator("#product-work-btn").click()
         page.wait_for_load_state("load")
         _wait_shell_ready(page)
-        page.wait_for_function(
-            "() => document.body.dataset.product === 'js-work'", timeout=15_000
-        )
+        _wait_body_product(page, "js-work")
 
 
 class TestWorkContextPanel:
@@ -61,7 +64,9 @@ class TestWorkContextPanel:
         grants_text = band.locator("#band-grants").inner_text()
         # Must never fabricate a directory-grant count.
         assert "个已授权目录" not in grants_text or grants_text.split("个")[0].isdigit()
-        assert grants_text in {"尚无活动目录授权", "授权状态不可用"} or "个已授权目录" in grants_text
+        assert (
+            grants_text in {"尚无活动目录授权", "授权状态不可用"} or "个已授权目录" in grants_text
+        )
         for section in ("wcp-files", "wcp-artifacts", "wcp-approvals", "wcp-current-task"):
             expect(page.locator(f"#{section}")).to_be_visible()
 
@@ -117,8 +122,6 @@ class TestWorkContextPanel:
             page.locator("#product-personal-btn").click()
             page.wait_for_load_state("load")
             _wait_shell_ready(page)
-            page.wait_for_function(
-                "() => document.body.dataset.product === 'js-agent'", timeout=15_000
-            )
+            _wait_body_product(page, "js-agent")
         page.wait_for_timeout(1500)
         assert requests == [], f"personal mode must not call work-context: {requests}"

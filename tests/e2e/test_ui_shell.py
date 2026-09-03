@@ -68,7 +68,9 @@ def _wait_shell_ready(page: Page) -> None:
 
 
 class TestShellStructure:
-    def test_nav_rail_primary_items(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_nav_rail_primary_items(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         rail = page.locator("#nav-rail")
@@ -99,7 +101,9 @@ class TestShellStructure:
         expect(top.locator("#cmdk-button")).to_be_visible()
         expect(top.locator("#user-entry")).to_be_visible()
 
-    def test_no_horizontal_overflow_1440(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_no_horizontal_overflow_1440(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         page.set_viewport_size({"width": 1440, "height": 1024})
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
@@ -110,7 +114,9 @@ class TestShellStructure:
 
 
 class TestCommandPalette:
-    def test_cmdk_opens_and_closes(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_cmdk_opens_and_closes(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         page.keyboard.press("Meta+k")
@@ -126,7 +132,9 @@ class TestCommandPalette:
         page.locator("#cmdk-button").click()
         expect(page.locator("#command-palette")).to_be_visible()
 
-    def test_cmdk_reaches_secondary_tab(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_cmdk_reaches_secondary_tab(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         page.keyboard.press("Meta+k")
@@ -136,7 +144,9 @@ class TestCommandPalette:
 
 
 class TestMoreMenu:
-    def test_more_menu_lists_secondary_tabs(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_more_menu_lists_secondary_tabs(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         page.locator("#nav-rail button[data-rail-label='更多']").click()
@@ -145,7 +155,9 @@ class TestMoreMenu:
         for tab in ("models", "approvals", "skills", "cron", "status"):
             expect(menu.locator(f"#nav-{tab}")).to_be_attached()
 
-    def test_all_enabled_tabs_reachable(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_all_enabled_tabs_reachable(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         """Every tab in the capability manifest must be reachable from rail/more menu."""
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
@@ -166,7 +178,9 @@ class TestMoreMenu:
 
 
 class TestTheme:
-    def test_theme_toggle_and_persistence(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_theme_toggle_and_persistence(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         html = page.locator("html")
@@ -179,7 +193,9 @@ class TestTheme:
         _wait_shell_ready(page)
         assert page.locator("html").get_attribute("data-theme") == toggled
 
-    def test_invalid_stored_theme_falls_back(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_invalid_stored_theme_falls_back(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         page.add_init_script("localStorage.setItem('js-theme', 'neon-purple')")
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
@@ -200,7 +216,9 @@ class TestTheme:
         _wait_shell_ready(page)
         assert page.locator("html").get_attribute("data-theme") == "light"
 
-    def test_contrast_aa_both_themes(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_contrast_aa_both_themes(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         selectors = ["#nav-rail button", "#session-column", "#top-bar"]
@@ -211,7 +229,9 @@ class TestTheme:
                 assert ratio is not None, f"cannot measure contrast for {sel} in {theme}"
                 assert ratio >= 4.5, f"{sel} contrast {ratio} < 4.5 in {theme} theme"
 
-    def test_same_dom_both_themes(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_same_dom_both_themes(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         # Tag-structure equality is the real invariant: theme switching must
@@ -248,7 +268,9 @@ class TestResponsive:
         expect(page.locator("#nav-rail")).to_be_visible()
         expect(page.locator("#session-column")).to_be_visible()
 
-    def test_1024_session_column_collapsible(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_1024_session_column_collapsible(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         page.set_viewport_size({"width": 1024, "height": 768})
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
@@ -264,14 +286,14 @@ def _wait_product(page: Page, timeout: float = 15_000) -> str:
     """Wait until the server-driven product mode is applied; dump diagnostics on failure."""
     try:
         page.wait_for_function(
-            "() => document.body.dataset.product === 'js-agent'"
-            " || document.body.dataset.product === 'js-work'",
+            "() => document.body != null && (document.body.dataset.product === 'js-agent'"
+            " || document.body.dataset.product === 'js-work')",
             timeout=timeout,
         )
     except Exception:
         diag = page.evaluate(
             """async () => {
-                const out = {url: location.href, product: document.body.dataset.product};
+                const out = {url: location.href, product: document.body && document.body.dataset.product};
                 try {
                     const r1 = await fetch('/api/capabilities');
                     out.cap_status = r1.status;
@@ -286,11 +308,22 @@ def _wait_product(page: Page, timeout: float = 15_000) -> str:
             }"""
         )
         raise AssertionError(f"product mode never applied: {diag}") from None
-    return page.evaluate("() => document.body.dataset.product")
+    return page.evaluate("() => document.body && document.body.dataset.product")
+
+
+def _wait_body_product(page: Page, product: str, *, timeout: float = 15_000) -> None:
+    """Wait for body[data-product] after a Personal/Work switch (body may be null mid-nav)."""
+    page.wait_for_function(
+        "expected => document.body != null && document.body.dataset.product === expected",
+        arg=product,
+        timeout=timeout,
+    )
 
 
 class TestModeLayouts:
-    def test_personal_hides_work_context(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_personal_hides_work_context(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         product = _wait_product(page)
@@ -298,12 +331,14 @@ class TestModeLayouts:
             page.locator("#product-personal-btn").click()
             page.wait_for_load_state("load")
             _wait_shell_ready(page)
-            page.wait_for_function("() => document.body.dataset.product === 'js-agent'", timeout=15_000)
+            _wait_body_product(page, "js-agent")
         expect(page.locator("#work-context-band")).to_be_hidden()
         expect(page.locator("#work-context-panel")).to_be_hidden()
         expect(page.locator("#workspace-label")).to_be_hidden()
 
-    def test_work_shows_context_band(self, page: Page, appshell_authed_server: tuple[str, str]) -> None:
+    def test_work_shows_context_band(
+        self, page: Page, appshell_authed_server: tuple[str, str]
+    ) -> None:
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         product = _wait_product(page)
@@ -311,7 +346,7 @@ class TestModeLayouts:
             page.locator("#product-work-btn").click()
             page.wait_for_load_state("load")
             _wait_shell_ready(page)
-            page.wait_for_function("() => document.body.dataset.product === 'js-work'", timeout=15_000)
+            _wait_body_product(page, "js-work")
         expect(page.locator("#work-context-band")).to_be_visible()
         expect(page.locator("#work-context-panel")).to_be_visible()
         expect(page.locator("#workspace-label")).to_be_visible()
@@ -320,6 +355,6 @@ class TestModeLayouts:
             "() => document.getElementById('workspace-label').tagName.toLowerCase()"
         )
         assert tag != "select", "workspace must be a label, not a selector"
-        assert (
-            page.locator("#workspace-label select").count() == 0
-        ), "workspace label must not contain a dropdown"
+        assert page.locator("#workspace-label select").count() == 0, (
+            "workspace label must not contain a dropdown"
+        )
