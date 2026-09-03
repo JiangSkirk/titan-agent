@@ -115,6 +115,7 @@ from js.orind.private_paths import (
     PathIdentity,
     PrivatePathError,
     ensure_private_dir,
+    owner_private_socket_temp_root,
     safe_unlink_if_same,
     safe_unlink_socket_if_same,
     verify_private_file,
@@ -375,7 +376,10 @@ class OrinDaemon:
     def _resolve_cell_socket(self, requested: Path) -> Path:
         if len(str(requested)) <= CELL_SOCKET_MAX_PATH:
             return requested
-        short_dir = Path(tempfile.mkdtemp(prefix="orind-cells-"))
+
+        short_dir = Path(
+            tempfile.mkdtemp(prefix="orind-cells-", dir=str(owner_private_socket_temp_root()))
+        )
         if self._cell_identity_enforce:
             try:
                 self._cell_socket_temp_identity = ensure_private_dir(short_dir)
@@ -684,7 +688,9 @@ class OrinDaemon:
                 loopback=True,
             )
         except PeerDenied:
-            self._audit("peer_rejected", reason="peer authentication failed", peer_euid=euid, peer_pid=pid)
+            self._audit(
+                "peer_rejected", reason="peer authentication failed", peer_euid=euid, peer_pid=pid
+            )
             return None
         return (euid, pid)
 

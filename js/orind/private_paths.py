@@ -13,6 +13,7 @@ import os
 import secrets
 import stat
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -169,6 +170,21 @@ def ensure_private_dir(path: Path, *, mode: int = _PRIVATE_DIR_MODE) -> PathIden
         os.close(parent_fd)
 
 
+def owner_private_socket_temp_root() -> Path:
+    """Return a short, owner-only directory for AF_UNIX sockets.
+
+    pytest tmp trees often exceed the sockaddr_un limit. ``/tmp`` itself is
+    root-owned on Linux CI, so C1 cannot use it as the immediate parent;
+    a 0700 directory we create under the process temp dir keeps both
+    constraints.
+    """
+
+    root = Path(tempfile.gettempdir()) / f"orind-{_effective_uid()}"
+    root.mkdir(mode=_PRIVATE_DIR_MODE, exist_ok=True)
+    os.chmod(root, _PRIVATE_DIR_MODE)
+    return root
+
+
 def _check_private_file_metadata(
     metadata: os.stat_result,
     path: Path,
@@ -251,9 +267,7 @@ def _check_private_socket_metadata(metadata: os.stat_result, path: Path) -> None
         or metadata.st_uid != _effective_uid()
         or stat.S_IMODE(metadata.st_mode) != _PRIVATE_FILE_MODE
     ):
-        raise PrivatePathError(
-            f"private socket must be owner-owned nlink=1 mode 0600: {path}"
-        )
+        raise PrivatePathError(f"private socket must be owner-owned nlink=1 mode 0600: {path}")
 
 
 def verify_private_socket(
@@ -516,6 +530,7 @@ __all__ = [
     "ensure_private_dir",
     "install_sqlite_guard",
     "open_private_file",
+    "owner_private_socket_temp_root",
     "prepare_private_sqlite",
     "read_once_private_file",
     "read_private_file",

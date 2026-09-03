@@ -50,8 +50,14 @@ def peer_credentials(sock: socket.socket) -> tuple[int, int] | None:
             return None
         return (euid, pid or 0)
     if system.startswith("linux"):
+        # Darwin LOCAL_PEERCRED is SOL_LOCAL option 1. Linux SO_PEERCRED is a
+        # different SOL_SOCKET option (typically 17). Using the Darwin constant
+        # here returns None / garbage and drops every orind handshake.
+        so_peercred = getattr(socket, "SO_PEERCRED", None)
+        if so_peercred is None:
+            return None
         with contextlib.suppress(OSError):
-            cred = sock.getsockopt(socket.SOL_SOCKET, LOCAL_PEERCRED, 12)
+            cred = sock.getsockopt(socket.SOL_SOCKET, so_peercred, 12)
             if len(cred) >= 12:
                 cpid, uid, _gid = struct_unpack("iii", cred)
                 return (int(uid), int(cpid))

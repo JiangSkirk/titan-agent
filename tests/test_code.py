@@ -25,6 +25,8 @@ class TestCodeTool:
             pytest.skip("Linux unshare is unavailable in this runner")
         if not result.success and "sandbox-exec" in result.error:
             pytest.skip("macOS sandbox-exec is unavailable in this runner")
+        if not result.success and "no sandbox tool available" in result.error:
+            pytest.skip("Linux filesystem sandbox (bwrap) is unavailable in this runner")
         if not result.success and result.metadata.get("returncode") == -6:
             pytest.skip("macOS sandbox-exec aborts under filesystem restrictions")
         assert result.success
@@ -67,9 +69,7 @@ class TestCodeTool:
             "x.__import__('os')",
         ],
     )
-    async def test_blacklist_bypass_payloads_blocked(
-        self, code_tool: CodeTool, code: str
-    ) -> None:
+    async def test_blacklist_bypass_payloads_blocked(self, code_tool: CodeTool, code: str) -> None:
         result = await code_tool.execute(code)
         assert not result.success
         assert "Disallowed" in result.error
@@ -90,9 +90,7 @@ class TestCodeTool:
         code = "print('safe')"
         victim = tmp_path.parent / "code-tool-victim.txt"
         victim.write_text("preserve-me", encoding="utf-8")
-        legacy_path = tmp_path / (
-            f".js_temp_script_{id(code)}_{hash(code) & 0xFFFFFFFF}.py"
-        )
+        legacy_path = tmp_path / (f".js_temp_script_{id(code)}_{hash(code) & 0xFFFFFFFF}.py")
         legacy_path.symlink_to(victim)
 
         await code_tool.execute(code)
@@ -114,9 +112,7 @@ class TestCodeTool:
         assert list(outside.iterdir()) == []
 
     @pytest.mark.asyncio
-    async def test_workspace_venv_python_cannot_run_external_script(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_workspace_venv_python_cannot_run_external_script(self, tmp_path: Path) -> None:
         """The workspace interpreter is trusted, not an external-file bypass."""
         interpreter = tmp_path / ".venv" / "bin" / "python"
         interpreter.parent.mkdir(parents=True)
@@ -132,6 +128,5 @@ class TestCodeTool:
 
         assert result.returncode == -1
         assert result.stderr == (
-            "Filesystem restricted command denied path outside workspace: "
-            f"{external_script}"
+            f"Filesystem restricted command denied path outside workspace: {external_script}"
         )

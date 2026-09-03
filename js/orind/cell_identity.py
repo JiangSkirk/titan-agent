@@ -6,27 +6,19 @@ keeps its frozen handshake and filesystem behavior while the switch is lazy.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
-import socket
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-from struct import unpack
-from typing import Any
 
 from js.orin.protocol import CELL_CONNECT_CAPS, ProtocolError
+from js.orind.daemon_net import peer_credentials as peer_credentials
 from js.orind.private_paths import (
     PrivatePathError,
     read_once_private_file,
     verify_private_socket,
 )
-
-SOL_LOCAL = 0
-LOCAL_PEERCRED = 1
-LOCAL_PEERTOKEN = 2
 
 CELL_IDENTITY_ENV = "ORIN_CELL_IDENTITY_ENFORCE"
 ORIND_PID_ENV = "ORIN_ORIND_PID"
@@ -40,48 +32,6 @@ class SocketIdentity:
 
     device: int
     inode: int
-
-
-def peer_credentials(sock: Any) -> tuple[int, int] | None:
-    """Return the connected peer's effective uid and PID, fail-closed.
-
-    This deliberately mirrors the daemon's established macOS/Linux probes so
-    the Cell can authenticate orind in the opposite direction without
-    importing the daemon (which would create a Cell/authority dependency).
-    """
-
-    if sys.platform == "darwin":
-        euid: int | None = None
-        pid: int | None = None
-        with contextlib.suppress(OSError):
-            token = sock.getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN, 32)
-            if len(token) >= 32:
-                values = [
-                    int.from_bytes(token[index : index + 4], "little")
-                    for index in range(0, 32, 4)
-                ]
-                euid = values[1]
-                pid = values[5]
-            elif len(token) >= 4:
-                pid = int.from_bytes(token[:4], "little")
-        with contextlib.suppress(OSError):
-            cred = sock.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, 12)
-            if len(cred) >= 12:
-                raw_pid, uid, _gid = unpack("iii", cred)
-                if euid is None:
-                    euid = int(uid)
-                if not pid:
-                    pid = int(raw_pid) or pid
-        if euid is None:
-            return None
-        return euid, pid or 0
-    if sys.platform.startswith("linux"):
-        with contextlib.suppress(OSError):
-            cred = sock.getsockopt(socket.SOL_SOCKET, LOCAL_PEERCRED, 12)
-            if len(cred) >= 12:
-                pid, uid, _gid = unpack("iii", cred)
-                return int(uid), int(pid)
-    return None
 
 
 def verify_owned_socket(path: Path) -> SocketIdentity:

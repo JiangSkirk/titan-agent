@@ -777,6 +777,8 @@ class CodeTool:
                     "duration_ms": result.duration_ms,
                 },
             )
+        except RuntimeError as exc:
+            return ToolResult(success=False, error=str(exc))
         finally:
             try:
                 os.unlink(script_name, dir_fd=temp_dir_fd)

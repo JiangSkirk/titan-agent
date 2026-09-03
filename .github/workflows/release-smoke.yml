@@ -37,7 +37,7 @@ jobs:
       - name: Install frozen extras
         run: |
           uv lock --check
-          uv sync --frozen --extra dev
+          uv sync --frozen --extra dev --extra echo-tokenizer
 
       - name: Build release artifacts
         run: |

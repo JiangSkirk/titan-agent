@@ -108,8 +108,15 @@ def test_destroy_refuses_replaced_inode(tmp_path: Path) -> None:
     private_path = handle.path
     private_parent = private_path.parent
     private_path.unlink()
-    private_path.write_bytes(os.urandom(32))
-    os.chmod(private_path, 0o600)
+    original_ino = handle._key_ino
+    for _ in range(32):
+        private_path.write_bytes(os.urandom(32))
+        os.chmod(private_path, 0o600)
+        if private_path.stat().st_ino != original_ino:
+            break
+        private_path.unlink()
+    else:
+        pytest.skip("filesystem reused the private-key inode")
 
     with pytest.raises(RuntimeError, match="identity drifted"):
         destroy_private_key(handle)

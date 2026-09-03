@@ -7,19 +7,21 @@ file, MAC, seq) exactly as production does.
 
 macOS caps AF_UNIX paths at 104 bytes, and pytest tmp_path trees can
 exceed that. When the requested socket path is too long the socket is
-relocated to a short temporary directory (``$TMPDIR/orind-*/orind.sock``)
-while the ledger/keybox stay in ``state_dir``.
+relocated under an owner-only short temp root while the ledger/keybox stay
+in ``state_dir``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 
 from js.orind.daemon import OrinDaemon
+from js.orind.private_paths import owner_private_socket_temp_root
 
 _MAX_UNIX_PATH = 100
 
@@ -85,9 +87,16 @@ class TestOrind:
         now_fn: Any = None,
     ) -> None:
         self._state_dir = state_dir
+        state_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(state_dir, 0o700)
         requested = socket_path or (state_dir / "orin" / "orind.sock")
         if len(str(requested)) > _MAX_UNIX_PATH:
-            short_dir = Path(tempfile.mkdtemp(prefix="orind-test-"))
+            short_dir = Path(
+                tempfile.mkdtemp(
+                    prefix="orind-test-",
+                    dir=str(owner_private_socket_temp_root()),
+                )
+            )
             requested = short_dir / "orind.sock"
         self._socket_path = requested
         self._keybox_tier = keybox_tier

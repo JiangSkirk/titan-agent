@@ -141,9 +141,16 @@ def test_state_dir_inode_change_fail_closed(
     state.mkdir()
     trusted = signer._open_trusted_state_dir(state)
     os.close(trusted.dir_fd)
-    # Replace directory with a new inode of the same path.
+    original = (trusted.st_dev, trusted.st_ino)
     state.rmdir()
-    state.mkdir()
+    for _ in range(32):
+        state.mkdir()
+        st = state.stat()
+        if (st.st_dev, st.st_ino) != original:
+            break
+        state.rmdir()
+    else:
+        pytest.skip("filesystem reused the state-dir inode")
     with pytest.raises(ValueError, match="state"):
         signer._open_trusted_state_dir(state, expected=trusted)
 

@@ -65,9 +65,13 @@ fi
 # ───────────────────────────────────────────────
 if [[ "$OSTYPE" != "darwin"* ]]; then
     log_warn "当前不是 macOS 系统。此脚本主要针对 macOS 优化。"
-    read -p "是否继续? (y/n) " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    if [[ -t 0 ]]; then
+        read -p "是否继续? (y/n) " -n 1 -r
+        echo
+        [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    else
+        log_warn "非交互环境：跳过确认并继续前置检查。"
+    fi
 fi
 
 # ───────────────────────────────────────────────

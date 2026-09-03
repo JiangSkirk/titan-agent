@@ -111,9 +111,16 @@ def test_inode_replace_before_destroy_fails(tmp_path: Path) -> None:
     private_path = handle.path
     parent = private_path.parent
     os.unlink(private_path)
+    original_ino = handle._key_ino
     replacement = parent / "ledger.ed25519.private"
-    replacement.write_bytes(os.urandom(32))
-    os.chmod(replacement, 0o600)
+    for _ in range(32):
+        replacement.write_bytes(os.urandom(32))
+        os.chmod(replacement, 0o600)
+        if replacement.stat().st_ino != original_ino:
+            break
+        replacement.unlink()
+    else:
+        pytest.skip("filesystem reused the private-key inode")
     with pytest.raises(RuntimeError, match="identity drifted|missing"):
         destroy_private_key(handle)
     assert replacement.is_file()

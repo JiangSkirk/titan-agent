@@ -13,6 +13,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
 
@@ -29,6 +30,9 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+
+      - name: Install Linux filesystem sandbox
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
       - name: Verify lockfile and install frozen extras
         run: |
@@ -79,10 +83,13 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
 
+      - name: Install Linux filesystem sandbox
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       - name: Verify lockfile and install frozen extras
         run: |
           uv lock --check
-          uv sync --frozen --extra dev
+          uv sync --frozen --extra dev --extra echo-tokenizer
 
       - name: Install Chromium
         run: uv run python -m playwright install --with-deps chromium
@@ -107,6 +114,9 @@ jobs:
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
+
+      - name: Install Linux filesystem sandbox
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
 
       - name: Verify lockfile and install frozen extras
         run: |

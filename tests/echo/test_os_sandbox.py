@@ -487,6 +487,8 @@ async def test_fs_restricted_allows_workspace_listing(tmp_path: Path) -> None:
     """ls with no path argument and ls . stay allowed inside the workspace."""
     (tmp_path / "normal.txt").write_text("fine", encoding="utf-8")
     executor = SandboxExecutor(workspace=tmp_path, timeout=5.0)
+    if not executor.filesystem_isolation_available():
+        pytest.skip("filesystem isolation backend unavailable")
 
     for probe in (["ls"], ["ls", "."]):
         result = await executor.execute(probe, fs_restricted=True)
