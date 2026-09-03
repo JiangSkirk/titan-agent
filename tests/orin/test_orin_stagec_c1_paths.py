@@ -5,12 +5,12 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from js.orin.protocol import ProtocolError
+from js.orin.testing import owner_private_temporary_directory
 from js.orind.cell_identity import read_session_key_once
 from js.orind.cells.services import SecretStore
 from js.orind.daemon import OrinDaemon, OrinDaemonError
@@ -214,7 +214,7 @@ def test_strict_keybox_rejects_unsafe_key_without_repair(
     orin_dir.mkdir(parents=True, mode=0o700)
     path = orin_dir / "keybox.key"
     target = tmp_path / "outside-keybox"
-    encoded = (b"ab" * 32)
+    encoded = b"ab" * 32
     _write_private(target, encoded)
     if attack == "symlink":
         path.symlink_to(target)
@@ -374,7 +374,7 @@ def test_short_socket_pointer_rejects_symlink_without_overwriting_target(
     _write_private(outside, marker)
     pointer.symlink_to(outside)
     with (
-        tempfile.TemporaryDirectory(prefix="orin-c1-main-") as short,
+        owner_private_temporary_directory(prefix="orin-c1-main-") as short,
         pytest.raises((OrinDaemonError, PrivatePathError)),
     ):
         OrinDaemon(
@@ -397,7 +397,7 @@ async def test_strict_cell_socket_rejects_non_socket_leaf_without_repair(
 ) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir(mode=0o700)
-    with tempfile.TemporaryDirectory(prefix="orin-c1-socket-") as short:
+    with owner_private_temporary_directory(prefix="orin-c1-socket-") as short:
         orin_dir = Path(short) / "orin"
         orin_dir.mkdir(mode=0o700)
         socket_path = orin_dir / "cells.sock"
@@ -436,7 +436,7 @@ async def test_cell_socket_parent_alias_cannot_pass_identity_or_cleanup(
 
     state_dir = tmp_path / "state"
     state_dir.mkdir(mode=0o700)
-    with tempfile.TemporaryDirectory(prefix="orin-c1-parent-alias-") as short:
+    with owner_private_temporary_directory(prefix="orin-c1-parent-alias-") as short:
         short_root = Path(short)
         orin_dir = short_root / "orin"
         orin_dir.mkdir(mode=0o700)
@@ -487,7 +487,7 @@ async def test_cell_socket_parent_alias_cannot_pass_identity_or_cleanup(
 def test_strict_session_key_cleanup_preserves_replacement_inode(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir(mode=0o700)
-    with tempfile.TemporaryDirectory(prefix="orin-c1-key-") as short:
+    with owner_private_temporary_directory(prefix="orin-c1-key-") as short:
         daemon = OrinDaemon(
             state_dir=state_dir,
             socket_path=Path(short) / "orind.sock",
@@ -522,7 +522,7 @@ async def test_short_cell_socket_and_pointer_are_private_and_cleaned(
     state_dir.mkdir(mode=0o700)
     orin_dir = _long_orin_dir(tmp_path)
     pointer = orin_dir / "cells.sock.path"
-    with tempfile.TemporaryDirectory(prefix="orin-c1-main-") as short:
+    with owner_private_temporary_directory(prefix="orin-c1-main-") as short:
         daemon = OrinDaemon(
             state_dir=state_dir,
             socket_path=Path(short) / "orind.sock",
@@ -555,7 +555,7 @@ async def test_stop_preserves_replaced_cell_socket_and_pointer(tmp_path: Path) -
     state_dir.mkdir(mode=0o700)
     orin_dir = _long_orin_dir(tmp_path)
     pointer = orin_dir / "cells.sock.path"
-    with tempfile.TemporaryDirectory(prefix="orin-c1-main-") as short:
+    with owner_private_temporary_directory(prefix="orin-c1-main-") as short:
         daemon = OrinDaemon(
             state_dir=state_dir,
             socket_path=Path(short) / "orind.sock",

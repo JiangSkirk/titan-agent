@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 from js.orin.protocol import ProtocolError, encode_frame, make_envelope, parse_frame, verify_mac
-from js.orin.testing import C1TestOrind
+from js.orin.testing import C1TestOrind, owner_private_temporary_directory
 from js.orind.cell_identity import read_session_key_once
 from js.orind.cells.base import CellBase
 from js.orind.daemon import OrinDaemon
@@ -281,7 +281,7 @@ async def _wait_for_cell_state(
 
 @asynccontextmanager
 async def _running_identity_daemon(tmp_path: Path) -> AsyncIterator[OrinDaemon]:
-    with tempfile.TemporaryDirectory(prefix="orin-c1-cells-") as short:
+    with owner_private_temporary_directory(prefix="orin-c1-cells-") as short:
         short_root = Path(short)
         daemon = OrinDaemon(
             state_dir=tmp_path,
@@ -492,7 +492,7 @@ async def _fake_orind_server() -> tuple[
     Path,
     tempfile.TemporaryDirectory[str],
 ]:
-    short_root = tempfile.TemporaryDirectory(prefix="orin-c1-fake-cell-")
+    short_root = owner_private_temporary_directory(prefix="orin-c1-fake-cell-")
     socket_path = Path(short_root.name) / "cells.sock"
     connected: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = (
         asyncio.get_running_loop().create_future()

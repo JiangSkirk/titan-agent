@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import stat
 from dataclasses import dataclass
@@ -120,6 +121,19 @@ def _csv_literal_prefix(text: str) -> str:
     return text
 
 
+def _regular_file_metadata(path: Path) -> os.stat_result:
+    """Stat a workbook without treating Linux ``/dev/fd`` snapshots as symlinks.
+
+    ``MaterializedSnapshotPath.__fspath__`` returns ``/dev/fd/<n>``. Darwin
+    fdescfs presents that node as the underlying regular file; Linux ``lstat``
+    sees a symlink, which must not fail closed as "not a regular .xlsx".
+    """
+    snapshot_fd = getattr(path, "_snapshot_fd", -1)
+    if isinstance(snapshot_fd, int) and snapshot_fd >= 0:
+        return os.fstat(snapshot_fd)
+    return path.lstat()
+
+
 def validate_safe_xlsx(path: Path) -> None:
     """Validate one macro-free XLSX before higher-level libraries open it."""
     from openpyxl import load_workbook
@@ -127,7 +141,7 @@ def validate_safe_xlsx(path: Path) -> None:
     from js_work.routines.precise_edit import PreciseExcelEditEngine
 
     try:
-        metadata = path.lstat()
+        metadata = _regular_file_metadata(path)
     except OSError as exc:
         raise ValueError("Office workbook is unavailable") from exc
     if path.suffix.lower() != ".xlsx" or not stat.S_ISREG(metadata.st_mode):
@@ -141,7 +155,7 @@ def validate_safe_xlsx(path: Path) -> None:
     finally:
         workbook.close()
     try:
-        after_metadata = path.lstat()
+        after_metadata = _regular_file_metadata(path)
     except OSError as exc:
         raise ValueError("Office workbook changed while it was validated") from exc
     if not stat.S_ISREG(after_metadata.st_mode) or _file_fingerprint(after_metadata) != before:

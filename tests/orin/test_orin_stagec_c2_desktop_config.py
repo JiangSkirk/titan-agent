@@ -12,14 +12,13 @@ import json
 import os
 import secrets
 import stat
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from js.config import OrinConfig
 from js.orin.protocol import encode_frame, make_envelope
-from js.orin.testing import C2TestOrind
+from js.orin.testing import C2TestOrind, owner_private_temporary_directory
 from js.orind.daemon import OrinDaemon
 
 _COMMON_CELL_ENV = {
@@ -167,7 +166,7 @@ async def test_desktop_cap_rejects_wire_identity_before_publishing_session_key(
     monkeypatch: pytest.MonkeyPatch,
     attack: str,
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix="orin-c2-identity-") as short:
+    with owner_private_temporary_directory(prefix="orin-c2-identity-") as short:
         short_root = Path(short)
         daemon = OrinDaemon(
             state_dir=tmp_path / attack,

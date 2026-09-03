@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -24,6 +25,27 @@ from js.orind.daemon import OrinDaemon
 from js.orind.private_paths import owner_private_socket_temp_root
 
 _MAX_UNIX_PATH = 100
+
+
+def owner_private_temporary_directory(
+    prefix: str = "orind-",
+) -> tempfile.TemporaryDirectory[str]:
+    """Return a 0700 temp dir whose immediate parent is owner-owned.
+
+    Linux CI ``/tmp`` is root-owned, so C1 ``ensure_private_dir`` cannot use
+    it as the socket or orin-dir parent. Nest under
+    :func:`owner_private_socket_temp_root` there.
+
+    Darwin already uses a user-owned TMPDIR; nesting under another prefix
+    can exceed the 104-byte AF_UNIX limit and relocate Cell sockets away
+    from the path the test is attacking.
+    """
+    if sys.platform == "linux":
+        return tempfile.TemporaryDirectory(
+            prefix=prefix,
+            dir=str(owner_private_socket_temp_root()),
+        )
+    return tempfile.TemporaryDirectory(prefix=prefix)
 
 
 def derive_c2_appshell_application_handle(

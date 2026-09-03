@@ -284,6 +284,23 @@ def test_shared_xlsx_validator_detects_input_replacement_during_validation(
         validate_safe_xlsx(source)
 
 
+def test_validate_safe_xlsx_accepts_fd_bound_snapshot(tmp_path: Path) -> None:
+    import os
+
+    from js_work.file_scope import MaterializedSnapshotPath
+    from js_work.routines.office_safety import validate_safe_xlsx
+
+    source = tmp_path / "source.xlsx"
+    _save_template_workbook(source)
+    snapshot = MaterializedSnapshotPath(source)
+    snapshot._snapshot_fd = os.open(source, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        validate_safe_xlsx(snapshot)
+    finally:
+        os.close(snapshot._snapshot_fd)
+        snapshot._snapshot_fd = -1
+
+
 def test_spreadsheet_routine_runner_generates_validation_report(tmp_path: Path) -> None:
     from js_work.routines import WorkRoutineStore
     from js_work.routines.spreadsheet import WorkSpreadsheetRoutineRunner
