@@ -405,6 +405,35 @@ def verify_release_readiness(
     )
 
 
+CI_DEFERRED_INTERNAL_BLOCKERS = frozenset(
+    {
+        "echo_slo_benchmark_digest_unbound",
+        "isolated_venv_e2e_invalid",
+        "isolated_venv_e2e_missing",
+    }
+)
+
+
+def filter_ci_deferred_internal_blockers(
+    blockers: Sequence[str],
+    *,
+    github_actions: bool | None = None,
+) -> tuple[str, ...]:
+    """Drop digest-bound evidence blockers that shared CI cannot rebind.
+
+    ``verify_release_readiness`` stays honest. GitHub Actions smoke still
+    requires security matrix, real sandbox, and IP boundary; SLO JSON and
+    isolated-venv E2E are generated on a developer machine and rebound there.
+    """
+
+    ordered = tuple(blockers)
+    if github_actions is None:
+        github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    if not github_actions:
+        return ordered
+    return tuple(item for item in ordered if item not in CI_DEFERRED_INTERNAL_BLOCKERS)
+
+
 def _iter_release_source_files(root: Path) -> list[Path]:
     """Walk the release-source digest surfaces with the shared file filters."""
     resolved_root = root.resolve()

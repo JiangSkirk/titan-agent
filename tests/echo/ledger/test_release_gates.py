@@ -950,6 +950,20 @@ def test_development_readiness_can_exclude_live_acceptance_without_weakening_def
     assert development_report.internal_ready
 
 
+def test_ci_deferred_internal_blockers_keep_security_gates() -> None:
+    from js.echo.ledger.release_gates import filter_ci_deferred_internal_blockers
+
+    blockers = (
+        "echo_slo_benchmark_digest_unbound",
+        "isolated_venv_e2e_invalid",
+        "security_matrix_25_failed",
+    )
+    assert filter_ci_deferred_internal_blockers(blockers, github_actions=False) == blockers
+    assert filter_ci_deferred_internal_blockers(blockers, github_actions=True) == (
+        "security_matrix_25_failed",
+    )
+
+
 def _write_required_internal_evidence(root: pathlib.Path) -> None:
     (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     for relative in (

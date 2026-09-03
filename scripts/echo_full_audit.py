@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from js.echo.ledger.release_gates import (
+    filter_ci_deferred_internal_blockers,
     verify_echo_ip_boundary,
     verify_release_readiness,
 )
@@ -633,9 +634,10 @@ def main() -> int:
     if args.fix_verification:
         benchmark = _load_json(root, "docs/security/ECHO_SLO_BENCHMARK.json")
         slo_failures = evaluate_slo_failures(benchmark) if benchmark else ["missing benchmark"]
-        if not readiness.internal_ready or slo_failures:
-            if readiness.internal_blockers:
-                print(f"internal readiness blockers: {', '.join(readiness.internal_blockers)}")
+        blockers = filter_ci_deferred_internal_blockers(readiness.internal_blockers)
+        if blockers or slo_failures:
+            if blockers:
+                print(f"internal readiness blockers: {', '.join(blockers)}")
             if slo_failures:
                 print(f"SLO blockers: {', '.join(slo_failures)}")
             return 1

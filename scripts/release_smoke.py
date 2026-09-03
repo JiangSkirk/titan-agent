@@ -737,7 +737,10 @@ async def check_fleet(base: Path) -> None:
 
 def check_echo_ledger(base: Path) -> None:
     from js.config import JSSettings
-    from js.echo.ledger.release_gates import verify_release_readiness
+    from js.echo.ledger.release_gates import (
+        filter_ci_deferred_internal_blockers,
+        verify_release_readiness,
+    )
     from js.echo.ledger.sandbox_backend import EchoSandboxBackend
     from js.echo.ledger.security_matrix import run_security_matrix
     from js.echo.ledger.service import EchoSafetyService
@@ -757,8 +760,9 @@ def check_echo_ledger(base: Path) -> None:
         require_audit_reports=False,
         require_live_acceptance=False,
     )
-    if not readiness.internal_ready:
-        raise SmokeError(f"Echo 内部门禁未通过: {readiness.internal_blockers}")
+    blockers = filter_ci_deferred_internal_blockers(readiness.internal_blockers)
+    if blockers:
+        raise SmokeError(f"Echo 内部门禁未通过: {blockers}")
     if "security_matrix_25" not in readiness.passed:
         raise SmokeError("Echo release gate 没有记录 security_matrix_25。")
     if "real_sandbox_backend" not in readiness.passed:
