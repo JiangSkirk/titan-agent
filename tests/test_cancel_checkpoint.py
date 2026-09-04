@@ -383,10 +383,21 @@ class TestCancelAPI:
 
         session_id = "test-cancel-session"
         run_task = asyncio.create_task(agent.run("List files", session_id=session_id))
-        # Allow first turn to start and provider to be called
-        await asyncio.sleep(0.02)
-        # Cancel before second turn begins
-        agent.request_cancel(session_id)
+        partition = runtime_partition_key("js-agent", None, session_id)
+        for _ in range(200):
+            if partition in agent._cancel_tokens:
+                break
+            await asyncio.sleep(0.01)
+        # Cancel *between* turns: the first model call must have finished so
+        # turn_count already incremented. A fixed 20ms sleep loses that race
+        # under coverage instrumentation (setup + first chat exceed 20ms).
+        for _ in range(200):
+            if mock_provider.calls:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("first model turn never started")
+        assert agent.request_cancel(session_id) is True
         state = await run_task
 
         assert state.status == "cancelled"
