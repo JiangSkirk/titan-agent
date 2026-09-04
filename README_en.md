@@ -4,7 +4,9 @@ An AI agent harness, not a chatbot. JS Agent wraps your chosen model with persis
 
 The model is the engine. The harness is the complete frame that lets the engine work.
 
-> **Status**: v0.1.3-alpha — APIs may change. Feedback welcome!
+> **Status**: v0.1.5 local release candidate / controlled trial — feedback welcome!
+>
+> [Security policy / trust model](SECURITY_en.md) · [中文安全政策](SECURITY.md)
 
 ## Core Harness Capabilities
 
@@ -23,8 +25,9 @@ The model is the engine. The harness is the complete frame that lets the engine 
 - **Parallel execution**: Independent tools can be called concurrently to reduce latency
 
 ### 🛡️ Safety Guardrails (Defense in Depth)
+- **Trust model**: The load-bearing boundary against an adversarial model is OS isolation; Echo/lease/guard are authorization and depth. See [SECURITY_en.md](SECURITY_en.md). In-repo audit entry: [AUDIT_PACK.md](docs/security/AUDIT_PACK.md) (no external red-team endorsement).
 - **Strategy-pattern defense**: Tool-call defenses are injectable, ordered strategy objects—not hardcoded if-else chains
-- **Fail-Open semantics**: When the security subsystem itself crashes/fails, it does not block the main system (prevents security from becoming a single point of failure)
+- **Fail-Closed semantics**: Echo authorization and the durable ledger fail closed when missing, unhealthy, or unverifiable — side effects are not bypassed
 - **Behavior audit**: Immutable hash-chained audit log of every tool call; tampering/truncation detectable
 - **Path protection**: Prevents accidental deletion of system files; writes outside workspace require confirmation
 - **Secret management**: Auto-detects and redacts API keys, tokens, and passwords; stores them encrypted at rest
@@ -48,18 +51,49 @@ The model is the engine. The harness is the complete frame that lets the engine 
 - **Four trust levels**: builtin → trusted → community → quarantine
 - **Hermes compatible**: Direct installation and execution of Hermes-format skills
 
-### 🌐 Local Web Interface
-- **FastAPI + WebSocket**: Real-time streaming chat without heavy Next.js dependencies
-- **Model management panel**: View local model status, health checks, one-click switching
-- **Memory browser**: View, search, and manage persistent memories
-- **Audit log**: Complete tool-call history with traceability
-- **Skill panel**: Install, uninstall, adjust trust levels, and view content online
+### 💻 Desktop app
+- **Primary surface**: Tauri window loading the local AppShell Host (not the system browser)
+- **CLI / TUI**: `js`, `js tui`, `js daemon` remain available in the terminal
+- **Local Host**: `js appshell` starts the local service without opening a browser
+
+## Skill Promotion Gate (v0.1.5)
+
+Auto curator and evolver **no longer** mutate trust levels or overwrite entry files directly. Both record `proposed` events in `skill_promotions.db`, which an operator must explicitly approve. Approval runs a 5-step gate (`protected → validate → security → tests → smoke`, smoke bounded by a 30 s timeout). A failed gate changes nothing — no trust flip, no file overwrite, no `skill_usage` pollution.
+
+| Action | CLI | Web | Auth |
+|---|---|---|---|
+| List open proposals | `js skill promote list` | `GET /api/skills/promotions` | normal auth |
+| Show event detail | `js skill promote show <event_id>` | `GET /api/skills/promotions/{event_id}` | normal auth |
+| Approve + run gate | `js skill promote approve <event_id>` | `POST .../{event_id}/approve` | admin |
+| Reject (status only) | `js skill promote reject <event_id>` | `POST .../{event_id}/reject` | admin |
+| Roll back an applied event | `js skill promote revert <event_id>` | `POST .../{event_id}/revert` | admin |
+
+Troubleshooting starts at `event.details.failed_step` (one of `protected/validate/security/tests/smoke`); smoke timeouts also carry `details.timeout=True` and `details.smoke_error`. Web responses **never** expose `owner_key_hash` — isolation is enforced server-side via `memory_owner(auth)`. See [`docs/deployment.md`](docs/deployment.md) → *Skill Promotion Operations* for the full operator runbook.
 
 ## Quick Start
 
+Release installs that do not use `uv.lock` must consume hashed third-party
+pins in `constraints.txt` (workspace packages `echo-core` / `orin-*` live
+in `packages/` and are not on PyPI):
+
 ```bash
-# Install
-pip install -e ".[dev]"
+uv sync --frozen
+# Or: hashed third-party pins, then local packages
+# pip install --require-hashes -r constraints.txt
+# pip install --no-deps ./packages/echo-core ./packages/orin-proto ./packages/orin-guard .
+```
+
+Developers should prefer `uv sync --frozen`. Editable installs are for a
+checkout that already follows the lockfile:
+
+```bash
+# Core install (no heavy Office/PDF deps)
+pip install -e .
+
+# Optional extras
+pip install -e ".[office]"  # openpyxl + pandas (Excel read/write)
+pip install -e ".[pdf]"     # pypdf + pdfplumber + reportlab (PDF read/generate)
+pip install -e ".[dev]"     # dev tooling
 
 # One-shot setup (auto-detects LM Studio / Ollama)
 js setup
@@ -67,29 +101,38 @@ js setup
 # CLI interactive mode
 js
 
-# Web UI
-js web --port 8000
+# Desktop app is the main UI; local Host (does not open a browser):
+js appshell
 
 # Search
 js search "latest AI developments"
 ```
+
+Dev-machine troubleshooting only (**not for everyday product use**): the desktop app and `js appshell` still start orind by default so leases stay in a separate gatekeeper process. To temporarily cut processes while debugging a noisy machine:
+
+```bash
+JS_ORIND=0 js appshell
+```
+
+That moves leases back in-process and changes the daily security boundary. Do not set `JS_ORIND=0` as a product default.
 
 ## Architecture Comparison
 
 | Capability | OpenClaw | Hermes | **JS Agent** |
 |---|---|---|---|
 | Runtime | Node.js (3700 chunks) | Python + Node UI | **Unified Python 3.12** |
-| Security | External plugin (ClawAegis) | Tirith + approval | **Built-in + Strategy pattern + Fail-Open** |
+| Security | External plugin (ClawAegis) | Tirith + approval | **Per-tool OS sandbox + Echo fail-closed** ([SECURITY_en.md](SECURITY_en.md); optional whole-process container; `orin.enforce` off by default) |
 | Context Compression | ❌ | ✅ Best-in-class | ✅ **Hermes-style compressor + Context capsules** |
-| Checkpoint | ❌ | ✅ Git Shadow | ✅ **Git Shadow Repo** |
+| Checkpoint | ❌ | ✅ Git Shadow | ⚠️ **Checkpoints removed — not shipped in this package** |
 | Circuit Breaker | ❌ | ❌ | ✅ **Auto-recovery probes** |
 | Model Discovery | ❌ Manual | ❌ Manual | ✅ **Auto-detection** |
 | Search | ❌ Plugin needed | Tavily (config needed) | ✅ **DuckDuckGo out-of-box** |
-| Web UI | Next.js heavy | Next.js + Python RPC | ✅ **FastAPI + lightweight native JS** |
+| Web UI | Next.js heavy | Next.js + Python RPC | ✅ **Desktop app (Tauri) + local Host** |
 | MCP | ❌ | Relatively new | ✅ **Native stdio/SSE** |
 | Skills | Static files | ❌ | ✅ **Code/Prompt/Workflow + security scan + installable** |
 | Multi-Agent | Simple sub-agent | Delegation thread pool | ✅ **Role system + parallel orchestration** |
-| Self-Learning | ❌ | ❌ | ✅ **Interaction learning + A/B testing** |
+| Self-Learning | ❌ | ❌ | ✅ **Proposal loop** (generate → human approve → apply → mock benchmark rollback; never unattended) |
+| Test density | mid | 3.2:1 | ⚠️ **M1 ≥ 1.2:1** (ratchet; coverage floors in CI; M2/M3 directional) |
 | Install Experience | JSON manual config | YAML 388-line | ✅ **`js setup` one-shot** |
 
 ## Testing
@@ -103,26 +146,30 @@ python scripts/release_smoke.py --all
 ```
 
 The release gate covers lint, typing, full tests, mock benchmarks, and release smoke.
+M1 density is hard-gated at 1.2:1 via `scripts/test_density_report.py`. CI also enforces
+M1 coverage ratchets: `js/security` ≥86%, `js/echo` ≥85%, whole-library branch ≥65%
+(plan targets 90/85/75 stay directional for M2).
 
 ## Known Limits
 
 - **Session Capsule Lite is experimental**: the API/UI currently support view, refresh, and clear only. Failures fall back to full history; it does not provide complex editing, cross-session planning, or full long-term memory guarantees.
 - **Auto-Fetch Pipeline is experimental**: Gmail / Slack / Drive / Calendar / GitHub / Notion connectors are mock/experimental for architecture demos.
+- **Tool output budget**: each tool call is capped at `ToolLimits.tool_output_budget_chars` (default 20k chars). Two code paths handle oversize: `file_read` checks after `offset`/`limit` paging — if still oversize it returns empty `output` with `metadata.too_large=True` plus a paging suggestion (`js/tools/files.py`); all other tools fall through to the registry, which truncates `output` to the budget, appends an `[output truncated: N chars; ...]` notice and sets `metadata.truncated=True` / `metadata.original_len=N` (`js/tools/registry.py`). Neither path stuffs the full payload into the prompt.
+- **Task Review Capsule (deterministic MVP)**: each run persists an owner-scoped, deterministic record (first user message, last assistant message, tool-call summary, token/turn counts, exit status) to `review_capsules.db`. **This is a deterministic post-run summary, not an LLM-generated reflection or learning signal.**
+- **Abnormal-exit recovery is a status marker, not auto-resume**: on startup, sessions whose heartbeat has gone stale are marked `aborted` with `exit_reason="abnormal_exit_recovery"`. **The agent does not automatically re-run, re-tool, or continue an aborted session from its last checkpoint.** Users still need to start a new run; the existing checkpoint-resume APIs are unchanged.
+- **Optional extras**: Office/PDF tools require `pip install -e ".[office]"` / `".[pdf]"`; without them the related tools fail with a clear error and core agent still works.
 
-## Production Deployment
+## Daily use
 
-> Note: binding to `0.0.0.0` exposes the service beyond localhost. Production, LAN, or public deployments must require an API key; never expose no-auth mode outside the local machine.
+The main path is the **JS Agent desktop app**. Use `js` / `js tui` / `js daemon` in the terminal. `js appshell` only starts the local Host for the desktop app or development; it does not open a browser.
+
+## Docker
 
 ```bash
-# Web UI
-js web --host 0.0.0.0 --port 8000
-
-# Or Docker
-docker run -p 8000:8000 -e OPENAI_API_KEY=xxx js-agent
-
-# Or Gunicorn + Uvicorn
-gunicorn "js.web:create_app()" -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+docker compose up -d js-agent
 ```
+
+The image and compose file set `JS_APPSHELL_PROVISION_KEY=1` by default. On first start, if no admin exists, a shared recovery key is written to `./state/bootstrap_admin_key.txt` (mode 0600). Use that key to sign in before calling `/api/*`. **The plaintext file is deleted after the first successful `/api/appshell/session` or `/api/auth/session` login**; `/api/appshell/bootstrap` leaves it in place so headless operators can still read it. The published port is loopback-only (`127.0.0.1:8000`). See [docs/deployment.md](docs/deployment.md).
 
 ## License
 

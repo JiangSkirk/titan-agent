@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .codex/hooks/format-python.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .codex/hooks/check-js.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

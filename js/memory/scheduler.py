@@ -25,6 +25,7 @@ class DreamScheduler:
         self._idle_threshold = 30.0
         self._max_deferral = 120.0
         self._check_interval = 15.0
+        self._idle_sleep = 60.0
         self._task: asyncio.Task[Any] | None = None
         self._conversation_buffer: list[dict[str, Any]] = []
         self._max_buffer = 5
@@ -46,12 +47,14 @@ class DreamScheduler:
         if not self._pending:
             self._pending = True
             self._pending_since = time.time()
-        self._conversation_buffer.append({
-            "user": user_input[:500],
-            "assistant": assistant_output[:500],
-            "owner_key_hash": owner_key_hash,
-            "session_id": session_id,
-        })
+        self._conversation_buffer.append(
+            {
+                "user": user_input[:500],
+                "assistant": assistant_output[:500],
+                "owner_key_hash": owner_key_hash,
+                "session_id": session_id,
+            }
+        )
         if len(self._conversation_buffer) > self._max_buffer:
             self._conversation_buffer.pop(0)
 
@@ -83,11 +86,21 @@ class DreamScheduler:
             if exc is not None:
                 self.logger.error("DreamScheduler loop crashed: %s", exc, exc_info=True)
 
-    async def force_consolidation(self) -> None:
+    async def force_consolidation(self, *, owner_key_hash: str | None = None) -> None:
         """Immediately run an evolution cycle, bypassing idle wait.
 
         Used by the daemon's cron dream task and manual triggers.
+        When ``owner_key_hash`` is provided, consolidation is limited to that
+        owner's memory partition; otherwise all owners are processed.
         """
+        from js.orin.stage_c import product_memory_cell_required
+
+        orin = getattr(getattr(self.agent, "settings", None), "orin", None)
+        if product_memory_cell_required(orin):
+            self.logger.warning(
+                "force_consolidation refused: ambient MemoryStore is closed under enforce"
+            )
+            return
         self._last_activity = 0.0
         self._pending = True
         self._pending_since = 0.0
@@ -101,15 +114,22 @@ class DreamScheduler:
 
     async def _run_once(self) -> None:
         """Execute a single evolution cycle."""
+        from js.orin.stage_c import product_memory_cell_required
+
+        orin = getattr(getattr(self.agent, "settings", None), "orin", None)
+        if product_memory_cell_required(orin):
+            self.logger.warning(
+                "evolution cycle refused: ambient MemoryStore is closed under enforce"
+            )
+            return
         buffer_copy = list(self._conversation_buffer)
+        snapshot_ids = {id(item) for item in buffer_copy}
         try:
             await asyncio.wait_for(
                 self.agent._run_evolution_cycle(conversation_buffer=buffer_copy),
                 timeout=120.0,
             )
         except asyncio.CancelledError:
-            self._pending = False
-            self._conversation_buffer.clear()
             raise
         except Exception as e:
             self.logger.warning("Evolution cycle failed: %s", e, exc_info=True)
@@ -119,13 +139,18 @@ class DreamScheduler:
             # items; if it failed we still drop them to avoid re-processing
             # stale conversation fragments in the next cycle.
             self._pending = False
-            self._conversation_buffer = self._conversation_buffer[len(buffer_copy):]
+            self._conversation_buffer = [
+                item for item in self._conversation_buffer if id(item) not in snapshot_ids
+            ]
+            if self._conversation_buffer:
+                self._pending = True
+                self._pending_since = self._last_activity
 
     async def _loop(self) -> None:
         """Main scheduling loop — checks idle time and triggers evolution."""
         while True:
             try:
-                await asyncio.sleep(self._check_interval)
+                await asyncio.sleep(self._check_interval if self._pending else self._idle_sleep)
             except asyncio.CancelledError:
                 break
             if not self._pending:
@@ -135,11 +160,15 @@ class DreamScheduler:
             self.logger.debug(
                 "DreamScheduler check: idle=%.1fs, deferred=%.1fs, "
                 "threshold=%.0fs, max_deferral=%.0fs",
-                idle, deferred, self._idle_threshold, self._max_deferral,
+                idle,
+                deferred,
+                self._idle_threshold,
+                self._max_deferral,
             )
             if idle >= self._idle_threshold or deferred >= self._max_deferral:
                 self.logger.info(
                     "Triggering evolution cycle (idle=%.1fs, deferred=%.1fs)",
-                    idle, deferred,
+                    idle,
+                    deferred,
                 )
                 await self._run_once()

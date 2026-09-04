@@ -11,15 +11,15 @@ from typing import Any
 
 
 class SkillType(StrEnum):
-    CODE = "code"       # Executable Python/Shell (JS Agent original)
-    PROMPT = "prompt"   # LLM instruction doc (Hermes-style)
+    CODE = "code"  # Executable Python/Shell (JS Agent original)
+    PROMPT = "prompt"  # LLM instruction doc (Hermes-style)
     WORKFLOW = "workflow"  # Lightweight automation chain
-    META = "meta"       # Composed of sub-skills (dependency DAG)
+    META = "meta"  # Composed of sub-skills (dependency DAG)
 
 
 class TrustLevel(StrEnum):
-    BUILTIN = "builtin"      # Shipped with JS Agent, signed
-    TRUSTED = "trusted"      # Installed from trusted source, scanned
+    BUILTIN = "builtin"  # Shipped with JS Agent, signed
+    TRUSTED = "trusted"  # Installed from trusted source, scanned
     COMMUNITY = "community"  # User-installed, scanned
     QUARANTINE = "quarantine"  # Pending security review
 
@@ -57,17 +57,56 @@ class Prerequisites:
         missing: list[str] = []
 
         import shutil
+
         for cmd in self.commands:
             if shutil.which(cmd) is None:
                 missing.append(f"command: {cmd}")
 
         import os
+
         for env in self.env_vars:
             if not os.getenv(env):
                 missing.append(f"env_var: {env}")
 
         # packages check is advisory (pip list is slow)
         return len(missing) == 0, missing
+
+
+# Directories excluded from integrity hashing: volatile environments, caches,
+# and VCS metadata must not affect the skill content hash.
+HASH_EXCLUDED_DIRS = frozenset({".venv", "__pycache__", ".git"})
+
+
+def compute_skill_dir_hash(skill_dir: Path) -> str:
+    """Compute a SHA-256 hash over the full content of a skill directory.
+
+    Every regular file is hashed (contents only) in stable sorted order of
+    its relative POSIX path — including subdirectories such as lib/,
+    references/, templates/ and assets/. Symlinks, non-regular files, and
+    volatile directories (see HASH_EXCLUDED_DIRS) are skipped.
+
+    This is the single source of truth for skill content hashing:
+    ``SkillSpec.compute_hash`` and ``js.security.signer`` manifest signatures
+    both delegate to it so their coverage can never drift apart.
+    """
+    import hashlib
+    import os
+
+    h = hashlib.sha256()
+    entries: list[tuple[str, Path]] = []
+    for root, dirnames, filenames in os.walk(skill_dir, followlinks=False):
+        root_path = Path(root)
+        # Prune excluded directories in place so os.walk never descends into
+        # them (a skill-local .venv alone can contain thousands of files).
+        dirnames[:] = sorted(d for d in dirnames if d not in HASH_EXCLUDED_DIRS)
+        for name in filenames:
+            f = root_path / name
+            if f.is_symlink() or not f.is_file():
+                continue
+            entries.append((f.relative_to(skill_dir).as_posix(), f))
+    for _rel, f in sorted(entries, key=lambda e: e[0]):
+        h.update(f.read_bytes())
+    return h.hexdigest()
 
 
 @dataclass
@@ -137,27 +176,16 @@ class SkillSpec:
         return any(mapping.get(p, p) == current for p in self.platforms)
 
     def compute_hash(self) -> str:
-        """Compute SHA-256 hash of all skill files (manifest + code)."""
+        """Compute SHA-256 hash of all skill files (manifest + code + resources).
+
+        Covers every regular file under the skill directory recursively via
+        ``compute_skill_dir_hash`` — a change to lib/, references/ or any
+        other shipped file therefore invalidates the stored integrity hash.
+        """
         if not self.path:
             return ""
-        import hashlib
-        h = hashlib.sha256()
-        # Hash manifest first
-        manifest = self.path / "SKILL.md"
-        if manifest.exists() and not manifest.is_symlink():
-            h.update(manifest.read_bytes())
-        # Hash all executable and config files
-        for pattern in ("*.py", "*.sh", "*.bash", "*.js", "*.json", "*.yaml", "*.yml", "*.toml", "requirements.txt"):
-            for f in sorted(self.path.glob(pattern)):
-                if not f.is_symlink():
-                    h.update(f.read_bytes())
-        # Hash scripts/ directory if present
-        scripts_dir = self.path / "scripts"
-        if scripts_dir.exists():
-            for f in sorted(scripts_dir.rglob("*")):
-                if f.is_file() and not f.is_symlink():
-                    h.update(f.read_bytes())
-        return h.hexdigest()[:32]  # 128-bit truncation for collision resistance
+        # 128-bit truncation: still ample collision resistance for integrity checks
+        return compute_skill_dir_hash(self.path)[:32]
 
     def to_summary_dict(self) -> dict[str, Any]:
         """Return minimal metadata for list_skills() — progressive disclosure."""
@@ -184,18 +212,20 @@ class SkillSpec:
     def to_detail_dict(self) -> dict[str, Any]:
         """Return full metadata for view_skill()."""
         data = self.to_summary_dict()
-        data.update({
-            "license": self.license,
-            "entry": self.entry,
-            "content_length": len(self.full_content),
-            "metadata": self.metadata,
-            "has_references": self.references_dir is not None and self.references_dir.exists(),
-            "has_templates": self.templates_dir is not None and self.templates_dir.exists(),
-            "has_assets": self.assets_dir is not None and self.assets_dir.exists(),
-            "timeout_seconds": self.timeout_seconds,
-            "network_allowed": self.network_allowed,
-            "dependencies": self.dependencies,
-        })
+        data.update(
+            {
+                "license": self.license,
+                "entry": self.entry,
+                "content_length": len(self.full_content),
+                "metadata": self.metadata,
+                "has_references": self.references_dir is not None and self.references_dir.exists(),
+                "has_templates": self.templates_dir is not None and self.templates_dir.exists(),
+                "has_assets": self.assets_dir is not None and self.assets_dir.exists(),
+                "timeout_seconds": self.timeout_seconds,
+                "network_allowed": self.network_allowed,
+                "dependencies": self.dependencies,
+            }
+        )
         return data
 
 
@@ -291,6 +321,8 @@ def parse_skill_manifest(path: Path) -> SkillSpec:
         full_content=body,
         metadata=frontmatter.get("metadata", {}),
         path=path.parent,
+        signature=str(frontmatter.get("signature") or ""),
+        public_key=str(frontmatter.get("public_key") or ""),
     )
 
     # Set sub-directories (Hermes style)

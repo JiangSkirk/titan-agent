@@ -15,6 +15,7 @@ env/
 !.env.example
 config.local.*
 secrets.*
+!js/security/secrets.py
 *.pem
 *.key
 *.crt
@@ -36,8 +37,13 @@ Thumbs.db
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.json
+coverage.xml
 htmlcov/
 .playwright-mcp/
+.mutmut-cache/
+mutants/
+*.meta
 
 # Build
 build/
@@ -69,3 +75,35 @@ logs/
 js_agent_*.md
 # Manual validation script (one-off, not for repo)
 manual_validation_security.py
+
+# Local evidence / scratch (never commit — may contain keys)
+.task-tmp/
+.tmp/
+.test-tmp-baseline/
+MagicMock/
+.cursor/
+
+# Accidental empty / mistyped paths
+/=
+
+# Local architecture research notes (optional publish later)
+architecture-research/
+
+# One-off research dumps (not product)
+analysis_3ai/
+
+# Repo-root scratch created by local runs (workspace-relative copies stay in workspace/)
+.echo-tmp/
+.js-code/
+.build/
+/echo/
+
+# Internal findings dumps (not curated evidence)
+docs/security/_enum_findings.json
+docs/security/_unique_findings_*.json
+docs/security/_round_review_summary.json
+docs/security/VULN_CATALOG_FULL.md
+docs/security/external/
+
+# AgentDojo CI report artifact (never a committed baseline)
+benchmarks/agentdojo/last_report.json

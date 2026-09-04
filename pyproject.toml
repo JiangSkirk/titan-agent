@@ -1,7 +1,7 @@
 [project]
 name = "js-agent"
-version = "0.1.3"
-description = "A stable, secure, and convenient AI agent framework"
+version = "0.1.5"
+description = "Local personal Agent Harness — local release candidate for controlled trial"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = {text = "MIT"}
@@ -9,34 +9,39 @@ authors = [
     {name = "JS Team"}
 ]
 dependencies = [
+    "echo-core==3.0.0",
+    "orin-proto==2.0.0",
+    "orin-guard==2.0.0",
     "pydantic>=2.10,<3",
-    "pydantic-settings>=2.6",
-    "rich>=13.9",
-    "textual>=0.70",
-    "aiosqlite>=0.20",
-    "cachetools>=5.5",
-    "click>=8.1",
-    "httpx>=0.27",
+    "pydantic-settings>=2.14.2,<3",
+    "rich>=13.9,<16",
+    "textual>=0.70,<9",
+    "aiosqlite>=0.20,<1",
+    "cachetools>=5.5,<8",
+    "click>=8.1,<9",
+    "httpx[http2]>=0.27,<1",
     "openai>=1.55,<3",
-    "prompt-toolkit>=3.0",
-    "structlog>=24.4",
-    "platformdirs>=4.3",
-    "python-dotenv>=1.0",
-    "cryptography>=44.0,<49",
-    "packaging>=24.2",
-    "psutil>=6.1",
-    "watchdog>=6.0",
-    "anyio>=4.7",
-    "tenacity>=9.0",
-    "pyyaml>=6.0",
-    "fastapi>=0.115",
-    "python-multipart>=0.0.20",
-    "uvicorn>=0.32",
-    "openpyxl>=3.1",
-    "pandas>=2.2",
-    "pypdf>=5.0",
-    "pdfplumber>=0.11",
-    "reportlab>=4.0",
+    "prompt-toolkit>=3.0,<4",
+    "structlog>=24.4,<26",
+    "platformdirs>=4.3,<5",
+    "python-dotenv>=1.0,<2",
+    "cryptography>=49.0.0,<51",
+    "packaging>=24.2,<27",
+    "psutil>=6.1,<8",
+    "watchdog>=6.0,<7",
+    "anyio>=4.7,<5",
+    "tenacity>=9.0,<10",
+    "pyyaml>=6.0,<7",
+    "fastapi>=0.139,<1",
+    "starlette>=1.3.1,<2",
+    "python-multipart>=0.0.32,<1",
+    "uvicorn>=0.32,<1",
+    "openpyxl>=3.1,<4",
+    "rfc8785==0.1.4",
+    "xlrd==2.0.2",
+    "pypdf>=6.15.0,<7",
+    "python-docx>=1.2,<2",
+    "reportlab>=4.0,<5",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +51,9 @@ desktop = [
 telegram = [
     "python-telegram-bot>=21.0,<23",
 ]
+discord = [
+    "discord.py>=2.4,<3",
+]
 monitor = [
     "prometheus-client>=0.21",
     "opentelemetry-api>=1.29",
@@ -54,10 +62,20 @@ monitor = [
     "opentelemetry-instrumentation-fastapi>=0.50",
     "opentelemetry-instrumentation-httpx>=0.50",
 ]
+office = [
+    "pandas>=2.2",
+]
+echo-tokenizer = [
+    "tiktoken>=0.7,<1",
+]
+pdf = [
+    "pdfplumber>=0.11",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
+    "hatchling>=1.27",
     "mypy>=1.13",
     "ruff>=0.8",
     "build>=1.2",
@@ -66,17 +84,85 @@ dev = [
     "types-PyYAML>=6.0",
     "types-psutil>=6.1",
     "types-reportlab>=4.0",
+    "websockets>=12",
+    "playwright>=1.52,<2",
     "httpx2>=2.4",  # Starlette TestClient prefers httpx2 over plain httpx
+    "hypothesis>=6.112",
+    "mutmut>=3.3,<4",
+    "js-agent[office,pdf]",
 ]
+
+[tool.mutmut]
+source_paths = ["js", "packages/orin-guard/orin_guard", "packages/echo-core/echo_core"]
+only_mutate = [
+    "js/security/parser.py",
+    "js/security/guard.py",
+    "js/security/rules.py",
+    "js/security/net_guard.py",
+    "js/echo/ledger/strict_json.py",
+    "js/echo/ledger/journal.py",
+    "packages/orin-guard/orin_guard/kernel/conjunction.py",
+    "packages/orin-guard/orin_guard/kernel/gate.py",
+    "packages/orin-guard/orin_guard/kernel/exec_parse.py",
+    "packages/orin-guard/orin_guard/kernel/identity.py",
+    "packages/echo-core/echo_core/ledger/strict_json.py",
+    "packages/echo-core/echo_core/ledger/journal.py",
+]
+pytest_add_cli_args_test_selection = [
+    "tests/test_security.py",
+    "tests/test_security_rules.py",
+    "tests/test_security_shell_allowlist.py",
+    "tests/test_security_hardening_round3.py",
+    "tests/test_net_guard.py",
+    "tests/echo/ledger/test_file_journal_recovery.py",
+    "tests/echo/ledger/test_journal_effects.py",
+    "tests/echo/ledger/test_core_contract.py",
+    "tests/property/test_parser_ast.py",
+    "tests/property/test_ledger_json.py",
+    "tests/security/test_mutation_kills.py",
+    "tests/test_security_expanded.py",
+]
+pytest_add_cli_args = ["-q", "--tb=no"]
+do_not_mutate = ["**/__init__.py"]
+also_copy = ["js_work/", "resources/"]
+
 [project.scripts]
 js = "js.__main__:main"
+js-work = "js_work.cli:compat_main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.uv.workspace]
+members = ["packages/echo-core", "packages/orin-proto", "packages/orin-guard"]
+
+[tool.uv.sources]
+echo-core = { workspace = true }
+orin-proto = { workspace = true }
+orin-guard = { workspace = true }
+
 [tool.hatch.build.targets.wheel]
-packages = ["js"]
+packages = ["js", "js_work"]
+force-include = { "js/security/secrets.py" = "js/security/secrets.py", "resources/tokenizer" = "resources/tokenizer" }
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/js/**",
+    "/js_work/**",
+    "/LICENSE",
+    "/ORIGIN_LEDGER.md",
+    "/README.md",
+    "/README_en.md",
+    "/SECURITY.md",
+    "/SECURITY_en.md",
+    "/THIRD_PARTY_NOTICES.md",
+    "/pyproject.toml",
+    "/resources/**",
+    "/uv.lock",
+    "/constraints.txt",
+]
+force-include = { "js/security/secrets.py" = "js/security/secrets.py", "README_en.md" = "README_en.md" }
 
 [tool.ruff]
 line-length = 100
@@ -85,6 +171,54 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "TCH"]
 ignore = ["E501", "TC001", "TC003", "SIM105", "SIM108", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_r6_memory_persistent.py" = ["N802"]
+"js/echo/os_sandbox.py" = ["F403", "F405"]
+"js/echo/types.py" = ["F403", "F405"]
+"js/echo/primitives.py" = ["F403", "F405"]
+"js/echo/core.py" = ["F403", "F405"]
+"js/echo/amber.py" = ["F403", "F405"]
+"js/echo/amber_tree.py" = ["F403", "F405"]
+"js/echo/tide.py" = ["F403", "F405"]
+"js/echo/tide_controller.py" = ["F403", "F405"]
+"js/echo/wheel.py" = ["F403", "F405"]
+"js/echo/timing_wheel.py" = ["F403", "F405"]
+"js/echo/capability.py" = ["F403", "F405"]
+"js/echo/capability_constants.py" = ["F403", "F405"]
+"js/echo/capability_encoding.py" = ["F403", "F405"]
+"js/echo/capability_exceptions.py" = ["F403", "F405"]
+"js/echo/sandbox.py" = ["F403", "F405"]
+"js/echo/mode_contract.py" = ["F403", "F405"]
+"js/echo/execution_contract.py" = ["F403", "F405"]
+"js/echo/runtime.py" = ["F403", "F405"]
+"js/echo/testing.py" = ["F403", "F405"]
+"js/echo/ledger/_hashing.py" = ["F403", "F405"]
+"js/echo/ledger/archive_store.py" = ["F403", "F405"]
+"js/echo/ledger/compat.py" = ["F403", "F405"]
+"js/echo/ledger/effects.py" = ["F403", "F405"]
+"js/echo/ledger/epoch.py" = ["F403", "F405"]
+"js/echo/ledger/journal.py" = ["F403", "F405"]
+"js/echo/ledger/journal_recovery.py" = ["F403", "F405"]
+"js/echo/ledger/kernel.py" = ["F403", "F405"]
+"js/echo/ledger/memory.py" = ["F403", "F405"]
+"js/echo/ledger/merkle.py" = ["F403", "F405"]
+"js/echo/ledger/partition_retention.py" = ["F403", "F405"]
+"js/echo/ledger/plugins.py" = ["F403", "F405"]
+"js/echo/ledger/policy.py" = ["F403", "F405"]
+"js/echo/ledger/privacy.py" = ["F403", "F405"]
+"js/echo/ledger/sandbox_backend.py" = ["F403", "F405"]
+"js/echo/ledger/slo.py" = ["F403", "F405"]
+"js/echo/ledger/slo_contract.py" = ["F403", "F405"]
+"js/echo/ledger/strict_json.py" = ["F403", "F405"]
+"js/echo/ledger/tip_anchor.py" = ["F403", "F405"]
+"js/echo/ledger/tip_seal.py" = ["F403", "F405"]
+"js/echo/ledger/types.py" = ["F403", "F405"]
+"js/echo/ledger/verification.py" = ["F403", "F405"]
+"js/orin/taint.py" = ["F403", "F405"]
+"js/orin/sinks.py" = ["F403", "F405"]
+"packages/orin-guard/**/*.py" = ["N818"]
+"packages/echo-core/**/*.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -95,7 +229,17 @@ warn_unused_ignores = false
 exclude = []
 
 [[tool.mypy.overrides]]
-module = ["pypdf.*", "pdfplumber.*", "pandas.*", "openpyxl.*"]
+module = [
+    "docx.*",
+    "pypdf.*",
+    "pdfplumber.*",
+    "pandas.*",
+    "openpyxl.*",
+    "rfc8785.*",
+    "tiktoken",
+    "telegram.*",
+    "xlrd",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -105,4 +249,5 @@ testpaths = ["tests"]
 addopts = "-m 'not playwright'"
 markers = [
     "playwright: Browser automation tests (run separately)",
+    "t8s3a_gate: T8-S3A real-tokenizer threshold gate; requires echo-tokenizer extra",
 ]

@@ -1,0 +1,33 @@
+[importlinter]
+root_packages =
+    echo_core
+    orin_proto
+    orin_guard
+
+[importlinter:contract:echo-core-isolation]
+name = echo-core must not import js, orin-guard, or orin-proto
+type = forbidden
+source_modules =
+    echo_core
+forbidden_modules =
+    js
+    orin_guard
+    orin_proto
+
+[importlinter:contract:orin-proto-isolation]
+name = orin-proto must not import js, echo-core, or orin-guard
+type = forbidden
+source_modules =
+    orin_proto
+forbidden_modules =
+    js
+    echo_core
+    orin_guard
+
+[importlinter:contract:orin-guard-no-js]
+name = orin-guard must not import js
+type = forbidden
+source_modules =
+    orin_guard
+forbidden_modules =
+    js

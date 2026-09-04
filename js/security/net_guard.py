@@ -17,8 +17,9 @@ the classic bypasses:
   them) rather than the hostname.
 
 Cloud metadata endpoints (``169.254.169.254`` and friends) and link-local /
-reserved / multicast / unspecified ranges are ALWAYS rejected, regardless of
-the ``allow_loopback`` / ``allow_private`` policy flags.
+reserved / multicast / unspecified / non-global (e.g. CGNAT ``100.64.0.0/10``)
+ranges are ALWAYS rejected, regardless of the ``allow_loopback`` /
+``allow_private`` policy flags.
 """
 
 from __future__ import annotations
@@ -94,7 +95,10 @@ def is_blocked_ip(
     """Return a rejection reason for *addr*, or ``None`` if it is permitted.
 
     Link-local, reserved, multicast, unspecified and known metadata addresses
-    are always rejected.  Loopback and private (RFC1918 / ULA) ranges are
+    are always rejected, and so is every address that is not globally
+    reachable per the IANA special-purpose registries (CGNAT ``100.64.0.0/10``
+    and similar shared space are neither private nor reserved, yet must never
+    be an outbound target).  Loopback and private (RFC1918 / ULA) ranges are
     rejected unless explicitly allowed by the policy flags.
     """
     # Normalize IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) to its IPv4 form so
@@ -116,8 +120,14 @@ def is_blocked_ip(
     # is also True for loopback; an allowed loopback must not fall through.
     if addr.is_loopback:
         return None if allow_loopback else "loopback address is blocked"
-    if addr.is_private and not allow_private:
-        return "private/internal address is blocked"
+    if addr.is_private:
+        return None if allow_private else "private/internal address is blocked"
+    # Fail closed on everything else that is not globally reachable per the
+    # IANA special-purpose registries — e.g. the CGNAT shared address space
+    # 100.64.0.0/10, which is neither private nor reserved and therefore
+    # slipped past the explicit checks above.
+    if not addr.is_global:
+        return "non-global (shared/special-purpose) address is blocked"
     return None
 
 
@@ -146,6 +156,12 @@ def resolve_and_validate(
     hostname = parsed.hostname
     if not hostname:
         raise OutboundURLError("URL has no host")
+
+    from js.orin.hooks import inspect_canary_text
+
+    blocked = inspect_canary_text(url, surface="net")
+    if blocked is not None:
+        raise OutboundURLError(blocked)
 
     host_lower = hostname.lower().rstrip(".")
     if host_lower in _BLOCKED_HOSTNAMES:
@@ -178,6 +194,7 @@ def resolve_and_validate(
 
 # ── DNS-rebinding defense: pin connections to validated IPs ──
 
+
 class PinnedIPBackend(httpcore.AsyncNetworkBackend):
     """Network backend that forces TCP connections to a pre-validated IP.
 
@@ -199,7 +216,11 @@ class PinnedIPBackend(httpcore.AsyncNetworkBackend):
         backend: httpcore.AsyncNetworkBackend | None = None,
     ) -> None:
         self.pinned_ip = pinned_ip
-        self._backend = backend or httpcore.AsyncNetworkBackend()
+        # AsyncNetworkBackend is the abstract interface and raises
+        # NotImplementedError on real connects.  AnyIOBackend is httpcore's
+        # concrete asyncio/trio implementation; wrapping it preserves the
+        # validated-IP substitution below while keeping TLS SNI/Host intact.
+        self._backend = backend or httpcore.AnyIOBackend()
 
     async def connect_tcp(
         self,
@@ -265,9 +286,7 @@ class PinnedTransport(httpx.AsyncHTTPTransport):
         self._pool = httpcore.AsyncConnectionPool(
             ssl_context=getattr(self._pool, "_ssl_context", None),
             max_connections=getattr(self._pool, "_max_connections", None),
-            max_keepalive_connections=getattr(
-                self._pool, "_max_keepalive_connections", None
-            ),
+            max_keepalive_connections=getattr(self._pool, "_max_keepalive_connections", None),
             keepalive_expiry=getattr(self._pool, "_keepalive_expiry", None),
             http1=getattr(self._pool, "_http1", True),
             http2=getattr(self._pool, "_http2", False),
