@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -143,28 +144,24 @@ class SandboxExecutor:
         self.strict_isolation = strict_isolation
         self._trusted_executables: set[Path] = set()
         # Read-only roots the sandbox profiles must grant so a trusted
-        # interpreter can start: the resolved binary's directory plus the
-        # virtualenv root (pyvenv.cfg marker) when the launcher lives in
-        # <venv>/bin.  Without these a deny-default profile cannot even
-        # import the ``site`` module.
+        # interpreter can start: venv root (pyvenv.cfg), bindir, and the
+        # prefix that holds ``lib/libpython*``.  GitHub-hosted CPython lives
+        # under ``/opt/hostedtoolcache`` — not ``/usr`` — so a venv bind
+        # alone cannot ``execvp`` python or load libpython.
         self._trusted_read_roots: set[Path] = set()
-        for executable in trusted_executables or []:
+        executables = list(trusted_executables or [])
+        executables.append(Path(sys.executable))
+        for executable in executables:
             raw = executable.expanduser()
             try:
                 resolved = raw.resolve()
             except (OSError, RuntimeError):
                 continue
             self._trusted_executables.add(resolved)
-            for candidate in (raw, resolved):
-                bindir = candidate.parent
-                venv_root = bindir.parent
-                try:
-                    if (venv_root / "pyvenv.cfg").is_file():
-                        self._trusted_read_roots.add(venv_root.resolve())
-                    else:
-                        self._trusted_read_roots.add(bindir)
-                except (OSError, RuntimeError):
-                    continue
+            for candidate in _bind_roots_for_executable(raw):
+                self._trusted_read_roots.add(candidate)
+        for candidate in _python_runtime_bind_roots():
+            self._trusted_read_roots.add(candidate)
         self._has_sandbox_exec = shutil.which("sandbox-exec") is not None
         self._has_unshare = shutil.which("unshare") is not None
         self._has_bwrap = shutil.which("bwrap") is not None
@@ -500,20 +497,39 @@ class SandboxExecutor:
             ]
             if not network_allowed:
                 wrapped.append("--unshare-net")
+            # After --tmpfs /tmp, bwrap synthesizes dummy dirs for missing
+            # --bind ancestors. ``--perms`` applies only to the next create,
+            # so every ancestor --dir must set 0555 itself.  These dirs live
+            # on tmpfs, not the host.
+            ancestor_dirs = _bwrap_readonly_ancestor_dirs(self.workspace)
+            for ancestor in ancestor_dirs:
+                wrapped.extend(("--perms", "0555", "--dir", str(ancestor)))
+            bound_roots: set[Path] = set()
             for system_root in ("/usr", "/bin", "/lib", "/lib64", "/sbin"):
-                if Path(system_root).exists():
+                system_path = Path(system_root)
+                if system_path.exists():
                     wrapped.extend(("--ro-bind", system_root, system_root))
+                    bound_roots.add(system_path.resolve())
             for read_only_path in read_only_paths:
                 wrapped.extend(("--ro-bind", str(read_only_path), str(read_only_path)))
-            # Trusted interpreters (and their venv roots) must be visible inside
-            # the mount namespace, matching the macOS sandbox-exec read allow.
-            bound_roots = {Path(p).resolve() for p in read_only_paths}
-            for trusted_root in sorted(self._trusted_read_roots):
+                try:
+                    bound_roots.add(Path(read_only_path).resolve())
+                except (OSError, RuntimeError):
+                    pass
+            # Trusted interpreters (venv + libpython prefix) must be visible,
+            # matching the macOS sandbox-exec read allow.
+            for trusted_root in sorted(
+                self._trusted_read_roots, key=lambda path: (len(path.parts), str(path))
+            ):
                 try:
                     resolved = trusted_root.resolve()
                 except (OSError, RuntimeError):
                     continue
                 if resolved in bound_roots or _path_is_within(resolved, self.workspace):
+                    continue
+                if any(
+                    resolved != bound and _path_is_within(resolved, bound) for bound in bound_roots
+                ):
                     continue
                 if resolved.exists():
                     wrapped.extend(("--ro-bind", str(resolved), str(resolved)))
@@ -1302,6 +1318,150 @@ def _path_is_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+_OVERLY_BROAD_BIND_ROOTS = frozenset(
+    {
+        "/",
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/sbin",
+        "/opt",
+        "/home",
+        "/Users",
+        "/var",
+        "/private",
+        "/System",
+        "/Library",
+        "/tmp",
+        "/private/tmp",
+        "/private/var",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/etc",
+    }
+)
+_BWRAP_DIR_SKIP = frozenset(
+    {
+        Path("/"),
+        Path("/tmp"),
+        Path("/dev"),
+        Path("/proc"),
+        Path("/sys"),
+        Path("/usr"),
+        Path("/bin"),
+        Path("/lib"),
+        Path("/lib64"),
+        Path("/sbin"),
+    }
+)
+
+
+def _is_overly_broad_bind_root(path: Path) -> bool:
+    """Reject filesystem roots that would reopen the host to the sandbox."""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return True
+    if str(resolved) in _OVERLY_BROAD_BIND_ROOTS:
+        return True
+    try:
+        if resolved == Path.home().resolve():
+            return True
+    except (OSError, RuntimeError):
+        pass
+    return False
+
+
+def _append_bind_root(roots: list[Path], seen: set[Path], path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return
+    if resolved in seen or _is_overly_broad_bind_root(resolved):
+        return
+    seen.add(resolved)
+    roots.append(resolved)
+
+
+def _venv_root_for_executable(executable: Path) -> Path | None:
+    """Return the pyvenv.cfg directory for a launcher in ``<venv>/bin``."""
+    try:
+        venv_root = executable.expanduser().parent.parent
+        if (venv_root / "pyvenv.cfg").is_file():
+            return venv_root.resolve()
+    except (OSError, RuntimeError):
+        return None
+    return None
+
+
+def _bind_roots_for_executable(executable: Path) -> list[Path]:
+    """Roots bwrap must ro-bind so ``executable`` can start and find libpython.
+
+    A venv launcher lives in ``.venv/bin``; libpython and the stdlib live in
+    ``sys.base_prefix`` (GitHub ``hostedtoolcache`` / pyenv prefix). Binding
+    only the venv — or only ``prefix/bin`` — leaves ``libpython*.so`` hidden.
+    """
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    try:
+        raw = executable.expanduser()
+        resolved = raw.resolve()
+    except (OSError, RuntimeError):
+        return roots
+    _append_bind_root(roots, seen, raw)
+    _append_bind_root(roots, seen, resolved)
+    venv_root = _venv_root_for_executable(raw)
+    if venv_root is not None:
+        _append_bind_root(roots, seen, venv_root)
+        _append_bind_root(roots, seen, venv_root / "bin")
+    bindir = resolved.parent
+    _append_bind_root(roots, seen, bindir)
+    prefix = bindir.parent if bindir.name.lower() in {"bin", "scripts"} else bindir
+    _append_bind_root(roots, seen, prefix)
+    _append_bind_root(roots, seen, prefix / "lib")
+    _append_bind_root(roots, seen, prefix / "lib64")
+    return roots
+
+
+def _python_runtime_bind_roots() -> list[Path]:
+    """Always-visible host interpreter prefix, even without trusted_executables."""
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for path in _bind_roots_for_executable(Path(sys.executable)):
+        if path not in seen:
+            seen.add(path)
+            roots.append(path)
+    for raw in (sys.prefix, sys.base_prefix, sys.exec_prefix):
+        prefix = Path(raw)
+        _append_bind_root(roots, seen, prefix)
+        _append_bind_root(roots, seen, prefix / "bin")
+        _append_bind_root(roots, seen, prefix / "lib")
+        _append_bind_root(roots, seen, prefix / "lib64")
+    return roots
+
+
+def _bwrap_readonly_ancestor_dirs(workspace: Path) -> list[Path]:
+    """Dummy parent dirs bwrap would otherwise create as writable.
+
+    Parent-first so nested ``--dir`` can build the tree. Skips ``/tmp``
+    (tmpfs mount) and OS roots already ``--ro-bind``ed.
+    """
+    try:
+        resolved = workspace.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return []
+    ancestors: list[Path] = []
+    for parent in reversed(resolved.parents):
+        if parent in _BWRAP_DIR_SKIP:
+            continue
+        ancestors.append(parent)
+    return ancestors
 
 
 def _sandbox_profile_path(path: Path) -> str:

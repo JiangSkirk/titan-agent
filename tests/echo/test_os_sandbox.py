@@ -655,3 +655,102 @@ def test_process_tree_rss_sums_descendants(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(os_sandbox.psutil, "Process", lambda _pid: FakeRoot())
     executor = SandboxExecutor(workspace=tmp_path, timeout=2.0)
     assert executor._process_tree_rss(123) == 140 * 1024 * 1024
+
+
+def _has_ro_bind(wrapped: list[str], path: Path) -> bool:
+    target = str(path.resolve())
+    for index, part in enumerate(wrapped):
+        if part == "--ro-bind" and index + 1 < len(wrapped) and wrapped[index + 1] == target:
+            return True
+    return False
+
+
+def test_linux_bwrap_binds_libpython_prefix_for_venv_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefix = tmp_path / "opt" / "python-3.13" / "x64"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "lib").mkdir()
+    (prefix / "lib" / "libpython3.13.so.1.0").write_bytes(b"")
+    real_py = prefix / "bin" / "python3.13"
+    real_py.write_text("#!/bin/sh\n")
+    venv = tmp_path / "host-venv" / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text(f"home = {prefix / 'bin'}\n")
+    venv_py = venv / "bin" / "python"
+    venv_py.symlink_to(real_py)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executor = SandboxExecutor(
+        workspace,
+        strict_isolation=True,
+        trusted_executables=[venv_py],
+    )
+    executor._has_bwrap = True
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Linux")
+    wrapped = executor._wrap_filesystem_isolation(["echo", "ok"], fs_restricted=True)
+
+    assert _has_ro_bind(wrapped, prefix) or _has_ro_bind(wrapped, prefix / "lib")
+    assert _has_ro_bind(wrapped, venv)
+    assert Path(sys.executable).resolve() in executor._trusted_executables
+
+
+def test_linux_bwrap_binds_host_interpreter_without_trusted_executables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = SandboxExecutor(tmp_path, strict_isolation=True)
+    executor._has_bwrap = True
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Linux")
+    wrapped = executor._wrap_filesystem_isolation(["echo", "ok"], fs_restricted=True)
+    resolved_py = Path(sys.executable).resolve()
+    assert resolved_py in executor._trusted_executables
+    prefix = Path(sys.prefix).resolve()
+    if str(prefix) not in os_sandbox._OVERLY_BROAD_BIND_ROOTS:
+        assert str(prefix) in wrapped or _has_ro_bind(wrapped, resolved_py.parent)
+
+
+def test_linux_bwrap_marks_workspace_ancestors_readonly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "c4-workspace"
+    workspace.mkdir()
+    executor = SandboxExecutor(workspace, strict_isolation=True)
+    executor._has_bwrap = True
+    monkeypatch.setattr("echo_core.os_sandbox.platform.system", lambda: "Linux")
+    wrapped = executor._wrap_filesystem_isolation(["/bin/true"], fs_restricted=True)
+    tmpfs_at = wrapped.index("--tmpfs")
+    bind_at = wrapped.index("--bind")
+    header = wrapped[tmpfs_at:bind_at]
+    dir_indexes = [index for index, part in enumerate(header) if part == "--dir"]
+    assert dir_indexes
+    for index in dir_indexes:
+        assert header[index - 2] == "--perms"
+        assert header[index - 1] == "0555"
+    assert str(tmp_path.resolve()) in header
+    assert str(workspace.resolve()) not in [
+        header[index + 1] for index in dir_indexes
+    ]
+
+
+def test_bwrap_readonly_ancestors_are_parent_first(tmp_path: Path) -> None:
+    workspace = tmp_path / "a" / "b" / "ws"
+    workspace.mkdir(parents=True)
+    ancestors = os_sandbox._bwrap_readonly_ancestor_dirs(workspace)
+    expected = [
+        path
+        for path in (
+            tmp_path.resolve(),
+            (tmp_path / "a").resolve(),
+            (tmp_path / "a" / "b").resolve(),
+        )
+        if path not in os_sandbox._BWRAP_DIR_SKIP
+    ]
+    for path in expected:
+        assert path in ancestors
+    assert workspace.resolve() not in ancestors
+    indices = [ancestors.index(path) for path in expected]
+    assert indices == sorted(indices)

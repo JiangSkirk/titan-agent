@@ -66,6 +66,26 @@ def test_release_smoke_echo_benchmark_omits_slo_gate_on_github_actions(
     assert "--baseline" in gha
 
 
+def test_release_smoke_echo_ledger_defers_journal_slo_on_github_actions(
+    monkeypatch,
+) -> None:
+    import scripts.release_smoke as release_smoke
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert release_smoke.github_actions_quiet_host() is True
+    assert release_smoke.echo_ledger_journal_slo_error(22.3) is None
+    assert release_smoke.echo_ledger_journal_slo_error(None) is not None
+    monkeypatch.setenv("GITHUB_ACTIONS", "false")
+    assert release_smoke.echo_ledger_journal_slo_error(22.3) is not None
+    monkeypatch.delenv("GITHUB_ACTIONS")
+    assert release_smoke.echo_ledger_journal_slo_error(1.0) is None
+    argv = release_smoke.echo_architecture_benchmark_argv(
+        Path("/tmp"),
+        enforce_slo=None,
+    )
+    assert "--enforce-slo" in argv
+
+
 def test_echo_architecture_benchmark_reuses_embedded_clean_export_baseline() -> None:
     import scripts.echo_architecture_benchmark as benchmark
 

@@ -165,6 +165,20 @@ CELL_SOCKET_MAX_PATH = 100
 """macOS AF_UNIX sun_path cap minus margin; mirrors js.orin.testing."""
 
 
+def unix_server_start_kwargs() -> dict[str, bool]:
+    """Kwargs so asyncio cannot follow an aliased parent on close.
+
+    Python 3.13+ ``start_unix_server(..., cleanup_socket=True)`` unlinks the
+    pathname with ``os.stat`` / ``os.unlink``, which follow intermediate
+    directory symlinks. C1 cleanup must stay on the O_NOFOLLOW parent walk
+    in ``safe_unlink_socket_if_same``.
+    """
+
+    if sys.version_info >= (3, 13):
+        return {"cleanup_socket": False}
+    return {}
+
+
 class OrinDaemon:
     """Serves the orin/v1 protocol on one Unix domain socket."""
 
@@ -502,9 +516,11 @@ class OrinDaemon:
         else:
             with contextlib.suppress(FileNotFoundError):
                 self._socket_path.unlink()
+        unix_kwargs = unix_server_start_kwargs()
         self._server = await asyncio.start_unix_server(
             self._handle_connection,
             path=str(self._socket_path),
+            **unix_kwargs,
         )
         os.chmod(self._socket_path, 0o600)
         if self._cell_identity_enforce:
@@ -518,6 +534,7 @@ class OrinDaemon:
             self._cell_server = await asyncio.start_unix_server(
                 self._handle_cell_connection,
                 path=str(self._cell_socket_path),
+                **unix_kwargs,
             )
             os.chmod(self._cell_socket_path, 0o600)
             if self._cell_identity_enforce:

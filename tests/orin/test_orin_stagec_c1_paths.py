@@ -13,7 +13,7 @@ from js.orin.protocol import ProtocolError
 from js.orin.testing import owner_private_temporary_directory
 from js.orind.cell_identity import read_session_key_once
 from js.orind.cells.services import SecretStore
-from js.orind.daemon import OrinDaemon, OrinDaemonError
+from js.orind.daemon import OrinDaemon, OrinDaemonError, unix_server_start_kwargs
 from js.orind.keybox import KeyBox, KeyBoxError
 from js.orind.membrane import CommitMembrane
 from js.orind.private_paths import PrivatePathError, ensure_private_dir, verify_private_file
@@ -426,6 +426,16 @@ async def test_strict_cell_socket_rejects_non_socket_leaf_without_repair(
         assert outside.read_bytes() == marker
         if attack == "regular-file":
             assert socket_path.read_bytes() == marker
+
+
+def test_unix_server_disables_follow_symlink_cleanup_on_py313() -> None:
+    import sys
+
+    kwargs = unix_server_start_kwargs()
+    if sys.version_info >= (3, 13):
+        assert kwargs == {"cleanup_socket": False}
+    else:
+        assert kwargs == {}
 
 
 @pytest.mark.asyncio

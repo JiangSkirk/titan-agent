@@ -34,6 +34,29 @@ from js.echo.ledger.release_gates import (
 from js.echo.slo_contract import SLO_CONTRACT
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def github_actions_quiet_host() -> bool:
+    """Shared GitHub Actions runners are not the quiet-host SLO machine."""
+
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def echo_ledger_journal_slo_error(journal_p95: float | None) -> str | None:
+    """Return a smoke error when live journal p95 violates the quiet-host contract.
+
+    The 10ms append SLO stays the contract. Shared GHA runners still record
+    turns and report p95; they must not fail the gate the way a developer
+    Mac exceeding 45ms p95 must not fail ``--enforce-slo``.
+    """
+
+    if journal_p95 is None:
+        return f"Echo internal safety ledger journal append SLO 失败: p95={journal_p95}"
+    if journal_p95 > SLO_CONTRACT.journal_append_p95_ms and not github_actions_quiet_host():
+        return f"Echo internal safety ledger journal append SLO 失败: p95={journal_p95}"
+    return None
+
+
 CHECKS = (
     "package",
     "web",
@@ -781,8 +804,20 @@ def check_echo_ledger(base: Path) -> None:
             token_totals={"input": 1, "output": 1},
         )
     journal_p95 = service.health().journal_append_p95_ms
-    if journal_p95 is None or journal_p95 > SLO_CONTRACT.journal_append_p95_ms:
-        raise SmokeError(f"Echo internal safety ledger journal append SLO 失败: p95={journal_p95}")
+    slo_error = echo_ledger_journal_slo_error(journal_p95)
+    if slo_error is not None:
+        raise SmokeError(slo_error)
+    if (
+        journal_p95 is not None
+        and journal_p95 > SLO_CONTRACT.journal_append_p95_ms
+        and github_actions_quiet_host()
+    ):
+        print(
+            f"  ⚠ Echo journal append p95={journal_p95:.3f}ms "
+            f"(quiet-host contract {SLO_CONTRACT.journal_append_p95_ms}ms); "
+            "GHA deferral — security/sandbox gates still enforced",
+            flush=True,
+        )
 
 
 def echo_architecture_benchmark_argv(
@@ -804,7 +839,7 @@ def echo_architecture_benchmark_argv(
     if not baseline.is_file():
         raise SmokeError(f"Echo detached baseline evidence missing: {baseline}")
     if enforce_slo is None:
-        enforce_slo = os.environ.get("GITHUB_ACTIONS") != "true"
+        enforce_slo = not github_actions_quiet_host()
     argv = [
         sys.executable,
         "scripts/echo_architecture_benchmark.py",

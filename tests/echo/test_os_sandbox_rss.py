@@ -57,7 +57,13 @@ def test_bwrap_placeholder_for_missing_git(tmp_path, monkeypatch) -> None:
     )
     # Host-side mkdir (not bwrap --dir) so the post-exec planted-.git check
     # does not treat our deny mount point as attacker metadata.
-    assert "--dir" not in wrapped
+    git_dir_args = [
+        wrapped[i + 1]
+        for i, part in enumerate(wrapped)
+        if part == "--dir" and i + 1 < len(wrapped)
+    ]
+    assert str(workspace / ".git") not in git_dir_args
+    assert not any(arg.endswith("/.git") or arg.endswith("\\.git") for arg in git_dir_args)
     assert (workspace / ".git").is_dir()
     assert str(workspace / ".git") in wrapped
     git_binds = [
