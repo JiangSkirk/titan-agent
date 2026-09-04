@@ -157,3 +157,49 @@ def test_grants_for_send_mail_with_web_and_private() -> None:
     grants = grants_for_tool("send_mail", resource_scope="private inbox", context_taint=WEB_CONTENT)
     with pytest.raises(ConjunctionDenied):
         require_conjunction(grants)
+
+
+def test_token_bucket_refills_and_never_exempts_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from orin_guard.kernel.rate import RateLimited, TokenBucket
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr("orin_guard.kernel.rate.time.monotonic", lambda: clock["now"])
+    bucket = TokenBucket(rate=10.0, burst=5.0, tokens=1.0, updated_at=100.0)
+    bucket.take(1.0)
+    with pytest.raises(RateLimited, match="exhausted"):
+        bucket.take(1.0, loopback=True)
+    clock["now"] = 101.0
+    bucket.take(5.0)
+    with pytest.raises(RateLimited):
+        bucket.take(1.0)
+
+
+def test_guard_client_issues_and_consumes_once() -> None:
+    from orin_guard.client import GuardClient
+
+    kernel = GateKernel(b"k" * 32)
+    client = GuardClient(kernel)
+    plane = PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1)
+    ticket = client.issue(plane)
+    assert client.consume(ticket, owner="o", run="r")
+    with pytest.raises(TicketDenied):
+        client.consume(ticket, owner="o", run="r")
+
+
+def test_signer_and_netguard_ports_are_runtime_checkable() -> None:
+    from orin_guard.ports import NetGuard, Signer
+
+    class _Signer:
+        def sign(self, payload: bytes) -> bytes:
+            return payload
+
+        def verify(self, payload: bytes, signature: bytes) -> bool:
+            return payload == signature
+
+    class _Net:
+        def resolve_and_validate(self, url: str, **kwargs: object) -> str:
+            del kwargs
+            return url
+
+    assert isinstance(_Signer(), Signer)
+    assert isinstance(_Net(), NetGuard)
