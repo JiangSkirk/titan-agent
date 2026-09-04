@@ -70,7 +70,9 @@ async def test_worker_is_real_sandboxed_process_without_host_authority(
 
     assert evidence.worker_pid > 1
     assert evidence.worker_pid != os.getpid()
-    assert evidence.parent_pid == os.getpid()
+    # Linux bwrap --unshare-pid makes the worker observe ppid=1 (namespace
+    # init). Darwin sandbox-exec keeps the real host parent pid.
+    assert evidence.parent_pid in {1, os.getpid()}
     assert evidence.received == _projection()
     assert not evidence.host_state_readable
     assert not evidence.owner_key_readable

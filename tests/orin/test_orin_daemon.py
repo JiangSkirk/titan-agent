@@ -435,15 +435,18 @@ class TestAttackSurface:
                 await writer.drain()
             except ConnectionError:
                 pass
+            read_error: BaseException | None = None
             try:
-                with pytest.raises((asyncio.IncompleteReadError, TimeoutError)):
-                    await asyncio.wait_for(reader.readexactly(4), timeout=1.0)
+                await asyncio.wait_for(reader.readexactly(4), timeout=1.0)
+            except (asyncio.IncompleteReadError, TimeoutError, ConnectionError, OSError) as exc:
+                read_error = exc
             finally:
                 writer.close()
                 try:
                     await writer.wait_closed()
-                except ConnectionError:
+                except (ConnectionError, OSError):
                     pass
+            assert read_error is not None, "rejected peer must not complete a hello frame"
             assert daemon._cell_by_cap("cell.file") is None  # noqa: SLF001
             assert not (state_dir / "orin" / f"session-{declared_pid}.key").exists()
             assert any(

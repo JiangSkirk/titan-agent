@@ -213,6 +213,39 @@ class SandboxExecutor:
             spawned_pid=result.spawned_pid,
         )
 
+    def _prepare_linux_git_deny_mount(self, *, fs_restricted: bool) -> Path | None:
+        """Pre-create workspace/.git so bwrap can ro-bind a deny placeholder.
+
+        Returns the path when this call created it (caller must clean up).
+        """
+        if not fs_restricted or platform.system() != "Linux" or not self._has_bwrap:
+            return None
+        git_root = self.workspace / ".git"
+        if git_root.exists():
+            return None
+        try:
+            git_root.mkdir(mode=0o700)
+        except OSError:
+            return None
+        return git_root
+
+    def _cleanup_linux_git_deny_mount(self, created: Path | None) -> None:
+        """Remove a deny-mount ``.git`` we created, unless real git metadata appeared."""
+        if created is None:
+            return
+        try:
+            if not created.exists() or not created.is_dir():
+                return
+            # Keep the directory if a real repository materialized despite the
+            # ro-bind (fail-closed purge already ran); only remove empty / our
+            # placeholder-only trees.
+            remaining = [path for path in created.iterdir()]
+            if remaining:
+                return
+            created.rmdir()
+        except OSError:
+            return
+
     def _build_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """Build a restricted environment."""
         env: dict[str, str] = {}
@@ -472,6 +505,19 @@ class SandboxExecutor:
                     wrapped.extend(("--ro-bind", system_root, system_root))
             for read_only_path in read_only_paths:
                 wrapped.extend(("--ro-bind", str(read_only_path), str(read_only_path)))
+            # Trusted interpreters (and their venv roots) must be visible inside
+            # the mount namespace, matching the macOS sandbox-exec read allow.
+            bound_roots = {Path(p).resolve() for p in read_only_paths}
+            for trusted_root in sorted(self._trusted_read_roots):
+                try:
+                    resolved = trusted_root.resolve()
+                except (OSError, RuntimeError):
+                    continue
+                if resolved in bound_roots or _path_is_within(resolved, self.workspace):
+                    continue
+                if resolved.exists():
+                    wrapped.extend(("--ro-bind", str(resolved), str(resolved)))
+                    bound_roots.add(resolved)
             wrapped.extend(
                 (
                     "--bind",
@@ -493,11 +539,20 @@ class SandboxExecutor:
             for git_component in (*git_dirs, *git_files):
                 if git_component.exists():
                     wrapped.extend(("--ro-bind", str(git_component), str(git_component)))
+            # Occupy workspace/.git with a read-only placeholder when absent so
+            # the sandboxed process cannot plant host-executing git metadata.
+            # Create the mount point on the host *before* bwrap runs — bwrap
+            # ``--dir`` under a rw ``--bind`` persists on the host and would
+            # then trip the post-exec planted-.git rejector.
             git_root = self.workspace / ".git"
             if not git_root.exists():
+                try:
+                    git_root.mkdir(mode=0o700)
+                except OSError:
+                    pass
+            if git_root.is_dir() and git_root not in git_dirs:
                 placeholder = self._sandbox_home_dir() / "git-deny-placeholder"
                 placeholder.mkdir(parents=True, exist_ok=True)
-                wrapped.extend(("--dir", str(git_root)))
                 wrapped.extend(("--ro-bind", str(placeholder), str(git_root)))
             from echo_core.tcb import (
                 workspace_tcb_allow_targets,
@@ -579,36 +634,11 @@ class SandboxExecutor:
                 killed=True,
             )
 
+        # Linux bwrap may pre-create workspace/.git as a deny mount point.
+        # Snapshot *after* that prep so our own placeholder is not treated as
+        # attacker-planted metadata, then remove it on the way out.
+        created_git_deny = self._prepare_linux_git_deny_mount(fs_restricted=fs_restricted)
         git_snapshot = _workspace_git_components(self.workspace) if fs_restricted else None
-
-        if isinstance(command, str):
-            # Use shell for complex commands, but carefully
-            # Cross-platform: use sh on Unix, cmd /c on Windows
-            if platform.system() == "Windows":
-                cmd = ["cmd", "/c", command]
-            else:
-                cmd = ["sh", "-c", command]
-        else:
-            cmd = list(command)
-
-        # Avoid nested sandbox launchers: filesystem backends can enforce the
-        # network restriction in the same process boundary.
-        combined_isolation = fs_restricted and (
-            (platform.system() == "Darwin" and self._has_sandbox_exec)
-            or (platform.system() == "Linux" and self._has_bwrap)
-        )
-        if not combined_isolation:
-            cmd = self._wrap_network_isolation(cmd, network_allowed=network_allowed)
-        cmd = self._wrap_filesystem_isolation(
-            cmd,
-            fs_restricted=fs_restricted,
-            read_only_paths=normalized_read_paths,
-            network_allowed=network_allowed,
-        )
-
-        work_dir.mkdir(parents=True, exist_ok=True)
-
-        built_env = self._build_env(env)
 
         proc: asyncio.subprocess.Process | None = None
         memory_task: asyncio.Task[bool] | None = None
@@ -619,6 +649,35 @@ class SandboxExecutor:
         returncode = 0
 
         try:
+            if isinstance(command, str):
+                # Use shell for complex commands, but carefully
+                # Cross-platform: use sh on Unix, cmd /c on Windows
+                if platform.system() == "Windows":
+                    cmd = ["cmd", "/c", command]
+                else:
+                    cmd = ["sh", "-c", command]
+            else:
+                cmd = list(command)
+
+            # Avoid nested sandbox launchers: filesystem backends can enforce the
+            # network restriction in the same process boundary.
+            combined_isolation = fs_restricted and (
+                (platform.system() == "Darwin" and self._has_sandbox_exec)
+                or (platform.system() == "Linux" and self._has_bwrap)
+            )
+            if not combined_isolation:
+                cmd = self._wrap_network_isolation(cmd, network_allowed=network_allowed)
+            cmd = self._wrap_filesystem_isolation(
+                cmd,
+                fs_restricted=fs_restricted,
+                read_only_paths=normalized_read_paths,
+                network_allowed=network_allowed,
+            )
+
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            built_env = self._build_env(env)
+
             popen_kwargs: dict[str, Any] = {
                 "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
@@ -692,7 +751,7 @@ class SandboxExecutor:
 
             duration_ms = (time.monotonic() - start_time) * 1000
 
-            return self._reject_if_new_git_metadata(
+            result = self._reject_if_new_git_metadata(
                 SandboxResult(
                     returncode=returncode,
                     stdout=stdout,
@@ -704,13 +763,14 @@ class SandboxExecutor:
                 ),
                 git_snapshot,
             )
+            return result
 
         except Exception as e:
             duration_ms = (time.monotonic() - start_time) * 1000
             if proc is not None:
                 self._kill_process_tree(proc)
                 await self._reap_process(proc)
-            return self._reject_if_new_git_metadata(
+            result = self._reject_if_new_git_metadata(
                 SandboxResult(
                     returncode=-1,
                     stdout="",
@@ -721,7 +781,9 @@ class SandboxExecutor:
                 ),
                 git_snapshot,
             )
+            return result
         finally:
+            self._cleanup_linux_git_deny_mount(created_git_deny)
             # No task/process leaks on normal, timeout, or exception paths.
             await self._cancel_tasks(stdout_task, stderr_task, memory_task)
             if proc is not None and proc.returncode is None:
@@ -921,6 +983,12 @@ class SandboxExecutor:
         group = self._process_group_rss(pid)
         cgroup = self._cgroup_rss(pid)
         if cgroup is None:
+            return group
+        # Shared parent cgroups (GitHub runners, Cloud Agent pods, desktop
+        # user slices) report the whole container/session, not the sandbox
+        # tree. Only trust cgroup current when it is in the same ballpark as
+        # the process-group sum; otherwise the monitor false-OOMs every job.
+        if cgroup > max(group * 4, group + 64 * 1024 * 1024):
             return group
         return max(group, cgroup)
 

@@ -33,12 +33,21 @@ class PrivatePathError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class PathIdentity:
-    """Filesystem identity pinned after a strict open."""
+    """Filesystem identity pinned after a strict open.
+
+    ``size`` / ``mtime_ns`` are evidence for unlink-vs-reuse checks only and
+    are excluded from equality so content-mutating sidecars (SQLite WAL) can
+    still re-verify the same inode. Linux often recycles inode numbers after
+    unlink+create; comparing size/mtime in ``safe_unlink_if_same`` prevents
+    deleting a replacement file that reused the pinned inode.
+    """
 
     dev: int
     ino: int
     uid: int
     mode: int
+    size: int = field(default=-1, compare=False)
+    mtime_ns: int = field(default=-1, compare=False)
 
     @classmethod
     def from_stat(cls, metadata: os.stat_result) -> PathIdentity:
@@ -47,6 +56,8 @@ class PathIdentity:
             ino=int(metadata.st_ino),
             uid=int(metadata.st_uid),
             mode=stat.S_IMODE(metadata.st_mode),
+            size=int(metadata.st_size),
+            mtime_ns=int(metadata.st_mtime_ns),
         )
 
 
@@ -424,7 +435,15 @@ def safe_unlink_if_same(path: Path, expected: PathIdentity) -> None:
     try:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         _check_private_file_metadata(metadata, path, mode=expected.mode)
-        if PathIdentity.from_stat(metadata) != expected:
+        current = PathIdentity.from_stat(metadata)
+        if current != expected:
+            raise PrivatePathError(f"refusing to unlink replaced private file: {path}")
+        # Linux often recycles inode numbers after unlink+create. When the
+        # pin recorded size/mtime, require those to match too so a replacement
+        # that reused the inode is preserved.
+        if expected.size >= 0 and expected.mtime_ns >= 0 and (
+            current.size != expected.size or current.mtime_ns != expected.mtime_ns
+        ):
             raise PrivatePathError(f"refusing to unlink replaced private file: {path}")
         os.unlink(name, dir_fd=parent_fd)
         os.fsync(parent_fd)

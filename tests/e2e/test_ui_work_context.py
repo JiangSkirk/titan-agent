@@ -42,6 +42,7 @@ class TestWorkContextPanel:
         self, page: Page, appshell_authed_server: tuple[str, str]
     ) -> None:
         _enter_work(page, appshell_authed_server)
+        page.wait_for_function("() => typeof window.loadApprovals === 'function'", timeout=10_000)
         page.evaluate(
             """() => {
                 window.__approvalUpdateEvents = 0;
@@ -59,6 +60,15 @@ class TestWorkContextPanel:
         _enter_work(page, appshell_authed_server)
         band = page.locator("#work-context-band")
         expect(band).to_be_visible()
+        # refreshWorkContext is async after mode entry; wait for the authoritative
+        # workspace handle instead of racing the HTML default label.
+        page.wait_for_function(
+            """() => {
+                const el = document.getElementById('band-workspace');
+                return Boolean(el && el.textContent && el.textContent.startsWith('ws-'));
+            }""",
+            timeout=10_000,
+        )
         workspace_text = band.locator("#band-workspace").inner_text()
         assert workspace_text.startswith("ws-"), f"unexpected workspace label: {workspace_text}"
         grants_text = band.locator("#band-grants").inner_text()

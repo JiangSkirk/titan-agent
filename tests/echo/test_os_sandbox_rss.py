@@ -17,12 +17,25 @@ def test_process_group_rss_covers_current_process() -> None:
 def test_accounted_rss_prefers_larger_of_group_and_cgroup(monkeypatch) -> None:
     executor = SandboxExecutor.__new__(SandboxExecutor)
     monkeypatch.setattr(SandboxExecutor, "_process_group_rss", staticmethod(lambda _pid: 100))
+    # Modest cgroup overshoot still wins (dedicated sandbox cgroup).
     monkeypatch.setattr(SandboxExecutor, "_cgroup_rss", staticmethod(lambda _pid: 250))
     assert executor._accounted_rss(1) == 250
     monkeypatch.setattr(SandboxExecutor, "_cgroup_rss", staticmethod(lambda _pid: None))
     assert executor._accounted_rss(1) == 100
     monkeypatch.setattr(SandboxExecutor, "_cgroup_rss", staticmethod(lambda _pid: 50))
     assert executor._accounted_rss(1) == 100
+
+
+def test_accounted_rss_ignores_shared_parent_cgroup(monkeypatch) -> None:
+    """CI containers report the whole pod in memory.current — do not OOM on that."""
+    executor = SandboxExecutor.__new__(SandboxExecutor)
+    monkeypatch.setattr(
+        SandboxExecutor, "_process_group_rss", staticmethod(lambda _pid: 26_000_000)
+    )
+    monkeypatch.setattr(
+        SandboxExecutor, "_cgroup_rss", staticmethod(lambda _pid: 1_700_000_000)
+    )
+    assert executor._accounted_rss(1) == 26_000_000
 
 
 def test_cgroup_rss_is_none_or_non_negative() -> None:
@@ -42,6 +55,16 @@ def test_bwrap_placeholder_for_missing_git(tmp_path, monkeypatch) -> None:
         fs_restricted=True,
         network_allowed=False,
     )
-    assert "--dir" in wrapped
+    # Host-side mkdir (not bwrap --dir) so the post-exec planted-.git check
+    # does not treat our deny mount point as attacker metadata.
+    assert "--dir" not in wrapped
+    assert (workspace / ".git").is_dir()
     assert str(workspace / ".git") in wrapped
-    assert any(str(part).endswith("git-deny-placeholder") for part in wrapped)
+    git_binds = [
+        i
+        for i, part in enumerate(wrapped)
+        if part == "--ro-bind"
+        and i + 2 < len(wrapped)
+        and wrapped[i + 2] == str(workspace / ".git")
+    ]
+    assert git_binds

@@ -825,7 +825,9 @@ def echo_architecture_benchmark_argv(
 def check_echo(base: Path) -> None:
     env = _env(base)
     _run([sys.executable, "scripts/echo_smoke.py"], env=env, timeout=120)
-    _run(echo_architecture_benchmark_argv(base), env=env, timeout=180)
+    # Shared CI runners (especially macOS Python 3.13) can exceed 180s for
+    # 50+10 iterations; keep the functional gate, give the host more budget.
+    _run(echo_architecture_benchmark_argv(base), env=env, timeout=300)
 
 
 def check_work(base: Path) -> None:
