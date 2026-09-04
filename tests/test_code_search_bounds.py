@@ -17,6 +17,7 @@ from js.tools.files import FileTools
 
 @pytest.fixture
 def files(tmp_path: Path) -> FileTools:
+    """Shared tools with a tight regex kill window for ReDoS timeout tests."""
     limits = ToolLimits(
         code_search_max_pattern_chars=32,
         code_search_max_files=50,
@@ -48,10 +49,21 @@ async def test_literal_does_not_interpret_regex_metacharacters(
 
 
 @pytest.mark.asyncio
-async def test_regex_mode_matches_and_rejects_invalid(files: FileTools, tmp_path: Path) -> None:
+async def test_regex_mode_matches_and_rejects_invalid(tmp_path: Path) -> None:
+    # Success-path regex must not share the 0.5s ReDoS kill window: coverage
+    # instrumentation makes spawn+worker start exceed that on CI.
+    limits = ToolLimits(
+        code_search_max_pattern_chars=32,
+        code_search_max_files=50,
+        code_search_max_bytes=100_000,
+        code_search_max_line_chars=200,
+        code_search_regex_timeout_seconds=5.0,
+    )
+    guard = BehaviorGuard(SecurityConfig(allow_workspace_delete=True), tmp_path)
+    files = FileTools(tmp_path, limits, guard)
     (tmp_path / "a.py").write_text("abc123xyz\n", encoding="utf-8")
     ok = await files.code_search(r"abc\d+", use_regex=True)
-    assert ok.success
+    assert ok.success, ok.error
     assert "abc123xyz" in (ok.output or "")
     assert ok.metadata["mode"] == "regex"
 
