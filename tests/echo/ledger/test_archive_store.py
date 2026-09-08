@@ -1101,17 +1101,56 @@ def test_permission_repair_failure_is_fail_closed(
         _store(path)
 
 
-def _collect_path_locks() -> int:
-    """Drain cyclic GC so WeakValueDictionary path locks can drop."""
-    for generation in (2, 1, 0, 2):
-        gc.collect(generation)
-    return archive_store._path_lock_count()
-
-
 def test_path_lock_registry_releases_unused_paths(tmp_path: Path) -> None:
-    baseline = _collect_path_locks()
+    """Weak path locks drop after the last strong reference is gone.
 
-    for number in range(24):
-        _store(tmp_path / f"archive-{number}.sqlite3")
+    Assert the WeakValueDictionary contract directly. Do not rely on ArchiveStore
+    cyclic-GC timing (Python 3.14 full-suite load can leave a discarded store
+    alive briefly and false-fail a process-wide retained-path scan).
+    """
 
-    assert _collect_path_locks() <= baseline
+    path_a = (tmp_path / "archive-a.sqlite3").resolve()
+    path_b = (tmp_path / "archive-b.sqlite3").resolve()
+
+    lock_a = archive_store._lock_for_path(path_a)
+    lock_b = archive_store._lock_for_path(path_b)
+    # Same strong ref must reuse the registry entry (lock is not RLock — call outside).
+    assert archive_store._lock_for_path(path_a) is lock_a
+    with archive_store._PATH_LOCKS_GUARD:
+        assert archive_store._PATH_LOCKS.get(path_a) is lock_a
+        assert archive_store._PATH_LOCKS.get(path_b) is lock_b
+
+    del lock_a
+    for _ in range(16):
+        gc.collect()
+        with archive_store._PATH_LOCKS_GUARD:
+            # Touch the mapping so dead weakrefs are purged promptly.
+            _ = list(archive_store._PATH_LOCKS.items())
+            if archive_store._PATH_LOCKS.get(path_a) is None:
+                break
+
+    with archive_store._PATH_LOCKS_GUARD:
+        assert archive_store._PATH_LOCKS.get(path_a) is None
+        # Sibling lock stays while its strong reference is alive.
+        assert archive_store._PATH_LOCKS.get(path_b) is lock_b
+
+    replacement = archive_store._lock_for_path(path_a)
+    with archive_store._PATH_LOCKS_GUARD:
+        assert archive_store._PATH_LOCKS.get(path_a) is replacement
+    assert replacement is not lock_b
+
+    del lock_b
+    del replacement
+    for _ in range(16):
+        gc.collect()
+        with archive_store._PATH_LOCKS_GUARD:
+            _ = list(archive_store._PATH_LOCKS.items())
+            if (
+                archive_store._PATH_LOCKS.get(path_a) is None
+                and archive_store._PATH_LOCKS.get(path_b) is None
+            ):
+                break
+
+    with archive_store._PATH_LOCKS_GUARD:
+        assert archive_store._PATH_LOCKS.get(path_a) is None
+        assert archive_store._PATH_LOCKS.get(path_b) is None

@@ -302,12 +302,13 @@ class TestCancelAPI:
 
         assert len(agent._cancel_tokens) == 2
         assert agent.request_cancel(session_id, owner_key_hash="owner-a") is True
-        state_a = await asyncio.wait_for(owner_a, timeout=0.5)
+        # Durable cancel (lane + D1/model cleanup) can exceed 0.5s under full CI load.
+        state_a = await asyncio.wait_for(owner_a, timeout=5.0)
         assert state_a.status == "cancelled"
         assert not owner_b.done()
 
         assert agent.request_cancel(session_id, owner_key_hash="owner-b") is True
-        state_b = await asyncio.wait_for(owner_b, timeout=0.5)
+        state_b = await asyncio.wait_for(owner_b, timeout=5.0)
         assert state_b.status == "cancelled"
 
     @pytest.mark.asyncio

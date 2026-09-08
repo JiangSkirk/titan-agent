@@ -176,7 +176,11 @@ def test_one_login_sets_only_parent_cookie_and_root_api_uses_principal(
     assert status.status_code == 200, status.text
     assert status.json()["product_id"] == "js-agent"
     assert appshell.client.get("/work/api/status").status_code == 404
-    assert "8765" not in appshell.client.get("/api/appshell/capabilities").text
+    caps_text = appshell.client.get("/api/appshell/capabilities").text
+    # Port leakage check — require host:port form so random session hex cannot
+    # false-positive on the substring "8765".
+    assert ":8765" not in caps_text
+    assert '"port":8765' not in caps_text.replace(" ", "")
 
 
 def test_parent_logout_revokes_session_and_expires_parent_cookie(
@@ -368,7 +372,8 @@ def test_switch_contract_validates_mode_and_opaque_workspace_then_routes_root(
     }
     assert payload["target_path"] == "/"
     assert payload["must_reconnect"] is True
-    assert "8765" not in switched.text
+    assert ":8765" not in switched.text
+    assert '"port":8765' not in switched.text.replace(" ", "")
     assert appshell.client.get("/api/status").json()["product_id"] == "js-work"
 
     stale = appshell.client.post(

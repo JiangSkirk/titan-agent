@@ -954,7 +954,9 @@ async def switch_appshell_mode(
         if body.workspace_handle != request.app.state.work_workspace_handle:
             raise HTTPException(400, {"code": "invalid_work_workspace_handle"})
         target_workspace = request.app.state.work_workspace_handle
-        await _await_work_runtime(request)
+        # Do not await Work boot here — cancel departing Personal runs first.
+        # Cold Work startup can take multiple seconds under CI load and must
+        # not delay CancelledError delivery to in-flight mutating tools.
     else:
         if body.workspace_handle is not None:
             raise HTTPException(400, {"code": "personal_workspace_must_be_null"})
@@ -1064,7 +1066,11 @@ async def switch_appshell_mode(
             )
         completed_steps.append("verify_departing_resources_cleared")
 
-        # 5. The browser clears stream and attachment references before reconnect.
+        # 5. Boot Work only after departing cancel/drain — never ahead of cancel.
+        if body.to_mode == "work":
+            await _await_work_runtime(request)
+
+        # 6. The browser clears stream and attachment references before reconnect.
         clear_keys = [
             "messages",
             "stream_buffers",
@@ -1074,7 +1080,7 @@ async def switch_appshell_mode(
             f"mode:{principal.active_mode}",
         ]
 
-        # 6. CAS only after every authoritative old-epoch operation ended.
+        # 7. CAS only after every authoritative old-epoch operation ended.
         try:
             updated = await gate.commit_switch(
                 _session_token(request),
@@ -1348,3 +1354,4 @@ async def list_friends(
         status_code=404,
         detail={"code": "feature_not_enabled", "feature": "friends"},
     )
+
