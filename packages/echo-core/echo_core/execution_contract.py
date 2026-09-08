@@ -23,7 +23,7 @@ SideEffectCommitment = Literal[
 
 _MODEL_EXECUTOR = "JSAgent.authorized_model_chat"
 _TOOL_EXECUTOR = "ToolExecutor.execute_tool"
-_LEDGER_OWNER = "EchoSafetyService"
+_LEDGER_OWNER = "FileEchoLedger"
 _MEMORY_OWNER = "js.memory via Echo ContextVault"
 _CONTRACT_VERSION = "echo-unified-turn-v1"
 

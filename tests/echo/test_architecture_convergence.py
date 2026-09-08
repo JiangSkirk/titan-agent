@@ -105,7 +105,7 @@ def test_unified_execution_contract_names_model_and_tool_executors() -> None:
     assert contract.architecture == "echo-2.0"
     assert contract.model_executor == "JSAgent.authorized_model_chat"
     assert contract.tool_executor == "ToolExecutor.execute_tool"
-    assert contract.ledger_owner == "EchoSafetyService"
+    assert contract.ledger_owner == "FileEchoLedger"
     assert contract.memory_owner == "js.memory via Echo ContextVault"
 
 

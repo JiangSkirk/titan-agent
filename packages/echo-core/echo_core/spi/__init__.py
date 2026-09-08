@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from echo_core.spi.guardian import GuardianSPI, NullGuardian
+from echo_core.spi.ledger_append import LedgerAppendPort
 from echo_core.spi.ports import (
     LedgerStore,
     MetricsSink,
@@ -18,6 +19,7 @@ from echo_core.spi.ports import (
 
 __all__ = [
     "GuardianSPI",
+    "LedgerAppendPort",
     "LedgerStore",
     "MetricsSink",
     "ModelAdapter",
