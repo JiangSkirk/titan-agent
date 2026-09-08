@@ -25,6 +25,29 @@ class TicketDenied(PermissionError):
     """Issue or consume refused."""
 
 
+def grants_digest(grants: frozenset[str]) -> str:
+    """Stable SHA-256 hex digest of a grant set (sorted, comma-joined)."""
+
+    canonical = ",".join(sorted(grants))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _ticket_mac_payload(
+    *,
+    ticket_id: str,
+    owner: str,
+    run: str,
+    effect_class: str,
+    grants_digest_hex: str,
+    args_hash: str,
+    lease_id: str,
+) -> bytes:
+    return (
+        f"{ticket_id}:{owner}:{run}:{effect_class}:"
+        f"{grants_digest_hex}:{args_hash}:{lease_id}"
+    ).encode()
+
+
 @dataclass(frozen=True, slots=True)
 class EffectTicket:
     ticket_id: str
@@ -36,6 +59,9 @@ class EffectTicket:
     mac: str
     expires_at: float
     nonce: str
+    grants_digest: str = ""
+    args_hash: str = ""
+    lease_id: str = ""
 
 
 class GateKernel:
@@ -50,7 +76,14 @@ class GateKernel:
         self._consumed: set[str] = set()
         self._frozen = False
 
-    def issue(self, plane: PolicyPlane, *, now: float | None = None) -> EffectTicket:
+    def issue(
+        self,
+        plane: PolicyPlane,
+        *,
+        now: float | None = None,
+        args_hash: str = "",
+        lease_id: str = "",
+    ) -> EffectTicket:
         if self._frozen and self.enforce:
             raise KernelUnavailable("kernel is frozen")
         if plane.budget < 1:
@@ -63,9 +96,18 @@ class GateKernel:
         stamp = now if now is not None else time.time()
         nonce = secrets.token_hex(16)
         ticket_id = hashlib.sha256(f"{plane.owner}:{plane.run}:{nonce}".encode()).hexdigest()
+        digest = grants_digest(plane.grants)
         mac = hmac.new(
             self._key,
-            f"{ticket_id}:{plane.owner}:{plane.run}:{plane.effect_class}".encode(),
+            _ticket_mac_payload(
+                ticket_id=ticket_id,
+                owner=plane.owner,
+                run=plane.run,
+                effect_class=plane.effect_class,
+                grants_digest_hex=digest,
+                args_hash=args_hash,
+                lease_id=lease_id,
+            ),
             hashlib.sha256,
         ).hexdigest()
         ticket = EffectTicket(
@@ -78,6 +120,9 @@ class GateKernel:
             mac=mac,
             expires_at=stamp + 300.0,
             nonce=nonce,
+            grants_digest=digest,
+            args_hash=args_hash,
+            lease_id=lease_id,
         )
         self._live[ticket_id] = ticket
         return ticket
@@ -87,22 +132,42 @@ class GateKernel:
     ) -> str:
         if self._frozen and self.enforce:
             raise KernelUnavailable("kernel is frozen")
-        stored = self._live.get(ticket.ticket_id)
-        if stored is None or ticket.ticket_id in self._consumed:
+        if ticket.ticket_id in self._consumed:
             raise TicketDenied("ticket missing or already consumed")
+        stored = self._live.get(ticket.ticket_id)
+        if stored is None:
+            # GateKernel.issue is the stamp; consume without a live stamp is denied.
+            raise TicketDenied("consume-before-stamp denied")
         stamp = now if now is not None else time.time()
         if stamp > stored.expires_at:
             self._live.pop(ticket.ticket_id, None)
             raise TicketDenied("ticket expired")
         if stored.run != run or stored.owner != owner:
             raise TicketDenied("ticket owner/run mismatch")
+        digest = grants_digest(stored.grants)
+        if digest != stored.grants_digest:
+            raise TicketDenied("ticket MAC mismatch")
         expected = hmac.new(
             self._key,
-            f"{stored.ticket_id}:{stored.owner}:{stored.run}:{stored.effect_class}".encode(),
+            _ticket_mac_payload(
+                ticket_id=stored.ticket_id,
+                owner=stored.owner,
+                run=stored.run,
+                effect_class=stored.effect_class,
+                grants_digest_hex=digest,
+                args_hash=stored.args_hash,
+                lease_id=stored.lease_id,
+            ),
             hashlib.sha256,
         ).hexdigest()
         if not hmac.compare_digest(stored.mac, expected) or not hmac.compare_digest(
             ticket.mac, expected
+        ):
+            raise TicketDenied("ticket MAC mismatch")
+        if (
+            not hmac.compare_digest(ticket.grants_digest, stored.grants_digest)
+            or not hmac.compare_digest(ticket.args_hash, stored.args_hash)
+            or not hmac.compare_digest(ticket.lease_id, stored.lease_id)
         ):
             raise TicketDenied("ticket MAC mismatch")
         self._consumed.add(ticket.ticket_id)
@@ -119,4 +184,5 @@ __all__ = [
     "GateKernel",
     "KernelUnavailable",
     "TicketDenied",
+    "grants_digest",
 ]

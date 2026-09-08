@@ -1,0 +1,35 @@
+# Lethal trifecta matrix for orin-guard conjunction kernel.
+# private.read ∩ web.read ∩ egress.send is structurally unsatisfiable.
+# No YOLO / timeout / ambient override path may flip deny → allow.
+
+cases:
+  - id: empty
+    grants: []
+    expect: allow
+  - id: private_only
+    grants: [private.read]
+    expect: allow
+  - id: web_only
+    grants: [web.read]
+    expect: allow
+  - id: egress_only
+    grants: [egress.send]
+    expect: allow
+  - id: private_web
+    grants: [private.read, web.read]
+    expect: allow
+  - id: private_egress
+    grants: [private.read, egress.send]
+    expect: allow
+  - id: web_egress
+    grants: [web.read, egress.send]
+    expect: allow
+  - id: lethal_triad
+    grants: [private.read, web.read, egress.send]
+    expect: deny
+  - id: lethal_plus_extra
+    grants: [private.read, web.read, egress.send, tool.exec]
+    expect: deny
+  - id: order_independent
+    grants: [egress.send, private.read, web.read]
+    expect: deny
