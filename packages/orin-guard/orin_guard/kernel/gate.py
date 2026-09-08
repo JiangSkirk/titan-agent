@@ -48,6 +48,14 @@ def _ticket_mac_payload(
     ).encode()
 
 
+def _digest_eq(left: str, right: str) -> bool:
+    """Constant-time equality that never raises on unequal lengths."""
+
+    if len(left) != len(right):
+        return False
+    return hmac.compare_digest(left, right)
+
+
 @dataclass(frozen=True, slots=True)
 class EffectTicket:
     ticket_id: str
@@ -160,14 +168,12 @@ class GateKernel:
             ),
             hashlib.sha256,
         ).hexdigest()
-        if not hmac.compare_digest(stored.mac, expected) or not hmac.compare_digest(
-            ticket.mac, expected
-        ):
+        if not _digest_eq(stored.mac, expected) or not _digest_eq(ticket.mac, expected):
             raise TicketDenied("ticket MAC mismatch")
         if (
-            not hmac.compare_digest(ticket.grants_digest, stored.grants_digest)
-            or not hmac.compare_digest(ticket.args_hash, stored.args_hash)
-            or not hmac.compare_digest(ticket.lease_id, stored.lease_id)
+            not _digest_eq(ticket.grants_digest, stored.grants_digest)
+            or not _digest_eq(ticket.args_hash, stored.args_hash)
+            or not _digest_eq(ticket.lease_id, stored.lease_id)
         ):
             raise TicketDenied("ticket MAC mismatch")
         self._consumed.add(ticket.ticket_id)
