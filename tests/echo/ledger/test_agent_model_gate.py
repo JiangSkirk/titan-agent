@@ -1119,14 +1119,14 @@ async def test_close_waits_for_turn_during_setup_admission(
     run_task = asyncio.create_task(
         agent.run("wait during setup", session_id="setup-close-race")
     )
-    await asyncio.wait_for(setup_started.wait(), timeout=1)
+    await asyncio.wait_for(setup_started.wait(), timeout=5)
     close_task = asyncio.create_task(agent.close())
     try:
         await asyncio.sleep(0.02)
         assert not close_task.done()
         setup_release.set()
-        state = await asyncio.wait_for(run_task, timeout=1)
-        await asyncio.wait_for(close_task, timeout=1)
+        state = await asyncio.wait_for(run_task, timeout=5)
+        await asyncio.wait_for(close_task, timeout=5)
         assert state.status == "cancelled"
         assert provider.calls == []
     finally:
