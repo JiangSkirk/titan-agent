@@ -698,6 +698,9 @@ class ToolExecutorMixin(ControlPlaneMixin, ToolHandoffMixin):
         owner_key_hash: str | None = None,
     ) -> tuple[ChatMessage, ToolResult]:
         """Execute a single tool call and return the tool message plus raw result."""
+        from js.echo.effect_bind import require_effect_exec_receipt
+
+        require_effect_exec_receipt()
         func = tc.get("function", {}) if isinstance(tc, dict) else {}
         tool_name = func.get("name", "") if isinstance(func, dict) else ""
         raw_args = func.get("arguments", "{}") if isinstance(func, dict) else "{}"

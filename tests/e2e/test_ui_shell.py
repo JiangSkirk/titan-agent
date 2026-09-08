@@ -207,12 +207,16 @@ class TestTheme:
     def test_system_theme_follows_preference(
         self, page: Page, appshell_authed_server: tuple[str, str]
     ) -> None:
+        # Pin preference to system so prefers-color-scheme drives data-theme.
+        page.add_init_script("localStorage.setItem('js-theme', 'system')")
         page.emulate_media(color_scheme="dark")
         _goto_shell(page, appshell_authed_server)
         _wait_shell_ready(page)
         assert page.locator("html").get_attribute("data-theme") == "dark"
         page.emulate_media(color_scheme="light")
-        _goto_shell(page, appshell_authed_server)
+        # Same-URL goto does not re-run theme-init.js. Force a full reload so
+        # matchMedia is re-read (macOS Playwright can miss the change event).
+        page.reload()
         _wait_shell_ready(page)
         assert page.locator("html").get_attribute("data-theme") == "light"
 

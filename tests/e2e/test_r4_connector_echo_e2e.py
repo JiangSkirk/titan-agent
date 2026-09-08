@@ -206,8 +206,9 @@ async def test_personal_import_e2e(tmp_path: Path) -> None:
     # Source file should not be modified
     assert source_file.read_text() == "hello world"
 
-    # Replay should fail (lease consumed)
-    with pytest.raises((PermissionError, Exception), match="nonce|already|replay|consumed"):
+    assert outcome.receipt_id  # D1 EffectAuthority receipt (not empty lease fallback)
+    # Replay should fail (D1 lease already issued / single-use admit)
+    with pytest.raises((PermissionError, Exception), match="nonce|already|replay|consumed|issued"):
         await runtime.execute_connector_effect(request, params=params, context=context)
 
 

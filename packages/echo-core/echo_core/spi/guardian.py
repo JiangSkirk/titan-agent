@@ -27,6 +27,8 @@ class GuardianSPI(Protocol):
         grants: frozenset[str],
         budget: int,
         taint: int = 0,
+        lease_id: str = "",
+        args_hash: str = "",
     ) -> str:
         """Return an opaque ticket id, or raise GuardianDenied."""
         ...

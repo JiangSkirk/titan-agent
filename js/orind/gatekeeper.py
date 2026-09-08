@@ -133,11 +133,8 @@ class GateKeeper:
             profile=profile,
         )
         if self._shadow_mode and decision.verdict != policy_mod.VERDICT_ALLOW:
-            return policy_mod.PolicyDecision(
-                verdict=policy_mod.VERDICT_ALLOW,
-                reason=f"shadow: {decision.verdict} ({decision.reason})",
-                matched_row=decision.matched_row,
-            )
+            # Observe-only: never rewrite deny/export/approval → allow.
+            return decision
         return decision
 
     @staticmethod

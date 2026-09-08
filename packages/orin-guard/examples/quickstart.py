@@ -10,10 +10,10 @@ from orin_guard.kernel.gate import GateKernel, TicketDenied
 def main() -> None:
     kernel = GateKernel(b"k" * 32)
     plane = PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1)
-    ticket = kernel.issue(plane, now=100.0)
+    ticket = kernel.issue(plane, now=100.0, lease_id="lease-qs")
     receipt = kernel.consume(ticket, owner="o", run="r", now=200.0)
     print("consumed once:", bool(receipt))
-    ticket2 = kernel.issue(plane, now=100.0)
+    ticket2 = kernel.issue(plane, now=100.0, lease_id="lease-qs-2")
     try:
         kernel.consume(ticket2, owner="o", run="r", now=401.0)
     except TicketDenied as exc:

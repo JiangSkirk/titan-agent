@@ -54,7 +54,7 @@ class CredBroker:
         ).hexdigest()
         if not hmac.compare_digest(token.mac, expected):
             raise CredBrokerDenied("token MAC mismatch")
-        secret = self._secrets.get(token.token_id)
+        secret = self._secrets.pop(token.token_id, None)
         if secret is None:
             raise CredBrokerDenied("token already spent or unknown")
         return secret

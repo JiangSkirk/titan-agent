@@ -694,7 +694,7 @@ class TestExactApprovalMembraneAuthority:
             _prepare_seeded_exact(seeded)
             _replace_current_witness(seeded)
             with pytest.raises(OperationConflict, match="witness is no longer current"):
-                seeded.membrane.begin_commit(seeded.spec.operation_id)
+                seeded.membrane.begin_commit(seeded.spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
             assert seeded.membrane.get(seeded.spec.operation_id).state is CommitState.PREPARED
         finally:
             seeded.membrane.close()
@@ -801,7 +801,7 @@ class TestExactApprovalMembraneAuthority:
         seeded = _seed_exact_membrane(tmp_path)
         _prepare_seeded_exact(seeded)
         if legacy_state is CommitState.UNKNOWN_COMMIT:
-            seeded.membrane.begin_commit(seeded.spec.operation_id)
+            seeded.membrane.begin_commit(seeded.spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
             seeded.membrane.mark_ambiguous(seeded.spec.operation_id, "legacy crash")
         seeded.membrane.close()
         legacy_fingerprint = membrane_module._spec_fingerprint(  # noqa: SLF001
