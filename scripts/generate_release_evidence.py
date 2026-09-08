@@ -42,9 +42,12 @@ def main() -> int:
         "--check",
         action="store_true",
         help=(
-            "Do not update artifacts. Compare lockfile-derived SBOM and license "
-            "scan only; command-embedded FTO/clean-room packets are operator "
-            "snapshots, not a GitHub Actions gate."
+            "Do not update artifacts. Compare lockfile package identity (name, "
+            "version, source, hashes) in the SBOM and license scan. Installed "
+            "license metadata may be NOASSERTION on some Python/OS matrix "
+            "cells; that availability gap is not staleness. Command-embedded "
+            "FTO/clean-room packets are operator snapshots, not a GitHub "
+            "Actions gate."
         ),
     )
     args = parser.parse_args()
@@ -61,7 +64,7 @@ def main() -> int:
         stale = [
             str(path.relative_to(ROOT))
             for path, content in generated.items()
-            if not path.exists() or path.read_text(encoding="utf-8") != content
+            if _static_artifact_is_stale(path, content)
         ]
         if stale:
             print("release evidence is stale:", ", ".join(stale), file=sys.stderr)
@@ -89,6 +92,132 @@ def _existing_generated_at(sbom_path: Path) -> str | None:
     if not isinstance(created, str) or not created.strip():
         return None
     return created
+
+
+_RAW_LICENSE_PREFIX = "Raw package metadata: "
+_LICENSE_ROW = re.compile(r"^\| `([^`]+)` \| `([^`]+)` \| (.*) \|$")
+
+
+def _package_raw_license(node: dict[str, Any]) -> str:
+    comments = node.get("licenseComments")
+    if isinstance(comments, str) and comments.startswith(_RAW_LICENSE_PREFIX):
+        return comments[len(_RAW_LICENSE_PREFIX) :]
+    declared = node.get("licenseDeclared")
+    return declared if isinstance(declared, str) and declared.strip() else "NOASSERTION"
+
+
+def licenses_compatible(left: str, right: str) -> bool:
+    """Installed license metadata is optional; lockfile identity is not."""
+    if left == right:
+        return True
+    return "NOASSERTION" in {left, right}
+
+
+def _license_table(markdown: str) -> dict[tuple[str, str], str]:
+    rows: dict[tuple[str, str], str] = {}
+    for line in markdown.splitlines():
+        match = _LICENSE_ROW.match(line)
+        if match is None:
+            continue
+        rows[(match.group(1), match.group(2))] = match.group(3).strip()
+    return rows
+
+
+def _existing_license_map() -> dict[tuple[str, str], str]:
+    """Reuse previously recorded licenses when this environment did not install a package."""
+    mapping: dict[tuple[str, str], str] = {}
+    scan = SECURITY_DIR / "LICENSE_SCAN.md"
+    if scan.is_file():
+        for key, text in _license_table(scan.read_text(encoding="utf-8")).items():
+            if text and text != "NOASSERTION":
+                mapping[key] = text
+    sbom = SECURITY_DIR / "SBOM.spdx.json"
+    if not sbom.is_file():
+        return mapping
+    try:
+        payload = json.loads(sbom.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return mapping
+    for node in payload.get("packages") or []:
+        if not isinstance(node, dict):
+            continue
+        name = node.get("name")
+        version = node.get("versionInfo")
+        if not isinstance(name, str) or not isinstance(version, str):
+            continue
+        raw = _package_raw_license(node)
+        if raw != "NOASSERTION":
+            mapping.setdefault((name, version), raw)
+    return mapping
+
+
+def _package_lock_identity(node: dict[str, Any]) -> tuple[object, ...]:
+    return (
+        node.get("SPDXID"),
+        node.get("name"),
+        node.get("versionInfo"),
+        node.get("downloadLocation"),
+        json.dumps(node.get("checksums") or [], sort_keys=True),
+    )
+
+
+def _depends_on_targets(payload: dict[str, Any]) -> set[str]:
+    related: set[str] = set()
+    for relation in payload.get("relationships") or []:
+        if not isinstance(relation, dict):
+            continue
+        if relation.get("relationshipType") != "DEPENDS_ON":
+            continue
+        target = relation.get("relatedSpdxElement")
+        if isinstance(target, str) and target.strip():
+            related.add(target)
+    return related
+
+
+def sbom_lockfile_matches(committed: dict[str, Any], expected: dict[str, Any]) -> bool:
+    committed_packages = {
+        node["SPDXID"]: node
+        for node in committed.get("packages") or []
+        if isinstance(node, dict) and isinstance(node.get("SPDXID"), str)
+    }
+    expected_packages = {
+        node["SPDXID"]: node
+        for node in expected.get("packages") or []
+        if isinstance(node, dict) and isinstance(node.get("SPDXID"), str)
+    }
+    if set(committed_packages) != set(expected_packages):
+        return False
+    for spdx_id, expected_pkg in expected_packages.items():
+        committed_pkg = committed_packages[spdx_id]
+        if _package_lock_identity(committed_pkg) != _package_lock_identity(expected_pkg):
+            return False
+        if not licenses_compatible(
+            _package_raw_license(committed_pkg), _package_raw_license(expected_pkg)
+        ):
+            return False
+    return _depends_on_targets(committed) == _depends_on_targets(expected)
+
+
+def license_scan_lockfile_matches(committed: str, expected: str) -> bool:
+    left = _license_table(committed)
+    right = _license_table(expected)
+    if set(left) != set(right):
+        return False
+    return all(licenses_compatible(left[key], right[key]) for key in left)
+
+
+def _static_artifact_is_stale(path: Path, expected: str) -> bool:
+    if not path.exists():
+        return True
+    actual = path.read_text(encoding="utf-8")
+    if path.name == "SBOM.spdx.json":
+        try:
+            return not sbom_lockfile_matches(json.loads(actual), json.loads(expected))
+        except json.JSONDecodeError:
+            return True
+    if path.name == "LICENSE_SCAN.md":
+        return not license_scan_lockfile_matches(actual, expected)
+    return actual != expected
 
 
 def generate_static_artifacts(packages: list[PackageEvidence], now: str) -> dict[Path, str]:
@@ -119,12 +248,17 @@ def read_lock_packages() -> list[PackageEvidence]:
     raw_packages = raw.get("package")
     _validate_lock_package_set(raw_packages)
     assert isinstance(raw_packages, list)
+    existing_licenses = _existing_license_map()
     packages: list[PackageEvidence] = []
     for pkg in raw_packages:
         name = str(pkg["name"])
         version = str(pkg.get("version", "0"))
         source = _source_name(pkg.get("source", {}))
         license_text, classifiers = _license_metadata(name, version)
+        if license_text == "NOASSERTION":
+            reused = existing_licenses.get((name, version))
+            if reused and reused != "NOASSERTION":
+                license_text = reused
         hashes = tuple(_artifact_hashes(pkg))
         packages.append(
             PackageEvidence(

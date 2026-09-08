@@ -13,7 +13,10 @@ from scripts.generate_release_evidence import (
     _license_metadata,
     _normalize_command_output,
     _spdx_license_value,
+    license_scan_lockfile_matches,
+    licenses_compatible,
     render_license_scan,
+    sbom_lockfile_matches,
 )
 
 
@@ -165,3 +168,90 @@ def test_lockfile_evidence_rejects_a_missing_declared_dependency(
 
     with pytest.raises(ValueError, match="missing-transitive"):
         release_evidence.read_lock_packages()
+
+
+def test_licenses_compatible_treats_noassertion_as_availability_gap() -> None:
+    assert licenses_compatible("MIT", "MIT") is True
+    assert licenses_compatible("NOASSERTION", "MIT") is True
+    assert licenses_compatible("Apache-2.0", "NOASSERTION") is True
+    assert licenses_compatible("MIT", "Apache-2.0") is False
+
+
+def _sbom_package(
+    *,
+    name: str,
+    version: str,
+    license_text: str,
+    download: str = "https://pypi.org/simple",
+    checksum: str = "aa",
+) -> dict[str, object]:
+    spdx_id = f"SPDXRef-Package-{name}-{version}"
+    return {
+        "SPDXID": spdx_id,
+        "name": name,
+        "versionInfo": version,
+        "downloadLocation": download,
+        "checksums": [{"algorithm": "SHA256", "checksumValue": checksum}],
+        "licenseComments": f"Raw package metadata: {license_text}",
+        "licenseDeclared": license_text,
+    }
+
+
+def test_sbom_check_requires_lockfile_identity_not_installed_license_bytes() -> None:
+    expected_pkg = _sbom_package(name="echo-core", version="3.0.0", license_text="MIT")
+    committed_pkg = _sbom_package(name="echo-core", version="3.0.0", license_text="NOASSERTION")
+    expected = {
+        "packages": [expected_pkg],
+        "relationships": [
+            {
+                "relationshipType": "DEPENDS_ON",
+                "relatedSpdxElement": expected_pkg["SPDXID"],
+            }
+        ],
+    }
+    committed = {
+        "packages": [committed_pkg],
+        "relationships": [
+            {
+                "relationshipType": "DEPENDS_ON",
+                "relatedSpdxElement": committed_pkg["SPDXID"],
+            }
+        ],
+    }
+    assert sbom_lockfile_matches(committed, expected) is True
+
+    missing = {
+        "packages": [],
+        "relationships": [],
+    }
+    assert sbom_lockfile_matches(missing, expected) is False
+
+    version_drift = {
+        "packages": [_sbom_package(name="echo-core", version="3.0.1", license_text="MIT")],
+        "relationships": expected["relationships"],
+    }
+    assert sbom_lockfile_matches(version_drift, expected) is False
+
+    conflict = {
+        "packages": [_sbom_package(name="echo-core", version="3.0.0", license_text="Apache-2.0")],
+        "relationships": expected["relationships"],
+    }
+    assert sbom_lockfile_matches(conflict, expected) is False
+
+
+def test_license_scan_check_allows_noassertion_for_uninstalled_matrix_packages() -> None:
+    expected = render_license_scan(
+        [_package("audioop-lts", "Apache-2.0"), _package("echo-core", "MIT")],
+        "2026-09-08T00:00:00Z",
+    )
+    committed = render_license_scan(
+        [_package("audioop-lts", "NOASSERTION"), _package("echo-core", "MIT")],
+        "2026-09-08T00:00:00Z",
+    )
+    assert license_scan_lockfile_matches(committed, expected) is True
+
+    missing_package = render_license_scan(
+        [_package("echo-core", "MIT")],
+        "2026-09-08T00:00:00Z",
+    )
+    assert license_scan_lockfile_matches(missing_package, expected) is False

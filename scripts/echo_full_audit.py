@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,10 @@ class AuditFinding:
     verification: str
 
 
+_ECHO_CORE_SHIM_MARKER = "Compatibility shim — implementation lives in echo_core."
+_ECHO_CORE_SHIM_IMPORT = re.compile(r"^import (echo_core(?:\.\w+)*) as _impl$", re.MULTILINE)
+
+
 def _read(root: Path, relative: str) -> str:
     path = root / relative
     if not path.exists() and relative.endswith(".py"):
@@ -63,7 +68,22 @@ def _read(root: Path, relative: str) -> str:
             child.read_text(encoding="utf-8", errors="replace")
             for child in sorted(path.rglob("*.py"))
         )
-    return path.read_text(encoding="utf-8", errors="replace")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return _with_echo_core_shim_source(root, text)
+
+
+def _with_echo_core_shim_source(root: Path, text: str) -> str:
+    """Include echo-core implementations when js.echo modules are thin shims."""
+    if _ECHO_CORE_SHIM_MARKER not in text:
+        return text
+    match = _ECHO_CORE_SHIM_IMPORT.search(text)
+    if match is None:
+        return text
+    module_path = Path(*match.group(1).split(".")).with_suffix(".py")
+    impl_path = root / "packages" / "echo-core" / module_path
+    if not impl_path.is_file():
+        return text
+    return text + "\n" + impl_path.read_text(encoding="utf-8", errors="replace")
 
 
 def _load_json(root: Path, relative: str) -> dict[str, Any]:
