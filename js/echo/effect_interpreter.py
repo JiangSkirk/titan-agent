@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,7 +129,7 @@ class EffectInterpreter:
         receipt = self._admit_d1(
             effect_class="model",
             context=context,
-            lease_id=f"model:{context.run_id}:{id(effect)}",
+            lease_id=f"model:{context.run_id}:{uuid.uuid4().hex}",
             grants=frozenset(),
         )
         from js.echo.effect_bind import reset_effect_exec_receipt, set_effect_exec_receipt
@@ -220,7 +221,7 @@ class EffectInterpreter:
         self._admit_d1(
             effect_class="model",
             context=context,
-            lease_id=f"model-stream:{context.run_id}:{id(effect)}",
+            lease_id=f"model-stream:{context.run_id}:{uuid.uuid4().hex}",
             grants=frozenset(),
         )
 
@@ -335,7 +336,10 @@ class EffectInterpreter:
         receipt = self._admit_d1(
             effect_class="tool",
             context=context,
-            lease_id=f"tool:{context.run_id}:{effect.tool_name}:{effect.tool_call_id or id(effect)}",
+            lease_id=(
+                f"tool:{context.run_id}:{effect.tool_name}:"
+                f"{effect.tool_call_id or uuid.uuid4().hex}"
+            ),
             grants=grants,
         )
         from js.echo.effect_bind import reset_effect_exec_receipt, set_effect_exec_receipt
