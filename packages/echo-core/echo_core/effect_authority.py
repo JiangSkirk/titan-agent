@@ -141,6 +141,7 @@ class EffectAuthority:
             grants=proposal.grants,
             budget=proposal.budget,
             taint=proposal.taint,
+            lease_id=lease_id,
         )
         record = self.ledger.append(
             record_type=STAMP_RECEIPT_RECORD_TYPE,

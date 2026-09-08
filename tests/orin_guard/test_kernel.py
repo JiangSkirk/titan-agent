@@ -29,7 +29,7 @@ def test_lethal_trifecta_hard_deny() -> None:
 def test_gate_kernel_single_use() -> None:
     kernel = GateKernel(b"k" * 32)
     plane = PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1)
-    ticket = kernel.issue(plane)
+    ticket = kernel.issue(plane, lease_id="lease-1")
     kernel.consume(ticket, owner="o", run="r")
     with pytest.raises(TicketDenied):
         kernel.consume(ticket, owner="o", run="r")
@@ -38,7 +38,7 @@ def test_gate_kernel_single_use() -> None:
 def test_gate_kernel_rejects_expired_ticket() -> None:
     kernel = GateKernel(b"k" * 32)
     plane = PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1)
-    ticket = kernel.issue(plane, now=100.0)
+    ticket = kernel.issue(plane, now=100.0, lease_id="lease-2")
     with pytest.raises(TicketDenied, match="expired"):
         kernel.consume(ticket, owner="o", run="r", now=401.0)
 
@@ -46,7 +46,7 @@ def test_gate_kernel_rejects_expired_ticket() -> None:
 def test_gate_kernel_consume_within_ttl() -> None:
     kernel = GateKernel(b"k" * 32)
     plane = PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1)
-    ticket = kernel.issue(plane, now=100.0)
+    ticket = kernel.issue(plane, now=100.0, lease_id="lease-3")
     receipt = kernel.consume(ticket, owner="o", run="r", now=200.0)
     assert receipt
 
@@ -180,7 +180,7 @@ def test_guard_client_issues_and_consumes_once() -> None:
     kernel = GateKernel(b"k" * 32)
     client = GuardClient(kernel)
     plane = PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1)
-    ticket = client.issue(plane)
+    ticket = client.issue(plane, lease_id="lease-client")
     assert client.consume(ticket, owner="o", run="r")
     with pytest.raises(TicketDenied):
         client.consume(ticket, owner="o", run="r")

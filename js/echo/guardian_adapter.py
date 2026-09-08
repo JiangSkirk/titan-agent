@@ -27,6 +27,8 @@ class OrinGuardian:
         grants: frozenset[str],
         budget: int,
         taint: int = 0,
+        lease_id: str = "",
+        args_hash: str = "",
     ) -> str:
         _ = taint
         try:
@@ -38,7 +40,9 @@ class OrinGuardian:
                     effect_class=effect_class,
                     grants=grants,
                     budget=budget,
-                )
+                ),
+                lease_id=lease_id,
+                args_hash=args_hash,
             )
         except (TicketDenied, KernelUnavailable) as exc:
             raise GuardianDenied(str(exc)) from exc

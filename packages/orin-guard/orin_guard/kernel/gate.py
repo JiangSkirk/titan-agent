@@ -15,6 +15,8 @@ from orin_guard.kernel.dual import PolicyPlane
 ALLOWED_EFFECTS: Final[frozenset[str]] = frozenset(
     {"tool", "model", "connector", "learn.tighten", "learn.note", "learn.widen"}
 )
+# Tool-class sinks must bind a non-empty lease_id into the stamp MAC.
+LEASE_BOUND_EFFECTS: Final[frozenset[str]] = frozenset({"tool", "connector"})
 
 
 class KernelUnavailable(RuntimeError):
@@ -98,6 +100,8 @@ class GateKernel:
             raise TicketDenied("budget < 1")
         if plane.effect_class not in ALLOWED_EFFECTS:
             raise TicketDenied("effect_class is not registered")
+        if plane.effect_class in LEASE_BOUND_EFFECTS and not lease_id:
+            raise TicketDenied("tool-class effect requires non-empty lease_id")
         require_conjunction(plane.grants)
         if plane.effect_class == "learn.widen" and not plane.grants:
             raise TicketDenied("learn.widen requires an explicit owner grant")
@@ -186,6 +190,7 @@ class GateKernel:
 
 __all__ = [
     "ALLOWED_EFFECTS",
+    "LEASE_BOUND_EFFECTS",
     "EffectTicket",
     "GateKernel",
     "KernelUnavailable",

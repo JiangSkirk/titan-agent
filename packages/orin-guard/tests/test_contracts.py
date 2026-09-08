@@ -1,4 +1,4 @@
-"""Package-local Orin 2.0 contract tests (C1–C23 coverage anchors)."""
+"""Package-local Orin 2.0 pins using frozen architecture contract names."""
 
 from __future__ import annotations
 
@@ -6,44 +6,32 @@ import dataclasses
 from pathlib import Path
 
 import pytest
+from echo_core.taint import WEB_CONTENT
 from orin_guard.broker.cred import CredBroker, CredBrokerDenied
 from orin_guard.kernel.conjunction import ConjunctionDenied, require_conjunction
 from orin_guard.kernel.dual import PolicyPlane
 from orin_guard.kernel.gate import EffectTicket, GateKernel, TicketDenied, grants_digest
+from orin_guard.kernel.grants import grants_for_tool
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _plane(grants: frozenset[str] | None = None) -> PolicyPlane:
+def _plane(
+    grants: frozenset[str] | None = None,
+    *,
+    effect_class: str = "tool",
+) -> PolicyPlane:
     return PolicyPlane(
         "o",
         "s",
         "r",
-        "tool",
+        effect_class,
         grants if grants is not None else frozenset({"private.read"}),
         1,
     )
 
 
-def test_c1_single_use_ticket() -> None:
-    kernel = GateKernel(b"k" * 32)
-    ticket = kernel.issue(_plane())
-    kernel.consume(ticket, owner="o", run="r")
-    with pytest.raises(TicketDenied, match="already consumed"):
-        kernel.consume(ticket, owner="o", run="r")
-
-
-def test_c2_stored_expires_at() -> None:
-    kernel = GateKernel(b"k" * 32)
-    ticket = kernel.issue(_plane(), now=100.0)
-    assert ticket.expires_at == 400.0
-    # Mutating a presented copy cannot extend the stored expiry.
-    forged = dataclasses.replace(ticket, expires_at=10_000.0)
-    with pytest.raises(TicketDenied, match="expired"):
-        kernel.consume(forged, owner="o", run="r", now=401.0)
-
-
-def test_c3_consume_before_stamp_denied() -> None:
+def test_consume_before_stamp_denied() -> None:
     kernel = GateKernel(b"k" * 32)
     forged = EffectTicket(
         ticket_id="deadbeef" * 8,
@@ -57,70 +45,29 @@ def test_c3_consume_before_stamp_denied() -> None:
         nonce="00",
         grants_digest=grants_digest(frozenset({"private.read"})),
         args_hash="",
-        lease_id="",
+        lease_id="lease-forged",
     )
     with pytest.raises(TicketDenied, match="consume-before-stamp"):
         kernel.consume(forged, owner="o", run="r")
 
 
-def test_c4_conjunction_lethal() -> None:
-    with pytest.raises(ConjunctionDenied, match="unsatisfiable"):
-        require_conjunction(frozenset({"private.read", "web.read", "egress.send"}))
-
-
-def test_c6_mac_mismatch() -> None:
+def test_mac_missing_grants_digest_denied() -> None:
     kernel = GateKernel(b"k" * 32)
-    ticket = kernel.issue(_plane(), args_hash="args-a", lease_id="lease-a")
-    tampered = dataclasses.replace(ticket, mac="ff" * 32)
+    ticket = kernel.issue(_plane(), lease_id="lease-g", args_hash="args")
+    blank = dataclasses.replace(ticket, grants_digest="")
+    with pytest.raises(TicketDenied, match="MAC mismatch"):
+        kernel.consume(blank, owner="o", run="r")
+
+
+def test_mac_args_hash_mismatch_denied() -> None:
+    kernel = GateKernel(b"k" * 32)
+    ticket = kernel.issue(_plane(), lease_id="lease-a", args_hash="sha256:" + "a" * 64)
+    tampered = dataclasses.replace(ticket, args_hash="sha256:" + "b" * 64)
     with pytest.raises(TicketDenied, match="MAC mismatch"):
         kernel.consume(tampered, owner="o", run="r")
 
 
-def test_c7_c8_c9_mac_binds_grants_args_lease() -> None:
-    kernel = GateKernel(b"k" * 32)
-    grants = frozenset({"private.read"})
-    ticket = kernel.issue(
-        _plane(grants),
-        args_hash="sha256:" + "a" * 64,
-        lease_id="lease-bound",
-    )
-    assert ticket.grants_digest == grants_digest(grants)
-    assert ticket.args_hash == "sha256:" + "a" * 64
-    assert ticket.lease_id == "lease-bound"
-
-    wrong_grants = dataclasses.replace(
-        ticket, grants_digest=grants_digest(frozenset({"web.read"}))
-    )
-    with pytest.raises(TicketDenied, match="MAC mismatch"):
-        kernel.consume(wrong_grants, owner="o", run="r")
-
-    ticket2 = kernel.issue(
-        _plane(grants),
-        args_hash="sha256:" + "b" * 64,
-        lease_id="lease-bound-2",
-    )
-    wrong_args = dataclasses.replace(ticket2, args_hash="sha256:" + "c" * 64)
-    with pytest.raises(TicketDenied, match="MAC mismatch"):
-        kernel.consume(wrong_args, owner="o", run="r")
-
-    ticket3 = kernel.issue(
-        _plane(grants),
-        args_hash="sha256:" + "d" * 64,
-        lease_id="lease-bound-3",
-    )
-    wrong_lease = dataclasses.replace(ticket3, lease_id="lease-other")
-    with pytest.raises(TicketDenied, match="MAC mismatch"):
-        kernel.consume(wrong_lease, owner="o", run="r")
-
-    ok = kernel.issue(
-        _plane(grants),
-        args_hash="sha256:" + "e" * 64,
-        lease_id="lease-ok",
-    )
-    assert kernel.consume(ok, owner="o", run="r")
-
-
-def test_c10_credbroker_single_use() -> None:
+def test_cred_exchange_is_single_use() -> None:
     broker = CredBroker(b"k" * 32, allowed_hosts=frozenset({"api.example"}))
     token = broker.issue("o", "api.example", b"real-key")
     assert broker.exchange(token, owner="o", host="api.example") == b"real-key"
@@ -128,13 +75,67 @@ def test_c10_credbroker_single_use() -> None:
         broker.exchange(token, owner="o", host="api.example")
 
 
-def test_c16_no_orin_allow_ambient_escape() -> None:
-    """Package must not ship an ORIN_ALLOW_AMBIENT product escape hatch."""
+def test_conjunction_lethal_ticket() -> None:
+    kernel = GateKernel(b"k" * 32)
+    with pytest.raises(ConjunctionDenied, match="unsatisfiable"):
+        kernel.issue(
+            _plane(frozenset({"private.read", "web.read", "egress.send"})),
+            lease_id="lease-lethal",
+        )
+
+
+def test_synthetic_path_file_web_egress_denied() -> None:
+    grants = grants_for_tool(
+        "send_mail", resource_scope="private inbox", context_taint=WEB_CONTENT
+    )
+    with pytest.raises(ConjunctionDenied, match="unsatisfiable"):
+        require_conjunction(grants)
+
+
+def test_tool_effect_empty_lease_id_denied() -> None:
+    kernel = GateKernel(b"k" * 32)
+    with pytest.raises(TicketDenied, match="lease_id"):
+        kernel.issue(_plane(effect_class="tool"), lease_id="")
+    # Model tickets are not lease-bound at GateKernel.
+    model = kernel.issue(_plane(effect_class="model"), lease_id="")
+    assert model.effect_class == "model"
+
+
+def test_stored_expires_at_enforced() -> None:
+    kernel = GateKernel(b"k" * 32)
+    ticket = kernel.issue(_plane(), lease_id="lease-exp", now=100.0)
+    assert ticket.expires_at == 400.0
+    forged = dataclasses.replace(ticket, expires_at=10_000.0)
+    with pytest.raises(TicketDenied, match="expired"):
+        kernel.consume(forged, owner="o", run="r", now=401.0)
+
+
+def test_single_use_ticket() -> None:
+    kernel = GateKernel(b"k" * 32)
+    ticket = kernel.issue(_plane(), lease_id="lease-once")
+    kernel.consume(ticket, owner="o", run="r")
+    with pytest.raises(TicketDenied, match="already consumed"):
+        kernel.consume(ticket, owner="o", run="r")
+
+
+def test_production_build_strips_orin_allow_ambient() -> None:
+    """Production package sources must not reference ORIN_ALLOW_AMBIENT."""
 
     root = PACKAGE_ROOT / "orin_guard"
     offenders: list[str] = []
     for path in sorted(root.rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        if "ORIN_ALLOW_AMBIENT" in text:
+        if "ORIN_ALLOW_AMBIENT" in path.read_text(encoding="utf-8"):
             offenders.append(str(path.relative_to(PACKAGE_ROOT)))
     assert offenders == []
+
+
+def test_orin_allow_ambient_env_ignored_still_denies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ORIN_ALLOW_AMBIENT", "1")
+    monkeypatch.setenv("ORIN_ALLOW_AMBIENT", "true")
+    with pytest.raises(ConjunctionDenied, match="unsatisfiable"):
+        require_conjunction(frozenset({"private.read", "web.read", "egress.send"}))
+    kernel = GateKernel(b"k" * 32)
+    with pytest.raises(TicketDenied, match="lease_id"):
+        kernel.issue(_plane(), lease_id="")

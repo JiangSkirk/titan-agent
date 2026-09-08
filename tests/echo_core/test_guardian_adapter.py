@@ -18,6 +18,7 @@ def test_orin_guardian_stamps_and_consumes_once() -> None:
         effect_class="tool",
         grants=frozenset({"private.read"}),
         budget=1,
+        lease_id="lease-g1",
     )
     guardian.consume(ticket, owner="o", run="r")
     with pytest.raises(GuardianDenied):

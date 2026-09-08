@@ -87,6 +87,12 @@ def test_interpreter_rejects_ticket_without_lease_receipt(tmp_path: Path) -> Non
     assert auth.require_exec("lease-3") == receipt
 
 
+def test_interpreter_requires_ledger_receipt(tmp_path: Path) -> None:
+    """Frozen alias — Interpreter.exec requires durable ledger receipt."""
+
+    test_interpreter_rejects_ticket_without_lease_receipt(tmp_path)
+
+
 def test_execution_contract_ledger_owner_is_file_echo_ledger() -> None:
     contract = current_execution_contract()
     assert contract.ledger_owner == "FileEchoLedger"
@@ -170,6 +176,15 @@ def test_turn_executor_bypass_red(tmp_path: Path) -> None:
     # Simulate a TurnExecutor / agent._execute_tool_call bypass with no lease.
     with pytest.raises(EffectAuthorityError, match="exec without stamp"):
         auth.require_exec("bypass-lease")
+
+    # Real `_execute_tool_call` exists on the Host agent, but EffectInterpreter
+    # is the only caller path that may reach it under the frozen contract.
+    interpreter = (
+        REPO_ROOT / "js" / "echo" / "effect_interpreter.py"
+    ).read_text(encoding="utf-8")
+    assert "_execute_tool_call" in interpreter
+    agent_base = (REPO_ROOT / "js" / "agent" / "base.py").read_text(encoding="utf-8")
+    assert "async def _execute_tool_call" in agent_base
 
 
 def test_no_execute_tool_call_bypass_symbol() -> None:
