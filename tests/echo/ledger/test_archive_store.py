@@ -1101,12 +1101,17 @@ def test_permission_repair_failure_is_fail_closed(
         _store(path)
 
 
+def _collect_path_locks() -> int:
+    """Drain cyclic GC so WeakValueDictionary path locks can drop."""
+    for generation in (2, 1, 0, 2):
+        gc.collect(generation)
+    return archive_store._path_lock_count()
+
+
 def test_path_lock_registry_releases_unused_paths(tmp_path: Path) -> None:
-    baseline = archive_store._path_lock_count()
+    baseline = _collect_path_locks()
 
     for number in range(24):
         _store(tmp_path / f"archive-{number}.sqlite3")
 
-    gc.collect()
-
-    assert archive_store._path_lock_count() <= baseline
+    assert _collect_path_locks() <= baseline

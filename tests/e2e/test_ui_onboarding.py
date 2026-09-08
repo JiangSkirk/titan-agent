@@ -596,9 +596,14 @@ class TestModelsPage:
         _wait_shell_ready(page)
         page.evaluate("window.switchTab('models')")
         page.wait_for_function(
-            "() => document.getElementById('current-model')?.value === 'fakep/m1'"
+            "() => { const s = document.getElementById('current-model');"
+            " return Boolean(s && s.value === 'fakep/m1'"
+            " && [...s.options].some(o => o.value === 'fakep/dynamic-model')); }"
         )
-        page.locator("#current-model").select_option("fakep/dynamic-model")
+        # onchange="switchModel(this.value)" is async; assert after the POST is
+        # actually routed, not immediately after select_option returns.
+        with page.expect_request("**/api/models/switch", timeout=5_000):
+            page.locator("#current-model").select_option("fakep/dynamic-model")
 
         expect(page.locator("#current-model")).to_have_value("fakep/dynamic-model")
         assert switch_calls == [1]
