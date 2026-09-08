@@ -1102,11 +1102,21 @@ def test_permission_repair_failure_is_fail_closed(
 
 
 def test_path_lock_registry_releases_unused_paths(tmp_path: Path) -> None:
-    baseline = archive_store._path_lock_count()
+    root = tmp_path.resolve()
 
     for number in range(24):
         _store(tmp_path / f"archive-{number}.sqlite3")
 
-    gc.collect()
+    # WeakValueDictionary drops entries only after GC. Under Python 3.14 full-suite
+    # load, a single collect can leave a stale entry briefly; scope the assertion to
+    # this test's paths (process-wide count races with sibling fixtures).
+    for _ in range(5):
+        gc.collect()
+        with archive_store._PATH_LOCKS_GUARD:
+            retained = [path for path in archive_store._PATH_LOCKS if path.is_relative_to(root)]
+        if not retained:
+            break
 
-    assert archive_store._path_lock_count() <= baseline
+    with archive_store._PATH_LOCKS_GUARD:
+        retained = [path for path in archive_store._PATH_LOCKS if path.is_relative_to(root)]
+    assert retained == []
