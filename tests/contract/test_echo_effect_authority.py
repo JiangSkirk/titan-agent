@@ -475,6 +475,63 @@ def test_tool_admit_does_not_hardcode_private_read() -> None:
     source = (REPO_ROOT / "js" / "echo" / "effect_interpreter.py").read_text(encoding="utf-8")
     assert "grants_for_effect_tool" in source
     assert 'grants=frozenset({"private.read"})' not in source
+    assert "resource_scope=resource_scope" in source
+    assert "args_hash=_d1_args_hash" in source or "args_hash=request.authority_binding_hash()" in source
+    assert 'f"connector:{request.lease.lease_id}:{request.lease.nonce}"' in source
+    assert "connector:{context.run_id}:" not in source
+
+
+def test_assert_grants_cover_tool_honors_resource_scope() -> None:
+    from js.echo.effect_grants import assert_grants_cover_tool, grants_for_effect_tool
+
+    # Scope with "private" adds private.read even when sinks alone may not.
+    required = grants_for_effect_tool("memory_store", resource_scope="private workspace")
+    assert "private.read" in required
+    with pytest.raises(EffectAuthorityError, match="grants incomplete"):
+        assert_grants_cover_tool(
+            "memory_store",
+            frozenset(),
+            resource_scope="private workspace",
+        )
+
+
+def test_tool_admit_binds_args_hash(tmp_path: Path) -> None:
+    from js.echo.effect_interpreter import EffectInterpreter, _d1_args_hash
+
+    auth = _authority(tmp_path)
+    interp = EffectInterpreter(object(), effect_authority=auth)
+    context = type(
+        "Ctx",
+        (),
+        {
+            "owner_key_hash": "owner-a",
+            "session_id": "session-a",
+            "run_id": "run-a",
+        },
+    )()
+    args_hash = _d1_args_hash('{"path":"a.txt"}')
+    receipt = interp._admit_d1(
+        effect_class="tool",
+        context=context,  # type: ignore[arg-type]
+        lease_id="tool:run-a:file_read:tc-args",
+        grants=frozenset({"private.read"}),
+        tool_name="file_read",
+        resource_scope="private",
+        args_hash=args_hash,
+    )
+    assert receipt.lease_id == "tool:run-a:file_read:tc-args"
+    assert args_hash
+    # Second admit with different args_hash but same lease_id still denied (single-use).
+    with pytest.raises(EffectAuthorityError, match="already issued"):
+        interp._admit_d1(
+            effect_class="tool",
+            context=context,  # type: ignore[arg-type]
+            lease_id="tool:run-a:file_read:tc-args",
+            grants=frozenset({"private.read"}),
+            tool_name="file_read",
+            resource_scope="private",
+            args_hash=_d1_args_hash('{"path":"b.txt"}'),
+        )
 
 
 def test_tool_admit_denied_without_real_required_grants(tmp_path: Path) -> None:

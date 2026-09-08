@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import secrets
 import time
@@ -51,6 +52,12 @@ def _new_d1_lease_id(prefix: str, run_id: str, *parts: object) -> str:
     if stable:
         return f"{prefix}:{run_id}:{stable}:{nonce}"
     return f"{prefix}:{run_id}:{nonce}"
+
+
+def _d1_args_hash(payload: str) -> str:
+    """Stable SHA-256 hex digest for GateKernel args_hash MAC binding."""
+
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -348,7 +355,12 @@ class EffectInterpreter:
             resource_scope=resource_scope,
             context_taint=context_taint,
         )
-        assert_grants_cover_tool(effect.tool_name, grants, context_taint=context_taint)
+        assert_grants_cover_tool(
+            effect.tool_name,
+            grants,
+            resource_scope=resource_scope,
+            context_taint=context_taint,
+        )
         receipt = self._admit_d1(
             effect_class="tool",
             context=context,
@@ -360,6 +372,9 @@ class EffectInterpreter:
             ),
             grants=grants,
             tool_name=effect.tool_name,
+            resource_scope=resource_scope,
+            context_taint=context_taint,
+            args_hash=_d1_args_hash(effect.arguments_json),
         )
 
         tool_call = {
@@ -498,23 +513,31 @@ class EffectInterpreter:
         from js.echo.effect_grants import assert_grants_cover_tool, grants_for_effect_tool
 
         # Frozen D8 / D1: one admit → bind → require → dispatch. No second ticket.
-        # Stable id from the sealed CapabilityLease so replay is single-use denied.
-        d1_lease_id = (
-            f"connector:{context.run_id}:{request.lease.lease_id}:{request.lease.nonce}"
-        )
+        # Sealed CapabilityLease identity only (no run_id) so the same lease cannot
+        # be re-admitted across runs after dual-ticket collapse.
+        d1_lease_id = f"connector:{request.lease.lease_id}:{request.lease.nonce}"
+        resource_scope = str(getattr(request, "scope", "") or "")
         context_taint = int(getattr(context, "taint", 0) or 0)
         d1_grants = grants_for_effect_tool(
             expected_tool,
-            resource_scope=str(getattr(request, "scope", "") or ""),
+            resource_scope=resource_scope,
             context_taint=context_taint,
         )
-        assert_grants_cover_tool(expected_tool, d1_grants, context_taint=context_taint)
+        assert_grants_cover_tool(
+            expected_tool,
+            d1_grants,
+            resource_scope=resource_scope,
+            context_taint=context_taint,
+        )
         d1_receipt = self._admit_d1(
             effect_class="connector",
             context=context,
             lease_id=d1_lease_id,
             grants=d1_grants,
             tool_name=expected_tool,
+            resource_scope=resource_scope,
+            context_taint=context_taint,
+            args_hash=request.authority_binding_hash(),
         )
         d1_bind = set_effect_exec_receipt(d1_receipt)
         try:
@@ -566,6 +589,9 @@ class EffectInterpreter:
         lease_id: str,
         grants: frozenset[str],
         tool_name: str | None = None,
+        resource_scope: str = "",
+        context_taint: int = 0,
+        args_hash: str = "",
     ) -> Any:
         from echo_core.effect_authority import EffectAuthorityError, EffectProposal
 
@@ -583,9 +609,19 @@ class EffectInterpreter:
         if effect_class == "tool":
             if not tool_name:
                 raise EffectAuthorityError("tool name required to admit tool effect")
-            assert_grants_cover_tool(tool_name, grants)
+            assert_grants_cover_tool(
+                tool_name,
+                grants,
+                resource_scope=resource_scope,
+                context_taint=context_taint,
+            )
         elif effect_class == "connector" and tool_name:
-            assert_grants_cover_tool(tool_name, grants)
+            assert_grants_cover_tool(
+                tool_name,
+                grants,
+                resource_scope=resource_scope,
+                context_taint=context_taint,
+            )
         proposal = EffectProposal(
             owner=context.owner_key_hash or "owner",
             session=context.session_id or "session",
@@ -594,7 +630,7 @@ class EffectInterpreter:
             grants=grants,
             budget=1,
         )
-        receipt = authority.admit_effect(proposal, lease_id=lease_id)
+        receipt = authority.admit_effect(proposal, lease_id=lease_id, args_hash=args_hash)
         authority.require_exec(lease_id)
         return receipt
 

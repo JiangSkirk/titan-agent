@@ -19,10 +19,20 @@ def grants_for_effect_tool(tool_name: str, *, resource_scope: str = "", context_
     )
 
 
-def assert_grants_cover_tool(tool_name: str, grants: frozenset[str], *, context_taint: int = 0) -> None:
+def assert_grants_cover_tool(
+    tool_name: str,
+    grants: frozenset[str],
+    *,
+    resource_scope: str = "",
+    context_taint: int = 0,
+) -> None:
     """Deny when presented grants do not cover the tool's required grant set."""
 
-    required = grants_for_effect_tool(tool_name, context_taint=context_taint)
+    required = grants_for_effect_tool(
+        tool_name,
+        resource_scope=resource_scope,
+        context_taint=context_taint,
+    )
     if sinks_for_tool(tool_name) and not required:
         # Sink-bearing tools must resolve to at least one grant bit.
         raise EffectAuthorityError(f"tool {tool_name!r} requires derived grants")
