@@ -1354,3 +1354,4 @@ async def list_friends(
         status_code=404,
         detail={"code": "feature_not_enabled", "feature": "friends"},
     )
+
