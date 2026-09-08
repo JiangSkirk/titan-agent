@@ -194,6 +194,8 @@ def test_release_workflow_audits_the_built_artifact_and_fails_closed_for_stable_
     assert "JS_ECHO_TRUSTED_REVIEW_KEYS: ${{ secrets.JS_ECHO_TRUSTED_REVIEW_KEYS }}" in workflow
     assert "unset JS_ECHO_TRUSTED_REVIEW_KEYS" not in workflow
     assert "report.stable_ready" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "startsWith(github.ref, 'refs/tags/v')" in workflow
 
 
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])

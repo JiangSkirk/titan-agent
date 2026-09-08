@@ -106,3 +106,11 @@ def test_model_boundary_round_recognizes_effect_interpreter_stream_gate() -> Non
     model_boundary = collect_round_findings(root)[1][0]
 
     assert model_boundary.status == "fixed"
+
+
+def test_lease_and_compaction_rounds_follow_echo_core_shims() -> None:
+    root = Path(__file__).resolve().parents[2]
+    findings = collect_round_findings(root)
+
+    assert findings[2][0].status == "fixed"
+    assert findings[5][0].status == "fixed"

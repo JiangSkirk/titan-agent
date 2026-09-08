@@ -2,13 +2,13 @@
   "SPDXID": "SPDXRef-DOCUMENT",
   "creationInfo": {
     "comment": "Local lockfile-derived SBOM. This artifact is not an external legal or license-review approval.",
-    "created": "2026-07-16T21:27:26Z",
+    "created": "2026-09-08T05:48:22Z",
     "creators": [
       "Tool: scripts/generate_release_evidence.py"
     ]
   },
   "dataLicense": "CC0-1.0",
-  "documentNamespace": "https://example.invalid/js-agent/sbom/66708874963dbf80963f257f122e13cff170be015e5463172dfce0f3aa55cffa",
+  "documentNamespace": "https://example.invalid/js-agent/sbom/2ad7a878e23ac3af0ad3b3802ba67bd0d9985f613b5154684a1423e3494f99b2",
   "name": "js-agent-echo-2.0-local-sbom",
   "packages": [
     {
@@ -20,6 +20,114 @@
       "licenseDeclared": "MIT",
       "name": "js-agent",
       "versionInfo": "0.1.5"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-aiohappyeyeballs-2.7.1",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "065665c041c42a5938ed220bdcd7230f22527fbec085e1853d2402c8a3615d9d"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "9243213661e29250eb41368e5daa826fc017156c3b8a11440826b2e3ed376472"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/aiohappyeyeballs@2.7.1",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "aiohappyeyeballs",
+      "versionInfo": "2.7.1"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-aiohttp-3.14.3",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "041badb8f84396357c4d3ad26de6afd7a32b112f43d3c63045c0c8278cfd2043"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0a5ff2dfbb9ce645fa5b8ef3e02c6c0b9cc3f6030ff863d0c51fffc50cb5541b"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "11fb37ef075669eee52ab1928fbf6e1741fada40409fa309ebde9607a962aebf"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1576145bdceeb92382d899751e12743a3a5b8e460a841e3e50543859e54864dc"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "16100ad3ab8d649fdfbee87602d9d2dcdca9df0b9eda8a1b5fdc0d41f96da559"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "18cb43369747b2ae007bd2655fb8e63a099c2ff1d207962943636dac989b3147"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1c5ec8fb1bcc31a8466f74aaf26c345d5c386fa4bd08a3f0eb9c7a4a3fe8b5bf"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1caa7b0d05f3e3a36f87788c59e970a7ee1cefcfcbb924a9f138c4a6551c9cb7"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/aiohttp@3.14.3",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "aiohttp",
+      "versionInfo": "3.14.3"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-aiosignal-1.4.0",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/aiosignal@1.4.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "aiosignal",
+      "versionInfo": "1.4.0"
     },
     {
       "SPDXID": "SPDXRef-Package-aiosqlite-0.22.1",
@@ -212,6 +320,86 @@
       "licenseDeclared": "MIT",
       "name": "ast-serialize",
       "versionInfo": "0.5.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-attrs-26.1.0",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/attrs@26.1.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "attrs",
+      "versionInfo": "26.1.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-audioop-lts-0.2.2",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0337d658f9b81f4cd0fdb1f47635070cc084871a3d4646d9de74fdf4e7c3d24a"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "03f061a1915538fd96272bac9551841859dbb2e3bf73ebe4a23ef043766f5449"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "068aa17a38b4e0e7de771c62c60bbca2455924b67a8814f3b0dee92b5820c0b3"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "088327f00488cdeed296edd9215ca159f3a5a5034741465789cad403fcf4bec0"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0d9385e96f9f6da847f4d571ce3cb15b5091140edf3db97276872647ce37efd7"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "106753a83a25ee4d6f473f2be6b0966fc1c9af7e0017192f5531a3e7463dce58"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "143fad0311e8209ece30a8dbddab3b65ab419cbe8c0dde6e8828da25999be911"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "15ab25dd3e620790f40e9ead897f91e79c0d3ce65fe193c8ed6c26cffdd24be7"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/audioop-lts@0.2.2",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "audioop-lts",
+      "versionInfo": "0.2.2"
     },
     {
       "SPDXID": "SPDXRef-Package-boolean-py-5.0",
@@ -566,39 +754,39 @@
       "versionInfo": "7.14.1"
     },
     {
-      "SPDXID": "SPDXRef-Package-cryptography-48.0.1",
+      "SPDXID": "SPDXRef-Package-cryptography-50.0.0",
       "checksums": [
         {
           "algorithm": "SHA256",
-          "checksumValue": "09f73a725d582cef64b91281a322cd798d14a33b2b6f2b7ad9531dc336d84c02"
+          "checksumValue": "031e2d5dd4bb9caa3ca9c82e5a197fd8ae680232cee62603d1a813f3f07e3d03"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "0df56b056bc17c1b7d6821dfa65216e62bd232d8ab05eb3db44e71d235651471"
+          "checksumValue": "06a32a980526a6ab9a4b9bf8f7385800791e2bb960903cb6b530e4817509a3b7"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "0ee6ea481db1ab889cba043ec1eda17bb9c1ea79db6722f779c3667f9f70322f"
+          "checksumValue": "07949c449a1abcf60d1ee6e88956d89404c7df3c8258f46589e912988e551987"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "15254441469dd6bf027039453288e2072124f8b6603563f5d759e1c9b69273fa"
+          "checksumValue": "105110f43a471dbd0060b9c9516cb8a6a79233631a04cc2ba16f28323ac6e025"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "266f4ee051abb2f725b74ef8072b521ce1feacf685a3364fa6a6b45548db791a"
+          "checksumValue": "11b74db56cdbe3cdee6e3f6982ecb70334fa10dce99ed58bf7894aaaa3b2a037"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "2c37f2461406063b417837f5f3daab668652acd82423efcd7f0a9f04be972de1"
+          "checksumValue": "12b9c6996425c76ea6c457ace4f3073e715b8c545add07cd1a8f3a4f90691269"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "32143b24adb918f078134e1e230f1eb8cc04886b92c28b5f0041aaf3e5699225"
+          "checksumValue": "1489e263a8048bb8b6a8bac662eb2d402ea5d2b7b4699b72f385f1e2772db105"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "3752f2dbc8f07a30aad2932c986cea495b03bb554887828225da104f732852b6"
+          "checksumValue": "19736989797678c6af1e55cd49055cdbcb55d8f6b5583ac5335f933aba9101dc"
         }
       ],
       "copyrightText": "NOASSERTION",
@@ -606,7 +794,7 @@
       "externalRefs": [
         {
           "referenceCategory": "PACKAGE-MANAGER",
-          "referenceLocator": "pkg:pypi/cryptography@48.0.1",
+          "referenceLocator": "pkg:pypi/cryptography@50.0.0",
           "referenceType": "purl"
         }
       ],
@@ -615,7 +803,7 @@
       "licenseConcluded": "NOASSERTION",
       "licenseDeclared": "Apache-2.0 OR BSD-3-Clause",
       "name": "cryptography",
-      "versionInfo": "48.0.1"
+      "versionInfo": "50.0.0"
     },
     {
       "SPDXID": "SPDXRef-Package-cyclonedx-python-lib-11.10.0",
@@ -674,6 +862,34 @@
       "versionInfo": "0.7.1"
     },
     {
+      "SPDXID": "SPDXRef-Package-discord-py-2.7.1",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "24d5e6a45535152e4b98148a9dd6b550d25dc2c9fb41b6d670319411641249da"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "849dca2c63b171146f3a7f3f8acc04248098e9e6203412ce3cf2745f284f7439"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/discord-py@2.7.1",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "discord-py",
+      "versionInfo": "2.7.1"
+    },
+    {
       "SPDXID": "SPDXRef-Package-distro-1.9.0",
       "checksums": [
         {
@@ -700,6 +916,25 @@
       "licenseDeclared": "Apache-2.0",
       "name": "distro",
       "versionInfo": "1.9.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-echo-core-3.0.0",
+      "checksums": [],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "editable:packages/echo-core",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/echo-core@3.0.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: MIT",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "MIT",
+      "name": "echo-core",
+      "versionInfo": "3.0.0"
     },
     {
       "SPDXID": "SPDXRef-Package-et-xmlfile-2.0.0",
@@ -786,6 +1021,58 @@
       "versionInfo": "3.29.3"
     },
     {
+      "SPDXID": "SPDXRef-Package-frozenlist-1.8.0",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0325024fe97f94c41c08872db482cf8ac4800d80e79222c6b0b7b162d5b13686"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "032efa2674356903cd0261c4317a561a6850f3ac864a63fc1583147fb05a79b0"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "03ae967b4e297f58f8c774c7eabcce57fe3c2434817d4385c50661845a058121"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "06be8f67f39c8b1dc671f5d83aaefd3358ae5cdcf8314552c57e7ed3e6475bdd"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "073f8bf8becba60aa931eb3bc420b217bb7d5b8f4750e6f8b3be7f3da85d38b7"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "07cdca25a91a4386d2e76ad992916a85038a9b97561bf7a3fd12d5d9ce31870c"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0c18a16eab41e82c295618a77502e17b195883241c563b00f0aa5106fc4eaa0d"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0f96534f8bfebc1a394209427d0f8a63d343c9779cda6fc25e8e121b5fd8555b"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/frozenlist@1.8.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "frozenlist",
+      "versionInfo": "1.8.0"
+    },
+    {
       "SPDXID": "SPDXRef-Package-greenlet-3.5.3",
       "checksums": [
         {
@@ -866,15 +1153,15 @@
       "versionInfo": "0.16.0"
     },
     {
-      "SPDXID": "SPDXRef-Package-h2-4.3.0",
+      "SPDXID": "SPDXRef-Package-h2-4.4.1",
       "checksums": [
         {
           "algorithm": "SHA256",
-          "checksumValue": "6c59efe4323fa18b47a632221a1888bd7fde6249819beda254aeca909f221bf1"
+          "checksumValue": "0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "c438f029a25f7945c69e0ccf0fb951dc3f73a5f6412981daee861431b70e2bdd"
+          "checksumValue": "4e866ffb1a869ae14dd9b5e6beb5c24a13da0495ad72b65925ded182521c1516"
         }
       ],
       "copyrightText": "NOASSERTION",
@@ -882,16 +1169,16 @@
       "externalRefs": [
         {
           "referenceCategory": "PACKAGE-MANAGER",
-          "referenceLocator": "pkg:pypi/h2@4.3.0",
+          "referenceLocator": "pkg:pypi/h2@4.4.1",
           "referenceType": "purl"
         }
       ],
       "filesAnalyzed": false,
-      "licenseComments": "Raw package metadata: License :: OSI Approved :: MIT License",
+      "licenseComments": "Raw package metadata: MIT",
       "licenseConcluded": "NOASSERTION",
       "licenseDeclared": "MIT",
       "name": "h2",
-      "versionInfo": "4.3.0"
+      "versionInfo": "4.4.1"
     },
     {
       "SPDXID": "SPDXRef-Package-hatchling-1.31.0",
@@ -1090,6 +1377,58 @@
       "versionInfo": "6.1.0"
     },
     {
+      "SPDXID": "SPDXRef-Package-hypothesis-6.165.10",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "00de0abdcf8c05c9d0eab735a3c49a276376b55151e6fcb903c2b39a90e5e5c3"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "057d0232f1224dcd0b7698902551a4341a7399f90670b036db6c4376715fe889"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "09772e328a26e50486ac572be34f9887f9aa185efe7ebb16bde4e8f6038db1f4"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0c4e6869817c3cfdf5a2b4d348497b95159bdecb3365be732c9b8570e36a4eef"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "18a3ea838ddea183388f8788750afa8494d79abb5358823be9782585f34445d3"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1a380bc99aa3b035e6a95a2201bf792d4082a04ca75babcc21849c2d0914bb28"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1d305448e9bd8e2f4f3cea0eafd809efdaab4e998a0019bc615650c8463e42f1"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1f2c4db25fb8ec1a16a8dba580666337b8ffb1887c4cf1750cc954313897cef7"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/hypothesis@6.165.10",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: MPL-2.0",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "MPL-2.0",
+      "name": "hypothesis",
+      "versionInfo": "6.165.10"
+    },
+    {
       "SPDXID": "SPDXRef-Package-idna-3.18",
       "checksums": [
         {
@@ -1215,6 +1554,58 @@
       "licenseDeclared": "MIT",
       "name": "js-agent",
       "versionInfo": "0.1.5"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-libcst-1.9.0",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "03165a264653bb77f6a11b412ae09c08bdb0c25864f3b8d42b816ac64b9d4b9e"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "087b58a9afe076bb08e2d726478e1f16cb928d67ffa9092817e033c335de522a"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0c7b548512db25af9c2997a95fa731bd6b6928ecbad6c0915d7482d8bb42d34f"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "107593af46945593e7825821793393262bc4fa1d3ea24c3ed487b61269bbbdf8"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "32395244edfe6538e0ea2bf82051d60103d3f54861274805c4fb3745efb70a85"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "444e84c76cd035cd2fe136838c1a524d34b08216521f6f5093df8a6f6cfa5799"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "45808c03528b3ad40b14095348a918e08d98c47b4a125d631cb78e817c0a5b16"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "496c24e0d3240bc7da45dae543aff3f5b6509978c39262d6b84ed2fb999dded2"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/libcst@1.9.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: License :: OSI Approved :: MIT License",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "MIT",
+      "name": "libcst",
+      "versionInfo": "1.9.0"
     },
     {
       "SPDXID": "SPDXRef-Package-librt-0.11.0",
@@ -1511,6 +1902,86 @@
       "licenseDeclared": "Apache-2.0",
       "name": "msgpack",
       "versionInfo": "1.2.1"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-multidict-6.7.1",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "03ede2a6ffbe8ef936b92cb4529f27f42be7f56afcdab5ab739cd5f27fb1cbf9"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0458c978acd8e6ea53c81eefaddbbee9c6c5e591f41b3f5e8e194780fe026581"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0b4c48648d7649c9335cf1927a8b87fa692de3dcb15faa676c6a6f1f1aabda43"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0e161ddf326db5577c3a4cc2d8648f81456e8a20d40415541587a71620d7a7d1"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "12fad252f8b267cc75b66e8fc51b3079604e8d43a75428ffe193cd9e2195dfd6"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "14525a5f61d7d0c94b368a42cff4c9a4e7ba2d52e2672a7b23d84dc86fb02b0c"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "17307b22c217b4cf05033dabefe68255a534d637c6c9b0cc8382718f87be4262"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1b99af4d9eec0b49927b4402bcbb58dea89d3e0db8806a4086117019939ad3dd"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/multidict@6.7.1",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "multidict",
+      "versionInfo": "6.7.1"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-mutmut-3.7.0",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1d2f9a1bfa4a474b2213df6b17223150b492bf4a85af0eda4fb322297337fb32"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "dc93260fabb3a6fd3693aa8d1746825885cb6f9e66c7f9cc1a0f34fc6388e14a"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/mutmut@3.7.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: BSD-3-Clause",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "mutmut",
+      "versionInfo": "3.7.0"
     },
     {
       "SPDXID": "SPDXRef-Package-mypy-2.1.0",
@@ -1953,6 +2424,44 @@
       "versionInfo": "0.63b1"
     },
     {
+      "SPDXID": "SPDXRef-Package-orin-guard-2.0.0",
+      "checksums": [],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "editable:packages/orin-guard",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/orin-guard@2.0.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: MIT",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "MIT",
+      "name": "orin-guard",
+      "versionInfo": "2.0.0"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-orin-proto-2.0.0",
+      "checksums": [],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "editable:packages/orin-proto",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/orin-proto@2.0.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: MIT",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "MIT",
+      "name": "orin-proto",
+      "versionInfo": "2.0.0"
+    },
+    {
       "SPDXID": "SPDXRef-Package-packageurl-python-0.17.6",
       "checksums": [
         {
@@ -2145,39 +2654,39 @@
       "versionInfo": "0.11.9"
     },
     {
-      "SPDXID": "SPDXRef-Package-pillow-12.2.0",
+      "SPDXID": "SPDXRef-Package-pillow-12.3.0",
       "checksums": [
         {
           "algorithm": "SHA256",
-          "checksumValue": "00a2865911330191c0b818c59103b58a5e697cae67042366970a6b6f1b20b7f9"
+          "checksumValue": "0740a512dc522224c77d9aa5a8d70d8b7d73fb91f2c21125d8d025d3b8990e45"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "01afa7cf67f74f09523699b4e88c73fb55c13346d212a59a2db1f86b0a63e8c5"
+          "checksumValue": "0847a763afefb695bc912d7c131e7e0632d4edc1d8698f58ddabec8e46b8b6d3"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "03e7e372d5240cc23e9f07deca4d775c0817bffc641b01e9c3af208dbd300987"
+          "checksumValue": "0dd2064cbc55aaec028ef5fbb60fa47bb6c3e7918e07ff17935284b227a9d2df"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "03f6fab9219220f041c74aeaa2939ff0062bd5c364ba9ce037197f4c6d498cd9"
+          "checksumValue": "164b31cd1a0490ab6efae01aa5df49da7061be0af1b30e035b6e9a1bfe34ee6e"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "042db20a421b9bafecc4b84a8b6e444686bd9d836c7fd24542db3e7df7baad9b"
+          "checksumValue": "1cca606cd25738df4ed873d5ad46bbdb3d83b5cbca291f6b4ff13a4df6b0bbe8"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "0a34329707af4f73cf1782a36cd2289c0368880654a2c11f027bcee9052d35dd"
+          "checksumValue": "21900ce7ba264168cd50defae43cd75d25c833ad4ad6e73ffc5596d12e25ac89"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "144748b3af2d1b358d41286056d0003f47cb339b8c43a9ea42f5fea4d8c66b6e"
+          "checksumValue": "23aceaa007d6172b02c277f0cd359c79492bbb14f7072b4ede9fbcaf20648130"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "1610dd6c61621ae1cf811bef44d77e149ce3f7b95afe66a4512f8c59f25d9ebe"
+          "checksumValue": "24870b09b224f7ae3c39ed07d10e819d06f8720bc551847b1d623832b5b0e28d"
         }
       ],
       "copyrightText": "NOASSERTION",
@@ -2185,7 +2694,7 @@
       "externalRefs": [
         {
           "referenceCategory": "PACKAGE-MANAGER",
-          "referenceLocator": "pkg:pypi/pillow@12.2.0",
+          "referenceLocator": "pkg:pypi/pillow@12.3.0",
           "referenceType": "purl"
         }
       ],
@@ -2194,7 +2703,7 @@
       "licenseConcluded": "NOASSERTION",
       "licenseDeclared": "MIT-CMU",
       "name": "pillow",
-      "versionInfo": "12.2.0"
+      "versionInfo": "12.3.0"
     },
     {
       "SPDXID": "SPDXRef-Package-pip-26.1.2",
@@ -2471,6 +2980,58 @@
       "licenseDeclared": "NOASSERTION",
       "name": "prompt-toolkit",
       "versionInfo": "3.0.52"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-propcache-0.5.2",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "01c4fc7480cd0598bb4b57022df55b9ca296da7fc5a8760bd8451a7e63a7d427"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "06187263ddad280d05b4d8a8b3bb7d164cbebd469236544a42e6d9b28ac6a4fa"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0958834041a0166d343b8d2cedcd8bcbaeb4fdbe0cf08320c5379f143c3be6e7"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "099aaf4b4d1a02265b92a977edf00b5c4f63b3b17ac6de39b0d637c9cac0188a"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0d2c9bf8528f135dbb805ce027567e09164f7efa51a2be07458a2c0420f292d0"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "10734b5484ea113152ee25a91dccedf81631791805d2c9ccb054958e51842c94"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "13fef48778b5a2a756523fdb781326b028ca75e32858b04f2cdd19f394564917"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "178b4a2cdaac1818e2bf1c5a99b94383fa73ea5382e032a48dec07dc5668dc42"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/propcache@0.5.2",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "propcache",
+      "versionInfo": "0.5.2"
     },
     {
       "SPDXID": "SPDXRef-Package-psutil-7.2.2",
@@ -2905,15 +3466,15 @@
       "versionInfo": "3.3.2"
     },
     {
-      "SPDXID": "SPDXRef-Package-pypdf-6.14.2",
+      "SPDXID": "SPDXRef-Package-pypdf-6.16.1",
       "checksums": [
         {
           "algorithm": "SHA256",
-          "checksumValue": "3f07891af76dc002657e04993ab9b4de81de29f9013b9761d0b7968bff12e946"
+          "checksumValue": "63fec31c4092ae50b6729beedcb469055b60d20c834bde1c402df241f371f644"
         },
         {
           "algorithm": "SHA256",
-          "checksumValue": "7873f502fe4385e79539b21d872392dc0c4e3714327c15881cbc7fbfd1f95b25"
+          "checksumValue": "c4d1b43ddae921387321cf63936cd16a7743b91d2da92f165c149a195c972ba9"
         }
       ],
       "copyrightText": "NOASSERTION",
@@ -2921,7 +3482,7 @@
       "externalRefs": [
         {
           "referenceCategory": "PACKAGE-MANAGER",
-          "referenceLocator": "pkg:pypi/pypdf@6.14.2",
+          "referenceLocator": "pkg:pypi/pypdf@6.16.1",
           "referenceType": "purl"
         }
       ],
@@ -2930,7 +3491,7 @@
       "licenseConcluded": "NOASSERTION",
       "licenseDeclared": "BSD-3-Clause",
       "name": "pypdf",
-      "versionInfo": "6.14.2"
+      "versionInfo": "6.16.1"
     },
     {
       "SPDXID": "SPDXRef-Package-pypdfium2-5.8.0",
@@ -3289,6 +3850,58 @@
       "versionInfo": "6.0.3"
     },
     {
+      "SPDXID": "SPDXRef-Package-pyyaml-ft-8.0.0",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "052561b89d5b2a8e1289f326d060e794c21fa068aa11255fe71d65baf18a632e"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "06237267dbcab70d4c0e9436d8f719f04a51123f0ca2694c00dd4b68c338e40b"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0c947dce03954c7b5d38869ed4878b2e6ff1d44b08a0d84dc83fdad205ae39ab"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "30c5f1751625786c19de751e3130fc345ebcba6a86f6bddd6e1285342f4bbb69"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "3bb4b927929b0cb162fb1605392a321e3333e48ce616cdcfa04a839271373255"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "3fa992481155ddda2e303fcc74c79c05eddcdbc907b888d3d9ce3ff3e2adcfb0"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "58e1015098cf8d8aec82f360789c16283b88ca670fe4275ef6c48c5e30b22a96"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "7d10175a746be65f6feb86224df5d6bc5c049ebf52b89a88cf1cd78af5a367a8"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/pyyaml-ft@8.0.0",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "pyyaml-ft",
+      "versionInfo": "8.0.0"
+    },
+    {
       "SPDXID": "SPDXRef-Package-regex-2026.5.9",
       "checksums": [
         {
@@ -3503,6 +4116,58 @@
       "licenseDeclared": "MIT",
       "name": "ruff",
       "versionInfo": "0.15.15"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-setproctitle-1.3.7",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "02432f26f5d1329ab22279ff863c83589894977063f59e6c4b4845804a08f8c2"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "047138279f9463f06b858e579cc79580fbf7a04554d24e6bddf8fe5dddbe3d4c"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0564a936ea687cd24dffcea35903e2a20962aa6ac20e61dd3a207652401492dd"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0b5074649797fd07c72ca1f6bff0406f4a42e1194faac03ecaab765ce605866f"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "10e92915c4b3086b1586933a36faf4f92f903c5554f3c34102d18c7d3f5378e9"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1403d2abfd32790b6369916e2313dffbe87d6b11dca5bbd898981bcde48e7a2b"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "14c7eba8d90c93b0e79c01f0bd92a37b61983c27d6d7d5a3b5defd599113d60e"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "1fae595d032b30dab4d659bece20debd202229fce12b55abab978b7f30783d73"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/setproctitle@1.3.7",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: License :: OSI Approved :: BSD License",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "setproctitle",
+      "versionInfo": "1.3.7"
     },
     {
       "SPDXID": "SPDXRef-Package-six-1.17.0",
@@ -4379,6 +5044,58 @@
       "licenseDeclared": "NOASSERTION",
       "name": "xlrd",
       "versionInfo": "2.0.2"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-yarl-1.24.5",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0055afc45e864b92729ac7600e2d102c17bef060647e74bca75fa84d66b9ff36"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "0465ec8cedc2349b97a6b595ace64084a50c6e839eca40aa0626f38b8350e331"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "16a2f5010280020e90f5330257e6944bc33e73593b136cc5a241e6c1dc292498"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "2120b96872df4a117cde97d270bac96aea7cc52205d305cf4611df694a487027"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "24e861e9630e0daddcb9191fb187f60f034e17a4426f8101279f0c475cd74144"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "2729fcfc4f6a596fb0c50f32090400aa9367774ac296a00387e65098c0befa76"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "2dbe06fc16bc91502bca713704022182e5729861ae00277c3a23354b40929740"
+        },
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "3363fcc96e665878946ad7a106b9a13eac0541766a690ef287c0232ac768b6ec"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/simple",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/yarl@1.24.5",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseComments": "Raw package metadata: NOASSERTION",
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "yarl",
+      "versionInfo": "1.24.5"
     }
   ],
   "relationships": [
@@ -4386,6 +5103,21 @@
       "relatedSpdxElement": "SPDXRef-Package-js-agent",
       "relationshipType": "DESCRIBES",
       "spdxElementId": "SPDXRef-DOCUMENT"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-aiohappyeyeballs-2.7.1",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-aiohttp-3.14.3",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-aiosignal-1.4.0",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
       "relatedSpdxElement": "SPDXRef-Package-aiosqlite-0.22.1",
@@ -4414,6 +5146,16 @@
     },
     {
       "relatedSpdxElement": "SPDXRef-Package-ast-serialize-0.5.0",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-attrs-26.1.0",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-audioop-lts-0.2.2",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4468,7 +5210,7 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
-      "relatedSpdxElement": "SPDXRef-Package-cryptography-48.0.1",
+      "relatedSpdxElement": "SPDXRef-Package-cryptography-50.0.0",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4483,7 +5225,17 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
+      "relatedSpdxElement": "SPDXRef-Package-discord-py-2.7.1",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
       "relatedSpdxElement": "SPDXRef-Package-distro-1.9.0",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-echo-core-3.0.0",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4503,6 +5255,11 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
+      "relatedSpdxElement": "SPDXRef-Package-frozenlist-1.8.0",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
       "relatedSpdxElement": "SPDXRef-Package-greenlet-3.5.3",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
@@ -4513,7 +5270,7 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
-      "relatedSpdxElement": "SPDXRef-Package-h2-4.3.0",
+      "relatedSpdxElement": "SPDXRef-Package-h2-4.4.1",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4553,6 +5310,11 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
+      "relatedSpdxElement": "SPDXRef-Package-hypothesis-6.165.10",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
       "relatedSpdxElement": "SPDXRef-Package-idna-3.18",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
@@ -4569,6 +5331,11 @@
     },
     {
       "relatedSpdxElement": "SPDXRef-Package-js-agent-0.1.5",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-libcst-1.9.0",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4609,6 +5376,16 @@
     },
     {
       "relatedSpdxElement": "SPDXRef-Package-msgpack-1.2.1",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-multidict-6.7.1",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-mutmut-3.7.0",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4683,6 +5460,16 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
+      "relatedSpdxElement": "SPDXRef-Package-orin-guard-2.0.0",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-orin-proto-2.0.0",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
       "relatedSpdxElement": "SPDXRef-Package-packageurl-python-0.17.6",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
@@ -4713,7 +5500,7 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
-      "relatedSpdxElement": "SPDXRef-Package-pillow-12.2.0",
+      "relatedSpdxElement": "SPDXRef-Package-pillow-12.3.0",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4759,6 +5546,11 @@
     },
     {
       "relatedSpdxElement": "SPDXRef-Package-prompt-toolkit-3.0.52",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-propcache-0.5.2",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4823,7 +5615,7 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
-      "relatedSpdxElement": "SPDXRef-Package-pypdf-6.14.2",
+      "relatedSpdxElement": "SPDXRef-Package-pypdf-6.16.1",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -4883,6 +5675,11 @@
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
     {
+      "relatedSpdxElement": "SPDXRef-Package-pyyaml-ft-8.0.0",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
       "relatedSpdxElement": "SPDXRef-Package-regex-2026.5.9",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
@@ -4909,6 +5706,11 @@
     },
     {
       "relatedSpdxElement": "SPDXRef-Package-ruff-0.15.15",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-setproctitle-1.3.7",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     },
@@ -5044,6 +5846,11 @@
     },
     {
       "relatedSpdxElement": "SPDXRef-Package-xlrd-2.0.2",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-js-agent"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-yarl-1.24.5",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-js-agent"
     }
