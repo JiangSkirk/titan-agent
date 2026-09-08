@@ -72,7 +72,7 @@ labels:
         status: pass
       - criterion_id: orin.cell_product_routes
         status: pass
-    notes: "Stage C harness + opt-in split/cell transport; orin.enforce remains default false"
+    notes: "Stage C harness + opt-in split/cell transport; Stage B D1 orin.enforce defaults true; Stage C product routes still conjunction-gated"
   - unit: web.appshell
     paths:
       - js/web/

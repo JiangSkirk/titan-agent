@@ -1,9 +1,12 @@
 """Stage C §6.1 conjunction and product-route helpers.
 
-``orin.enforce=true`` is allowed only when every conjunction bit is observed.
-External gates (official TCC, K§15.6 #8/#9) stay false in this tree; the
-checker lists them instead of hiding behind a vague C2-C7 sentence.
-Product Desktop/Memory Cell routes are live only while enforce is on.
+Stage B (v0.3.3.1) product defaults set ``orin.enabled`` and ``orin.enforce``
+to true for EffectAuthority D1. That does **not** open Stage C cells.
+
+Stage C production routes (Desktop/Memory Cells, ambient-authority closure,
+daemon ``--orin-enforce``) stay live only when every §6.1 conjunction bit is
+observed. External gates (official TCC, K§15.6 #8/#9) stay false in this
+tree; the checker lists them instead of hiding behind a vague C2-C7 sentence.
 """
 
 from __future__ import annotations
@@ -265,7 +268,16 @@ def _config_flag(config: Any, name: str) -> bool:
 
 
 def product_enforce_enabled(config: Any) -> bool:
-    return _config_flag(config, "enforce")
+    """Stage C product-route enforce (not bare D1 ``orin.enforce``).
+
+    Stage B defaults ``orin.enforce=true`` for EffectAuthority. Stage C
+    ambient-authority closure and cell product routes require the §6.1
+    conjunction on top of that flag.
+    """
+
+    if not _config_flag(config, "enforce"):
+        return False
+    return evaluate_stage_c_conjunction(config).ok
 
 
 def product_desktop_cell_required(config: Any) -> bool:

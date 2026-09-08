@@ -56,7 +56,11 @@ def test_ambient_memory_writes_blocked_only_when_product_enforce_bound(
         reset_product_enforce(token)
 
 
-def test_orin_config_product_flags_do_not_enable_enforce() -> None:
+def test_orin_config_product_flags_do_not_enable_stage_c_routes() -> None:
+    from js.orin.stage_c import product_enforce_enabled
+
     config = OrinConfig(cell_desktop=True, cell_memory=True, cell_identity_enforce=True)
-    assert config.enforce is False
+    # Stage B: D1 enforce defaults true; cell flags alone do not open Stage C.
+    assert config.enforce is True
+    assert product_enforce_enabled(config) is False
     assert config.echo_minimal_os is False

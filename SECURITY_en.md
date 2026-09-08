@@ -76,10 +76,12 @@ sandbox alone.
 
 **Not implemented by default — do not claim otherwise:**
 
-- `orin.enabled` defaults to `false` (`OrinConfig.enabled`).
-- `orin.enforce` defaults to `false` (`OrinConfig.enforce`). Stage C cells /
-  process split are `not_implemented`; see
+- `orin.enabled` defaults to `true` (`OrinConfig.enabled`, Stage B / v0.3.3.1).
+- `orin.enforce` defaults to `true` (`OrinConfig.enforce`) for EffectAuthority
+  D1. Stage C cells / process split remain `not_implemented` until the §6.1
+  conjunction is observed; see
   [`docs/security/orin/ORIN_STAGE_C_CLOSEOUT.md`](docs/security/orin/ORIN_STAGE_C_CLOSEOUT.md).
+  Bare `orin.enforce=true` is **not** Stage C closeout.
 - Echo RCE is not closed.
 - No official TCC / Developer ID / notarization.
 - No independent external red-team attestation.

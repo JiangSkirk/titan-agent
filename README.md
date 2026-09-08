@@ -140,7 +140,7 @@ pytest tests -q -p no:cacheprovider
 | 能力 | OpenClaw | Hermes | **JS Agent** |
 |------|----------|--------|-----------|
 | 运行时 | Node.js (3700 chunks) | Python + Node UI | **Python 3.12+ 统一** |
-| 安全 | 外部插件 (ClawAegis) | Tirith + 审批 | **每工具 OS 沙箱 + Echo fail-closed**（[SECURITY.md](SECURITY.md)；整进程容器可选；`orin.enforce` 默认关） |
+| 安全 | 外部插件 (ClawAegis) | Tirith + 审批 | **每工具 OS 沙箱 + Echo fail-closed**（[SECURITY.md](SECURITY.md)；整进程容器可选；Stage B `orin.enabled`/`orin.enforce` 默认 true（D1）；Stage C cells 仍为 `not_implemented`） |
 | 上下文压缩 | ❌ | ✅ 最强 | ✅ **Hermes 式压缩器 + 上下文胶囊** |
 | Checkpoint | ❌ | ✅ Git Shadow | ⚠️ **已移除 checkpoints，不随包发布** |
 | 配置缓存 | ❌ | ✅ Stat-based | ⚠️ 已移除 (YAGNI) |

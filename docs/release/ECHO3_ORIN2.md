@@ -34,8 +34,9 @@ pip install ./packages/echo-core ./packages/orin-proto ./packages/orin-guard
 - Independent GitHub mirrors (`echo-core` / `orin-guard` as their own remotes)
 - SLSA provenance, Sigstore/cosign, SPDX SBOM on a GitHub Release
 - AgentDojo 629-case CI (block-rate ≥77%, utility drop ≤10%)
-- `orin.enforce=true` as the product default
-- Stage C cells / process split (`not_implemented`)
+- Stage C cells / process split (`not_implemented`); §6.1 conjunction still
+  incomplete. Stage B product defaults set `orin.enabled` / `orin.enforce`
+  true for EffectAuthority D1 — that is **not** Stage C closeout.
 
 ## Tags
 

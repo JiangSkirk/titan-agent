@@ -121,7 +121,7 @@ That moves leases back in-process and changes the daily security boundary. Do no
 | Capability | OpenClaw | Hermes | **JS Agent** |
 |---|---|---|---|
 | Runtime | Node.js (3700 chunks) | Python + Node UI | **Unified Python 3.12** |
-| Security | External plugin (ClawAegis) | Tirith + approval | **Per-tool OS sandbox + Echo fail-closed** ([SECURITY_en.md](SECURITY_en.md); optional whole-process container; `orin.enforce` off by default) |
+| Security | External plugin (ClawAegis) | Tirith + approval | **Per-tool OS sandbox + Echo fail-closed** ([SECURITY_en.md](SECURITY_en.md); optional whole-process container; Stage B `orin.enabled`/`orin.enforce` default true for D1; Stage C cells still `not_implemented`) |
 | Context Compression | ❌ | ✅ Best-in-class | ✅ **Hermes-style compressor + Context capsules** |
 | Checkpoint | ❌ | ✅ Git Shadow | ⚠️ **Checkpoints removed — not shipped in this package** |
 | Circuit Breaker | ❌ | ❌ | ✅ **Auto-recovery probes** |

@@ -16,7 +16,6 @@ from uuid import uuid4
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from pydantic import ValidationError
 
 from js.config import OrinConfig
 from js.echo.capability import LeaseDenied
@@ -37,8 +36,12 @@ from js.orind.manifest import builtin_manifest
 
 
 def test_enforce_still_fails_fast_because_conjunction_is_incomplete() -> None:
-    with pytest.raises(ValidationError, match="conjunction incomplete"):
-        OrinConfig(enforce=True)
+    from js.orin.stage_c import product_enforce_enabled, require_stage_c_enforce
+
+    config = OrinConfig(enforce=True)
+    assert product_enforce_enabled(config) is False
+    with pytest.raises(ValueError, match="conjunction incomplete"):
+        require_stage_c_enforce(config)
 
 
 def test_daemon_enforce_still_fails_before_state(tmp_path: Path) -> None:
@@ -134,7 +137,11 @@ def test_enforce_false_default_daemon_spawns_no_stage_c_cells(tmp_path: Path) ->
     try:
         assert daemon._cell_desktop_enabled is False  # noqa: SLF001
         assert daemon._cell_memory_enabled is False  # noqa: SLF001
-        assert OrinConfig().enforce is False
+        # Stage B: D1 enforce defaults true; Stage C product routes stay closed.
+        assert OrinConfig().enforce is True
+        from js.orin.stage_c import product_enforce_enabled
+
+        assert product_enforce_enabled(OrinConfig()) is False
     finally:
         daemon._store.close()  # noqa: SLF001
 

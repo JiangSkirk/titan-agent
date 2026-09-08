@@ -147,17 +147,25 @@ class TestLegacyLedger:
 
 class TestOrinDisabledEquivalence:
     def test_orin_disabled_defaults(self, tmp_path: Path) -> None:
-        """orin_enabled=false must be the default with pre-Orin behavior."""
+        """orin.enabled=false remains a supported opt-out (CHAT_ONLY / tests)."""
 
-        from js.config import JSSettings
+        from js.config import JSSettings, OrinConfig
 
-        settings = JSSettings(workspace=tmp_path / "ws", state_dir=tmp_path / "st")
+        settings = JSSettings(
+            workspace=tmp_path / "ws",
+            state_dir=tmp_path / "st",
+            orin=OrinConfig(enabled=False),
+        )
         assert settings.orin.enabled is False
         assert settings.orin.fail_mode.value == "closed"
         assert settings.orin.policy_profile.value == "conservative"
         assert settings.orin.socket_path is None
         assert settings.orin.keybox_tier.value == "dev"
         assert settings.orin.shadow_mode is False
+        # Stage B product defaults stay true when not overridden.
+        defaults = JSSettings(workspace=tmp_path / "ws2", state_dir=tmp_path / "st2")
+        assert defaults.orin.enabled is True
+        assert defaults.orin.enforce is True
 
     def test_getter_returns_inprocess_authority_when_disabled(self, tmp_path: Path) -> None:
         """The tool-executor getter keeps the LeaseAuthority path when off."""

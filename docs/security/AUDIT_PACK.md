@@ -18,8 +18,9 @@ Facts that must not be contradicted in a report:
 - The load-bearing boundary for adversarial model output is OS isolation
   (per-tool `sandbox-exec` / `bwrap`, optional whole-process container).
 - Echo leases, ledger, guard, and taint are authorization / defense in depth.
-- `orin.enabled` and `orin.enforce` default to false. Stage C cells are
-  `not_implemented`.
+- `orin.enabled` and `orin.enforce` default to true (Stage B / v0.3.3.1 D1).
+  Stage C cells remain `not_implemented` until the §6.1 conjunction is
+  observed; bare `orin.enforce=true` is not Stage C closeout.
 - Gateway and Friends default off. Host cold start must not import them.
 - Evolution never auto-applies. There is no unattended self-modify path.
 

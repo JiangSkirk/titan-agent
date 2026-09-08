@@ -66,8 +66,8 @@ def test_security_policy_required_sections() -> None:
 
 
 def test_security_policy_matches_config_defaults() -> None:
-    assert OrinConfig.model_fields["enabled"].default is False
-    assert OrinConfig.model_fields["enforce"].default is False
+    assert OrinConfig.model_fields["enabled"].default is True
+    assert OrinConfig.model_fields["enforce"].default is True
     assert JSSettings.model_fields["friends_enabled"].default is False
     assert JSSettings.model_fields["mobile_enabled"].default is False
     assert JSSettings.model_fields["remote_collaboration_enabled"].default is False
@@ -79,8 +79,10 @@ def test_security_policy_matches_config_defaults() -> None:
         text = path.read_text(encoding="utf-8")
         assert "orin.enabled" in text
         assert "orin.enforce" in text
-        assert "false" in text.lower()
+        assert "true" in text.lower()
         assert "friends_enabled" in text
         assert "mobile_enabled" in text
         assert "gateway.enabled" in text
         assert "strict_isolation=True" in text
+        # Stage C cells remain not_implemented even when D1 enforce defaults true.
+        assert "not_implemented" in text

@@ -29,9 +29,10 @@ Data directory: `~/.orin-guard/`.
 python packages/orin-guard/examples/quickstart.py
 ```
 
-Stage C cells / `orin.enforce=true` as a product default are **not**
-claimed by this package. Hosts that want enforcement wire GateKernel
-themselves.
+Stage C cells / process-split closeout are **not** claimed by this package.
+Hosts that want GateKernel enforcement wire it themselves. Product Host
+defaults may set `orin.enabled` / `orin.enforce` true for EffectAuthority D1
+without claiming Stage C.
 
 ## License
 

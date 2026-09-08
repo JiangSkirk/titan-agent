@@ -18,9 +18,11 @@ until evidence exists. Code cannot mark them green unilaterally.
 - [ ] Provider tokens only via CredBroker
 - [ ] AppShell / Echo process split (`appshell_echo_separated`)
 - [ ] External endorsement (TCC / red team)
-- [ ] `orin.enforce=true` default **only after** the conjunction is observed
+- [x] Stage B `orin.enabled` / `orin.enforce` product defaults true (EffectAuthority D1; hard gate 2026-10-01)
+- [ ] Stage C `orin.enforce` product-route closeout **only after** the §6.1 conjunction is observed
 
-Until then: `orin.enforce` stays default false; closeout remains
+Until then: Stage C cells stay `not_implemented`; bare D1 `orin.enforce=true`
+does **not** claim Stage C; closeout remains
 `not_implemented`.
 
 ## Assurance

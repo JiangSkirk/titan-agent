@@ -59,16 +59,15 @@ def effect_authority_from_agent(agent: Any) -> EffectAuthority:
     settings = getattr(agent, "settings", None)
     state_dir = Path(getattr(settings, "state_dir", Path(".")))
     orin = getattr(settings, "orin", None)
-    # EffectAuthority enforce is the D1 gate flag (GateKernel), not Stage C.
     chat_only = bool(getattr(settings, "echo_chat_only", False))
     tool_names = getattr(agent, "_current_allowed_tools", None) or set()
     tool_table_empty = len(tool_names) == 0
-    # Default Host: effect authority enabled+enforce so Interpreter.exec is gated.
-    enabled = True
-    enforce = True
+    # Stage B product defaults: orin.enabled ∧ orin.enforce (both true).
+    # CHAT_ONLY requires ¬enabled ∧ chat_only ∧ empty tools.
+    enabled = True if orin is None else bool(getattr(orin, "enabled", True))
+    enforce = True if orin is None else bool(getattr(orin, "enforce", True))
     if chat_only:
         enabled = False
-    _ = orin  # product orin.enforce remains Stage C; not used here
     return build_host_effect_authority(
         state_dir=state_dir,
         enabled=enabled,
