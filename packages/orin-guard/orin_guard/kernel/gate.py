@@ -50,7 +50,13 @@ class GateKernel:
         self._consumed: set[str] = set()
         self._frozen = False
 
-    def issue(self, plane: PolicyPlane, *, now: float | None = None) -> EffectTicket:
+    def issue(
+        self,
+        plane: PolicyPlane,
+        *,
+        now: float | None = None,
+        lease_id: str = "",
+    ) -> EffectTicket:
         if self._frozen and self.enforce:
             raise KernelUnavailable("kernel is frozen")
         if plane.budget < 1:
@@ -62,7 +68,13 @@ class GateKernel:
             raise TicketDenied("learn.widen requires an explicit owner grant")
         stamp = now if now is not None else time.time()
         nonce = secrets.token_hex(16)
-        ticket_id = hashlib.sha256(f"{plane.owner}:{plane.run}:{nonce}".encode()).hexdigest()
+        # CHAT_ONLY tickets are pinned exactly to chat_only:{lease_id}.
+        if lease_id.startswith("chat_only:"):
+            ticket_id = lease_id
+        else:
+            ticket_id = hashlib.sha256(f"{plane.owner}:{plane.run}:{nonce}".encode()).hexdigest()
+        if ticket_id in self._live or ticket_id in self._consumed:
+            raise TicketDenied("ticket id already issued")
         mac = hmac.new(
             self._key,
             f"{ticket_id}:{plane.owner}:{plane.run}:{plane.effect_class}".encode(),

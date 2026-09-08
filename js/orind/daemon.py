@@ -2677,7 +2677,7 @@ class OrinDaemon:
             package, draft, _record = self._membrane_package(operation)
         except (MembraneError, ProtocolError, ValueError) as exc:
             return {"ok": False, "code": "denied", "reason": str(exc)[:512]}
-        committing = membrane.begin_commit(operation.operation_id)
+        committing = membrane.begin_commit(operation.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
         self._membrane_fault("after_committing_persisted", operation.draft_id)
         response = await self._request_cell(
             operation.executor_id,

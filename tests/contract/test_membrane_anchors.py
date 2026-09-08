@@ -44,7 +44,7 @@ def _spec() -> OperationSpec:
 
 
 def test_membrane_rejects_commit_without_receipt(tmp_path: Path) -> None:
-    """COMMITTED → RECEIPTED requires a receipt_id; empty receipt is denied."""
+    """Commit requires lease_id + stamp_receipt anchors; RECEIPTED needs receipt_id."""
 
     membrane = CommitMembrane(tmp_path / "membrane.db", now_fn=lambda: NOW_MS)
     try:
@@ -59,7 +59,21 @@ def test_membrane_rejects_commit_without_receipt(tmp_path: Path) -> None:
             require_personal_pass=False,
             now_ms=NOW_MS,
         )
-        membrane.begin_commit(spec.operation_id)
+        with pytest.raises(InvalidTransition, match="lease_id"):
+            membrane.begin_commit(spec.operation_id)
+        with pytest.raises(InvalidTransition, match="stamp_receipt"):
+            membrane.begin_commit(spec.operation_id, lease_id="lease:op-1")
+        with pytest.raises(InvalidTransition, match="stamp_receipt"):
+            membrane.begin_commit(
+                spec.operation_id,
+                lease_id="lease:op-1",
+                stamp_receipt="",
+            )
+        membrane.begin_commit(
+            spec.operation_id,
+            lease_id="lease:op-1",
+            stamp_receipt="stamp:receipt-hash",
+        )
         membrane.transition(spec.operation_id, CommitState.COMMITTED)
         with pytest.raises((InvalidTransition, ValueError)):
             membrane.transition(spec.operation_id, CommitState.RECEIPTED, receipt_id="")

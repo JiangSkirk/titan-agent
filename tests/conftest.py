@@ -84,6 +84,36 @@ def echo_tool_context() -> Callable[..., ToolExecutionContext]:
 
 
 @pytest.fixture(autouse=True)
+def bind_synthetic_effect_receipt(request: pytest.FixtureRequest):
+    """Unit tests may call ``_execute_tool_call`` directly; bind a D1 receipt.
+
+    Contract suite tests exercise naked-bypass denial and must not receive this
+    ambient bind.
+    """
+
+    path = str(getattr(request, "fspath", "") or "")
+    if "tests/contract" in path.replace("\\", "/"):
+        yield
+        return
+
+    from echo_core.effect_authority import LeaseReceipt
+
+    from js.echo.effect_bind import reset_effect_exec_receipt, set_effect_exec_receipt
+
+    handle = set_effect_exec_receipt(
+        LeaseReceipt(
+            lease_id="test-lease",
+            stamp_id="test-stamp",
+            consume_receipt_hash="test-consume",
+        )
+    )
+    try:
+        yield
+    finally:
+        reset_effect_exec_receipt(handle)
+
+
+@pytest.fixture(autouse=True)
 def reset_web_globals():
     """Keep mocked web agents from leaking between tests."""
     from js.web import deps, server

@@ -13,6 +13,7 @@ from echo_core.effect_authority import (
     EffectAuthorityError,
     EffectProposal,
     WiringMode,
+    chat_only_ticket_id,
     classify_wiring,
     null_unwired_authority,
     require_boot_ok,
@@ -22,6 +23,11 @@ from echo_core.ledger.journal import FileEchoLedger
 from echo_core.spi.guardian import GuardianDenied, NullGuardian
 from orin_guard.kernel.gate import GateKernel
 
+from js.echo.effect_bind import (
+    require_effect_exec_receipt,
+    reset_effect_exec_receipt,
+    set_effect_exec_receipt,
+)
 from js.echo.guardian_adapter import OrinGuardian
 from js.echo.ledger_append_adapter import FileEchoLedgerAppend
 
@@ -40,7 +46,7 @@ def _proposal(*, effect_class: str = "tool") -> EffectProposal:
     )
 
 
-def _authority(tmp_path: Path, *, wiring: WiringMode = WiringMode.WIRED) -> EffectAuthority:
+def _authority(tmp_path: Path, *, wiring: WiringMode = WiringMode.WIRED_ENFORCE) -> EffectAuthority:
     journal = FileEchoLedger(tmp_path / "stamp.jsonl", mac_key=b"j" * 32)
     guardian = OrinGuardian(GateKernel(b"k" * 32))
     return EffectAuthority(
@@ -98,7 +104,7 @@ def test_only_host_adapter_appends_stamp_receipt(tmp_path: Path) -> None:
     auth = EffectAuthority(
         guardian=OrinGuardian(GateKernel(b"k" * 32)),
         ledger=adapter,
-        wiring=WiringMode.WIRED,
+        wiring=WiringMode.WIRED_ENFORCE,
     )
     auth.issue(_proposal(), lease_id="lease-4")
     stamped = auth.stamp("lease-4")
@@ -106,7 +112,6 @@ def test_only_host_adapter_appends_stamp_receipt(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0].payload["stamp_id"] == stamped.stamp_id
     assert rows[0].payload["phase"] == "STAMPED"
-    # Interpreter / echo-core must not be the concrete append owner.
     assert adapter.__module__.startswith("js.echo.")
 
 
@@ -129,7 +134,6 @@ def test_echo_core_has_no_ledger_append_symbol() -> None:
             }:
                 offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.name}")
     assert offenders == []
-    # Protocol is declared; no journal-fd holder in effect authority module.
     source = (ECHO_CORE_ROOT / "effect_authority.py").read_text(encoding="utf-8")
     assert "FileEchoLedger(" not in source
     assert "open(" not in source
@@ -142,7 +146,6 @@ def test_safety_service_cannot_append_journal() -> None:
 
     assert not hasattr(SafetyService, "append")
     assert "append" not in getattr(SafetyService, "__protocol_attrs__", set())
-    # Public stamp-receipt append must not be a SafetyService method.
     assert not hasattr(EchoSafetyService, "append")
     assert not hasattr(EchoSafetyService, "append_stamp_receipt")
     assert not hasattr(EchoSafetyService, "append_journal")
@@ -155,25 +158,39 @@ def test_no_second_journal_writer() -> None:
     from js.echo.ledger.journal import FileEchoLedger
 
     assert FrameLedger is FileEchoLedger
-    # Host stamp adapter wraps FileEchoLedger rather than inventing a writer.
-    source = (
-        REPO_ROOT / "js" / "echo" / "ledger_append_adapter.py"
-    ).read_text(encoding="utf-8")
+    source = (REPO_ROOT / "js" / "echo" / "ledger_append_adapter.py").read_text(encoding="utf-8")
     assert "FileEchoLedger" in source
     assert "class FileEchoLedgerAppend" in source
 
 
-def test_turn_executor_bypass_red(tmp_path: Path) -> None:
-    """Bypassing stamp/consume (naked tool exec) is denied by authority."""
+@pytest.mark.asyncio
+async def test_turn_executor_bypass_red(tmp_path: Path) -> None:
+    """Naked ToolExecutorMixin._execute_tool_call without D1 receipt is denied.
 
-    auth = _authority(tmp_path)
-    # Simulate a TurnExecutor / agent._execute_tool_call bypass with no lease.
-    with pytest.raises(EffectAuthorityError, match="exec without stamp"):
-        auth.require_exec("bypass-lease")
+    This fails the build if the legacy hot-path can still execute tools while
+    bypassing Echo EffectAuthority / EffectInterpreter.
+    """
+
+    from js.agent.tool_executor import ToolExecutorMixin
+
+    # Bind the real method without constructing a full agent/registry graph.
+    execute = ToolExecutorMixin._execute_tool_call
+    with pytest.raises(EffectAuthorityError, match="bypasses Echo EffectAuthority"):
+        await execute(
+            object(),
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "file_read", "arguments": "{}"},
+            },
+            "session",
+            "run",
+            "user",
+        )
 
 
 def test_no_execute_tool_call_bypass_symbol() -> None:
-    """No public execute_tool_call that skips EffectInterpreter."""
+    """Public execute_tool_call is banned; underscore bypass must refuse naked calls."""
 
     offenders: list[str] = []
     roots = (
@@ -190,6 +207,14 @@ def test_no_execute_tool_call_bypass_symbol() -> None:
                 ):
                     offenders.append(str(path.relative_to(REPO_ROOT)))
     assert offenders == []
+
+    # `_execute_tool_call` may exist on the Host agent, but must call
+    # require_effect_exec_receipt so naked invocation cannot bypass Echo.
+    source = (REPO_ROOT / "js" / "agent" / "tool_executor.py").read_text(encoding="utf-8")
+    assert "require_effect_exec_receipt" in source
+    assert "async def _execute_tool_call" in source
+    with pytest.raises(EffectAuthorityError, match="bypasses Echo EffectAuthority"):
+        require_effect_exec_receipt()
 
 
 def test_no_second_run_echo_turn_entrypoint() -> None:
@@ -231,19 +256,36 @@ def test_enabled_without_enforce_boot_fails() -> None:
 
 
 def test_chat_only_not_classified_as_unwired() -> None:
-    assert classify_wiring(enabled=False, chat_only=True) is WiringMode.CHAT_ONLY
+    assert (
+        classify_wiring(enabled=False, chat_only=True, tool_table_empty=True)
+        is WiringMode.CHAT_ONLY
+    )
     assert classify_wiring(enabled=False, chat_only=False) is WiringMode.UNWIRED
-    assert classify_wiring(enabled=True, chat_only=False) is WiringMode.WIRED
-    # CHAT_ONLY ≻ UNWIRED even when enabled=false.
-    assert classify_wiring(enabled=False, chat_only=True) is not WiringMode.UNWIRED
+    assert (
+        classify_wiring(enabled=True, chat_only=False, enforce=True)
+        is WiringMode.WIRED_ENFORCE
+    )
+    # CHAT_ONLY ≻ UNWIRED when chat_only ∧ ¬enabled ∧ empty tools.
+    assert (
+        classify_wiring(enabled=False, chat_only=True, tool_table_empty=True)
+        is not WiringMode.UNWIRED
+    )
+    # enabled=true + chat_only=true is NEVER CHAT_ONLY.
+    assert (
+        classify_wiring(enabled=True, chat_only=True, enforce=True)
+        is WiringMode.WIRED_ENFORCE
+    )
+    assert (
+        classify_wiring(enabled=True, chat_only=True, enforce=False) is WiringMode.ILLEGAL
+    )
 
 
 def test_chat_only_ticket_issued_by_gatekernel(tmp_path: Path) -> None:
     auth = _authority(tmp_path, wiring=WiringMode.CHAT_ONLY)
-    # Chat-only model tickets still go through GateKernel via OrinGuardian.
     auth.issue(_proposal(effect_class="model"), lease_id="chat-1")
     stamped = auth.stamp("chat-1")
-    assert stamped.stamp_id
+    assert stamped.stamp_id == chat_only_ticket_id("chat-1")
+    assert stamped.stamp_id == "chat_only:chat-1"
     assert isinstance(auth.guardian, OrinGuardian)
 
 
@@ -252,11 +294,14 @@ def test_chat_only_host_cannot_forge_pending_stamp(tmp_path: Path) -> None:
     auth.issue(_proposal(effect_class="model"), lease_id="chat-2")
     with pytest.raises(EffectAuthorityError, match="cannot forge"):
         auth.forge_pending_stamp_denied("chat-2", forged_stamp_id="forged-stamp")
+    with pytest.raises(EffectAuthorityError, match="cannot forge"):
+        auth.forge_pending_stamp_denied(
+            "chat-2", forged_stamp_id="chat_only:chat-2"
+        )
 
 
 def test_chat_only_path_contract(tmp_path: Path) -> None:
     auth = _authority(tmp_path, wiring=WiringMode.CHAT_ONLY)
-    # Model/chat may issue; tool sinks remain denied on the chat-only path.
     auth.issue(_proposal(effect_class="model"), lease_id="chat-3")
     with pytest.raises(EffectAuthorityError, match="chat_only"):
         auth.issue(_proposal(effect_class="tool"), lease_id="chat-tool")
@@ -268,7 +313,7 @@ def test_stamped_state_durable_on_echo_ledger(tmp_path: Path) -> None:
     auth = EffectAuthority(
         guardian=OrinGuardian(GateKernel(b"k" * 32)),
         ledger=FileEchoLedgerAppend(journal),
-        wiring=WiringMode.WIRED,
+        wiring=WiringMode.WIRED_ENFORCE,
     )
     auth.issue(_proposal(), lease_id="lease-d")
     stamped = auth.stamp("lease-d")
@@ -285,18 +330,17 @@ def test_live_cache_hydrates_from_echo_ledger_stamped_row(tmp_path: Path) -> Non
     first = EffectAuthority(
         guardian=OrinGuardian(GateKernel(b"k" * 32)),
         ledger=FileEchoLedgerAppend(journal),
-        wiring=WiringMode.WIRED,
+        wiring=WiringMode.WIRED_ENFORCE,
     )
     proposal = _proposal()
     first.issue(proposal, lease_id="lease-h")
     stamped = first.stamp("lease-h")
     row = next(r for r in journal.records if r.record_type == STAMP_RECEIPT_RECORD_TYPE)
 
-    # Fresh authority instance hydrates live cache from durable STAMPED row.
     second = EffectAuthority(
         guardian=OrinGuardian(GateKernel(b"k" * 32)),
         ledger=FileEchoLedgerAppend(journal),
-        wiring=WiringMode.WIRED,
+        wiring=WiringMode.WIRED_ENFORCE,
     )
     hydrated = second.hydrate_from_stamped_row(dict(row.payload), proposal=proposal)
     assert hydrated.lease_id == "lease-h"
@@ -312,3 +356,15 @@ def test_pulse_emits_no_exec() -> None:
     kinds = {type(action).__name__ for action in actions}
     assert "Exec" not in kinds
     assert "CommitFrame" not in kinds
+
+
+def test_effect_bind_receipt_roundtrip(tmp_path: Path) -> None:
+    auth = _authority(tmp_path)
+    receipt = auth.admit_effect(_proposal(), lease_id="bind-1")
+    handle = set_effect_exec_receipt(receipt)
+    try:
+        assert require_effect_exec_receipt() == receipt
+    finally:
+        reset_effect_exec_receipt(handle)
+    with pytest.raises(EffectAuthorityError):
+        require_effect_exec_receipt()
