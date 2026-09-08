@@ -19,7 +19,8 @@ def test_default_config_conjunction_lists_external_gates() -> None:
     report = evaluate_stage_c_conjunction(OrinConfig())
 
     assert report.ok is False
-    assert "enabled" in report.missing
+    # Stage B: enabled defaults true, so it is observed; Stage C bits stay missing.
+    assert "enabled" not in report.missing
     assert "echo_minimal_os" in report.missing
     assert "k156_8_real_model_e2e" in report.missing
     assert "k156_9_independent_red_team" in report.missing

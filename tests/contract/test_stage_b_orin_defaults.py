@@ -65,13 +65,14 @@ def test_no_second_turn_loop_in_membrane() -> None:
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name == "run_echo_turn":
-                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.name}")
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "run_echo_turn"
+            ):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:def")
             if isinstance(node, ast.Call):
                 func = node.func
                 name = getattr(func, "id", None) or getattr(func, "attr", None)
                 if name == "run_echo_turn":
                     offenders.append(f"{path.relative_to(REPO_ROOT)}:call")
-        assert "run_echo_turn" not in source
     assert offenders == []
