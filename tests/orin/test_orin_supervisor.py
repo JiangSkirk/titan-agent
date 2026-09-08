@@ -25,17 +25,17 @@ def _settings(tmp_path: Path) -> JSSettings:
     )
 
 
-def test_default_settings_keep_orin_disabled(tmp_path: Path) -> None:
+def test_default_settings_keep_orin_stage_b_defaults(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    assert settings.orin.enabled is False
-    assert settings.orin.enforce is False
+    assert settings.orin.enabled is True
+    assert settings.orin.enforce is True
 
 
-def test_prepare_product_orin_enables_stage_a_without_enforce(tmp_path: Path) -> None:
+def test_prepare_product_orin_keeps_stage_b_defaults(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     prepare_product_orin(settings)
     assert settings.orin.enabled is True
-    assert settings.orin.enforce is False
+    assert settings.orin.enforce is True
     assert settings.orin.stage_b is False
     assert settings.orin.policy_profile.value == "conservative"
     assert settings.orin.cell_desktop is False
@@ -81,7 +81,7 @@ def test_prepare_keeps_explicit_compat_profile(tmp_path: Path) -> None:
     )
     prepare_product_orin(settings)
     assert settings.orin.enabled is True
-    assert settings.orin.enforce is False
+    assert settings.orin.enforce is True
     assert settings.orin.policy_profile.value == "compat"
 
 
@@ -125,15 +125,16 @@ def test_ensure_orind_starts_attaches_and_stops(tmp_path: Path) -> None:
     assert not _socket_live(path)
 
 
-def test_default_jsagent_does_not_start_orind(tmp_path: Path) -> None:
+def test_default_jsagent_starts_orind_under_stage_b_defaults(tmp_path: Path) -> None:
     from js.agent import JSAgent
 
     settings = _settings(tmp_path)
     agent = JSAgent(settings)
     try:
-        assert settings.orin.enabled is False
-        assert not (Path(settings.state_dir) / "orin" / "orind.sock").exists()
-        assert settings.orin.socket_path is None
+        assert settings.orin.enabled is True
+        assert settings.orin.enforce is True
+        wait_orind_socket(Path(settings.state_dir) / "orin" / "orind.sock")
+        assert _socket_live(Path(settings.state_dir) / "orin" / "orind.sock")
     finally:
         asyncio.run(agent.close())
 
@@ -149,7 +150,7 @@ def test_jsagent_product_prepare_uses_orind_adapter(tmp_path: Path) -> None:
         authority = agent._get_echo_tool_lease_authority()
         assert isinstance(authority, OrinLeaseClientAdapter)
         assert authority.healthy()
-        assert settings.orin.enforce is False
+        assert settings.orin.enforce is True
         assert _socket_live(Path(settings.orin.socket_path))
     finally:
         asyncio.run(agent.close())

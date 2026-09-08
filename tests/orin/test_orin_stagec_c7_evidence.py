@@ -44,10 +44,14 @@ def test_conjunction_still_missing_external_gates() -> None:
 
 
 def test_production_closeout_verdict_is_not_implemented() -> None:
+    from js.orin.stage_c import product_enforce_enabled
+
     declaration = stage_c_closeout_declaration()
     assert declaration.verdict == CLOSEOUT_NOT_IMPLEMENTED
     assert declaration.conjunction_ok is False
-    assert OrinConfig().enforce is False
+    # Stage B flips D1 orin.enforce default true; Stage C closeout stays red.
+    assert OrinConfig().enforce is True
+    assert product_enforce_enabled(OrinConfig()) is False
     assert "official_tcc_packaging" in declaration.external_gates_missing
     assert "k156_8_real_model_e2e" in declaration.external_gates_missing
     assert "k156_9_independent_red_team" in declaration.external_gates_missing

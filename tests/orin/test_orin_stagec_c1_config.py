@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from js.config import OrinConfig
 from js.orin.protocol import ProtocolError, make_envelope
@@ -15,21 +14,27 @@ from js.orind.daemon import OrinDaemon, OrinDaemonError
 def test_stage_c_switches_default_off() -> None:
     config = OrinConfig()
 
-    assert config.enforce is False
+    # Stage B: D1 enforce defaults true; Stage C cell switches stay off.
+    assert config.enforce is True
     assert config.cell_identity_enforce is False
     assert config.echo_minimal_os is False
 
 
-def test_cell_identity_switch_is_accepted_but_lazy_without_enforce() -> None:
+def test_cell_identity_switch_is_accepted_but_lazy_without_stage_c_conjunction() -> None:
     config = OrinConfig(cell_identity_enforce=True)
 
-    assert config.enforce is False
+    assert config.enforce is True
     assert config.cell_identity_enforce is True
 
 
-def test_product_enforce_config_fails_fast_until_conjunction_is_observed() -> None:
-    with pytest.raises(ValidationError, match="conjunction incomplete"):
-        OrinConfig(enforce=True)
+def test_product_enforce_config_constructs_but_stage_c_routes_stay_closed() -> None:
+    from js.orin.stage_c import product_enforce_enabled, require_stage_c_enforce
+
+    config = OrinConfig(enforce=True)
+    assert config.enforce is True
+    assert product_enforce_enabled(config) is False
+    with pytest.raises(ValueError, match="conjunction incomplete"):
+        require_stage_c_enforce(config)
 
 
 def test_daemon_enforce_fails_before_creating_state(tmp_path: Path) -> None:

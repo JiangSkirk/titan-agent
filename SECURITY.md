@@ -68,10 +68,11 @@ Host 本身仍在原生进程内。
 
 **默认未实施、不得宣称的事项：**
 
-- `orin.enabled` 默认 `false`（配置类 `OrinConfig.enabled`）。
-- `orin.enforce` 默认 `false`（配置类 `OrinConfig.enforce`）。Stage C cells /
-  进程拆分的官方裁决是 `not_implemented`，见
+- `orin.enabled` 默认 `true`（配置类 `OrinConfig.enabled`，Stage B / v0.3.3.1）。
+- `orin.enforce` 默认 `true`（配置类 `OrinConfig.enforce`）用于 EffectAuthority
+  D1。Stage C cells / 进程拆分在 §6.1 合取观测完成前仍是 `not_implemented`，见
   [`docs/security/orin/ORIN_STAGE_C_CLOSEOUT.md`](docs/security/orin/ORIN_STAGE_C_CLOSEOUT.md)。
+  单独的 `orin.enforce=true` **不是** Stage C 收口。
 - 不得宣称 Echo RCE 已收口。
 - 无正式 TCC / Developer ID / 公证。
 - 无独立外部红队背书。

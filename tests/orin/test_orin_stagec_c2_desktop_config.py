@@ -69,7 +69,8 @@ def test_cell_desktop_switch_defaults_off_and_is_lazy() -> None:
 
     assert default.cell_desktop is False
     assert opted_in.cell_desktop is True
-    assert opted_in.enforce is False
+    # Opting into the cell switch does not claim Stage C; D1 enforce defaults true.
+    assert opted_in.enforce is True
 
 
 def test_desktop_cell_cannot_activate_outside_explicit_c2_harness(tmp_path: Path) -> None:

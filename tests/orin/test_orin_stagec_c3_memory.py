@@ -122,7 +122,8 @@ def test_cell_memory_defaults_off_and_is_lazy() -> None:
     opted = OrinConfig(cell_memory=True)
     assert default.cell_memory is False
     assert opted.cell_memory is True
-    assert opted.enforce is False
+    # Opting into the cell switch does not claim Stage C; D1 enforce defaults true.
+    assert opted.enforce is True
 
 
 def test_memory_cell_cannot_activate_outside_explicit_c3_harness(tmp_path: Path) -> None:

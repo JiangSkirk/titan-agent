@@ -16,9 +16,13 @@ from js.orin.stage_c import StageCEvidence
 
 
 def test_k156_8_evidence_bit_stays_false() -> None:
+    from js.orin.stage_c import product_enforce_enabled
+
     evidence = StageCEvidence.observed()
     assert evidence.k156_8_real_model_e2e is False
-    assert OrinConfig().enforce is False
+    # Stage B D1 enforce defaults true; K§15.6 #8 still blocks Stage C.
+    assert OrinConfig().enforce is True
+    assert product_enforce_enabled(OrinConfig()) is False
 
 
 @pytest.mark.skipif(

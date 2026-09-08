@@ -1721,13 +1721,13 @@ class ToolExecutorMixin(ControlPlaneMixin, ToolHandoffMixin):
     def _get_echo_tool_lease_authority(self) -> Any:
         """Return the lease authority handle (Orin adapter or in-process).
 
-        ``orin_enabled=false`` (default) keeps the original in-process
-        ``LeaseAuthority`` path byte-for-byte. When Orin is enabled the
-        handle is an :class:`OrinLeaseClientAdapter`: it holds no MAC key
-        and never subclasses ``LeaseAuthority`` (the handle check rejects
-        subclasses). After enabling Orin the main process must never read
-        the adopted ``echo_tool_lease.key`` again — that key lives only
-        in the orind KeyBox.
+        ``orin.enabled=false`` keeps the original in-process
+        ``LeaseAuthority`` path byte-for-byte. When Orin is enabled (Stage B
+        product default) the handle is an :class:`OrinLeaseClientAdapter`: it
+        holds no MAC key and never subclasses ``LeaseAuthority`` (the handle
+        check rejects subclasses). After enabling Orin the main process must
+        never read the adopted ``echo_tool_lease.key`` again — that key lives
+        only in the orind KeyBox.
         """
 
         authority = getattr(self, "_tool_lease_authority", None)

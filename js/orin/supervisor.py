@@ -51,7 +51,7 @@ def orind_socket_path(settings: Any) -> Path:
 
 
 def prepare_product_orin(settings: Any) -> Any:
-    """Enable Stage A Orin on product launchers. Never opens enforce."""
+    """Apply Stage B product Orin defaults. Never opens Stage C ``--orin-enforce``."""
 
     orin = getattr(settings, "orin", None)
     if orin is None or not hasattr(orin, "enabled"):
@@ -60,7 +60,9 @@ def prepare_product_orin(settings: Any) -> Any:
         orin.enabled = False
         logger.info("JS_ORIND opt-out: product will not start orind")
         return settings
-    if getattr(orin, "enforce", False) is True:
+    # Respect explicit enabled=false (CHAT_ONLY / tests). Defaults are
+    # enabled=true ∧ enforce=true; do not silently force enabled when off.
+    if getattr(orin, "enabled", True) is False:
         return settings
     orin.enabled = True
     # P1-3: never silently widen conservative → compat. Explicit

@@ -435,20 +435,21 @@ class OrinPolicyProfile(StrEnum):
 
 
 class OrinConfig(BaseModel):
-    """Orin Stage A gatekeeper (orind) configuration.
+    """Orin gatekeeper + EffectAuthority D1 product configuration.
 
-    Orin moves lease issuance / consumption / revocation into a separate
-    daemon. Stage A claims only model-layer hardening — never process-RCE
-    containment (tool handlers still run in-process). All defaults keep
-    pre-Orin behavior: ``orin_enabled=False`` routes every lease call
-    through the in-process ``LeaseAuthority`` exactly as before.
+    Stage B (v0.3.3.1) product defaults are ``enabled=true`` and
+    ``enforce=true`` together. ``enabled ∧ ¬enforce`` is illegal and fails
+    at EffectAuthority boot only (not at settings parse). Stage C cells /
+    process split remain ``not_implemented`` until the §6.1 conjunction is
+    observed — bare ``enforce=true`` is the D1 gate, not Stage C closeout.
     """
 
     enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "Route lease issue/consume/revoke through orind. Disabled by default "
-            "until merge; must keep pre-Orin behavior when False."
+            "Route lease issue/consume/revoke through orind and mark EffectAuthority "
+            "enabled. Product default true (Stage B); set False for CHAT_ONLY / "
+            "explicit in-process lease fallback."
         ),
     )
     fail_mode: OrinFailMode = Field(
@@ -543,14 +544,16 @@ class OrinConfig(BaseModel):
             "reconciliation for workspace commits and connector sends."
         ),
     )
-    # -- stage C (ORIN_STAGE_C_SPEC.md): parsed now.  Product routes stay
-    # inert while enforce is off.  The master switch fail-fasts unless the
-    # §6.1 conjunction (including external #8/#9/TCC bits) is fully observed.
+    # -- Stage B D1 enforce (v0.3.3.1): product default true with enabled.
+    # Stage C cell routes still require the §6.1 conjunction via
+    # ``product_enforce_enabled`` / daemon ``--orin-enforce``; bare enforce
+    # alone does not claim Stage C closeout.
     enforce: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "Stage-C production enforce mode. Fail-fast unless the §6.1 "
-            "conjunction is fully observed."
+            "EffectAuthority D1 enforce flag (must pair with enabled=true). "
+            "Product default true (Stage B). Stage C cells stay closed until "
+            "the §6.1 conjunction is observed."
         ),
     )
     cell_identity_enforce: bool = Field(
@@ -588,15 +591,6 @@ class OrinConfig(BaseModel):
             "provider tokens when this is observed. Default off; not enforce."
         ),
     )
-
-    @model_validator(mode="after")
-    def reject_unfinished_stage_c_enforce(self) -> OrinConfig:
-        if self.enforce:
-            from js.orin.stage_c import require_stage_c_enforce
-
-            require_stage_c_enforce(self)
-        return self
-
 
 class MemoryConfig(BaseModel):
     """Memory and context management."""

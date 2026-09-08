@@ -19,7 +19,8 @@ def test_default_config_conjunction_lists_external_gates() -> None:
     report = evaluate_stage_c_conjunction(OrinConfig())
 
     assert report.ok is False
-    assert "enabled" in report.missing
+    # Stage B: enabled defaults true, so it is observed; Stage C bits stay missing.
+    assert "enabled" not in report.missing
     assert "echo_minimal_os" in report.missing
     assert "k156_8_real_model_e2e" in report.missing
     assert "k156_9_independent_red_team" in report.missing
@@ -66,10 +67,14 @@ def test_all_software_flags_still_fail_without_external_evidence() -> None:
     )
 
 
-def test_product_cell_routes_stay_off_when_enforce_is_off() -> None:
+def test_product_cell_routes_stay_off_without_stage_c_conjunction() -> None:
+    from js.orin.stage_c import product_enforce_enabled
+
     config = OrinConfig(cell_desktop=True, cell_memory=True)
 
-    assert config.enforce is False
+    # Stage B defaults enforce=true for D1; Stage C routes still need conjunction.
+    assert config.enforce is True
+    assert product_enforce_enabled(config) is False
     assert product_desktop_cell_required(config) is False
     assert product_memory_cell_required(config) is False
     assert echo_may_hold_provider_tokens(config) is True
