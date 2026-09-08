@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +17,6 @@ from js.connectors.contracts import (
     canonical_params_digest,
 )
 from js.connectors.manager import ConnectorManager
-from js.echo.capability import is_lease_authority_handle
 from js.echo.turn_context import (
     RuntimeContext,
     reset_current_owner_key_hash,
@@ -37,6 +36,21 @@ if TYPE_CHECKING:
     from js.models.stream_events import StreamEvent
 
 logger = get_logger("js.echo.effect_interpreter")
+
+
+def _new_d1_lease_id(prefix: str, run_id: str, *parts: object) -> str:
+    """Mint a unique D1 lease id.
+
+    ``id(effect)`` is unsafe here: CPython may recycle object addresses after GC,
+    which collides with EffectAuthority's single-use ``lease already issued`` gate
+    across retries / multi-turn runs that share ``run_id``.
+    """
+
+    stable = ":".join(str(part) for part in parts if part not in (None, ""))
+    nonce = secrets.token_hex(8)
+    if stable:
+        return f"{prefix}:{run_id}:{stable}:{nonce}"
+    return f"{prefix}:{run_id}:{nonce}"
 
 
 @dataclass(frozen=True)
@@ -129,7 +143,7 @@ class EffectInterpreter:
         receipt = self._admit_d1(
             effect_class="model",
             context=context,
-            lease_id=f"model:{context.run_id}:{uuid.uuid4().hex}",
+            lease_id=_new_d1_lease_id("model", context.run_id),
             grants=frozenset(),
         )
         from js.echo.effect_bind import reset_effect_exec_receipt, set_effect_exec_receipt
@@ -221,7 +235,7 @@ class EffectInterpreter:
         self._admit_d1(
             effect_class="model",
             context=context,
-            lease_id=f"model-stream:{context.run_id}:{uuid.uuid4().hex}",
+            lease_id=_new_d1_lease_id("model-stream", context.run_id),
             grants=frozenset(),
         )
 
@@ -324,25 +338,29 @@ class EffectInterpreter:
         if not callable(execute):
             raise RuntimeError("Echo tool effect requires the leased tool executor")
 
-        from orin_guard.kernel.grants import grants_for_tool
+        from js.echo.effect_bind import reset_effect_exec_receipt, set_effect_exec_receipt
+        from js.echo.effect_grants import assert_grants_cover_tool, grants_for_effect_tool
 
         resource_scope = " ".join(str(root) for root in getattr(context, "fs_roots", ()) or ())
         context_taint = int(getattr(context, "taint", 0) or 0)
-        grants = grants_for_tool(
+        grants = grants_for_effect_tool(
             effect.tool_name,
             resource_scope=resource_scope,
             context_taint=context_taint,
         )
+        assert_grants_cover_tool(effect.tool_name, grants, context_taint=context_taint)
         receipt = self._admit_d1(
             effect_class="tool",
             context=context,
-            lease_id=(
-                f"tool:{context.run_id}:{effect.tool_name}:"
-                f"{effect.tool_call_id or uuid.uuid4().hex}"
+            lease_id=_new_d1_lease_id(
+                "tool",
+                context.run_id,
+                effect.tool_name,
+                effect.tool_call_id,
             ),
             grants=grants,
+            tool_name=effect.tool_name,
         )
-        from js.echo.effect_bind import reset_effect_exec_receipt, set_effect_exec_receipt
 
         tool_call = {
             "id": effect.tool_call_id,
@@ -410,11 +428,12 @@ class EffectInterpreter:
         context: RuntimeContext,
         operation: Any = None,
     ) -> ConnectorRunOutcomeV1:
+        """Connector exec: single D1 authority chain (no lease_authority dual ticket)."""
+
         if type(request) is not ConnectorExecutionRequestV1:
             raise TypeError("connector request must be exact ConnectorExecutionRequestV1")
         if not isinstance(params, Mapping) or isinstance(params, (str, bytes, bytearray)):
             raise TypeError("connector params must be a mapping")
-
         manager = self._connector_manager
         if type(manager) is not ConnectorManager:
             raise RuntimeError("Echo connector manager authority is unavailable")
@@ -445,9 +464,12 @@ class EffectInterpreter:
             ):
                 raise PermissionError("connector directory grant exceeds runtime filesystem roots")
 
-        expected_tool = f"connector.{request.connection.ref.connector_type}.{request.operation}"
-        expected_scope = f"connection:{request.connection.ref.connection_id}:{request.scope}"
-        expected_fs_roots = () if grant is None else (grant.root,)
+        expected_tool = (
+            f"connector.{request.connection.ref.connector_type}.{request.operation}"
+        )
+        if not getattr(request.lease, "lease_id", ""):
+            raise PermissionError("connector effect requires non-empty lease_id")
+
         approvals: ApprovalQueue | None = None
         approval_kwargs: dict[str, Any] | None = None
         if request.operation == "write":
@@ -468,74 +490,42 @@ class EffectInterpreter:
             }
             approvals.validate_approved_binding(request.approval_id, **approval_kwargs)
 
-        # Request-seal check only (no LeaseAuthority consume). EffectAuthority is
-        # the single stamp/consume chain for connector effects.
-        authority_getter = getattr(self._agent, "_get_echo_tool_lease_authority", None)
-        if not callable(authority_getter):
-            raise RuntimeError("Echo connector lease authority is unavailable")
-        lease_authority = authority_getter()
-        if not is_lease_authority_handle(lease_authority):
-            raise RuntimeError("Echo connector lease authority is invalid")
-        now_fn = getattr(lease_authority, "_now", None)
-        if not callable(now_fn):
-            raise RuntimeError("Echo connector lease authority clock is unavailable")
-        now = int(now_fn())
-        lease_authority.verify_bound(
-            request.lease,
-            expected_product_id=request.task_ref.legacy_product_id,
-            expected_owner=request.task_ref.owner,
-            expected_session=request.task_ref.session,
-            expected_run=request.task_ref.run,
-            expected_tool=expected_tool,
-            expected_args_schema=request.authority_binding_hash(),
-            expected_resource_scope=expected_scope,
-            expected_fs_roots=expected_fs_roots,
-            expected_network_policy="deny",
-            expected_network_hosts=(),
-            expected_max_bytes=10 * 1024 * 1024,
-            expected_max_duration_ms=30_000,
-            now=now,
-            require_single_use=True,
-        )
-
-        if approvals is not None and approval_kwargs is not None:
-            assert request.approval_id is not None
-            approvals.consume_approved_binding(request.approval_id, **approval_kwargs)
-
-        from orin_guard.kernel.grants import grants_for_tool
-
         from js.echo.effect_bind import (
             require_effect_exec_receipt,
             reset_effect_exec_receipt,
             set_effect_exec_receipt,
         )
+        from js.echo.effect_grants import assert_grants_cover_tool, grants_for_effect_tool
 
-        # Stable D1 lease id from the sealed CapabilityLease (single-use admit).
-        d1_lease_id = f"connector:{request.lease.lease_id}:{request.lease.nonce}"
+        # Frozen D8 / D1: one admit → bind → require → dispatch. No second ticket.
+        # Stable id from the sealed CapabilityLease so replay is single-use denied.
+        d1_lease_id = (
+            f"connector:{context.run_id}:{request.lease.lease_id}:{request.lease.nonce}"
+        )
+        context_taint = int(getattr(context, "taint", 0) or 0)
+        d1_grants = grants_for_effect_tool(
+            expected_tool,
+            resource_scope=str(getattr(request, "scope", "") or ""),
+            context_taint=context_taint,
+        )
+        assert_grants_cover_tool(expected_tool, d1_grants, context_taint=context_taint)
         d1_receipt = self._admit_d1(
             effect_class="connector",
             context=context,
             lease_id=d1_lease_id,
-            grants=grants_for_tool(
-                expected_tool,
-                resource_scope=str(getattr(request, "scope", "") or ""),
-                context_taint=int(getattr(context, "taint", 0) or 0),
-            ),
+            grants=d1_grants,
+            tool_name=expected_tool,
         )
-        bind = set_effect_exec_receipt(d1_receipt)
+        d1_bind = set_effect_exec_receipt(d1_receipt)
         try:
-            # Same gate as tools: naked connector dispatch without D1 receipt is denied.
-            bound = require_effect_exec_receipt()
+            require_effect_exec_receipt()
+
+            if approvals is not None and approval_kwargs is not None:
+                assert request.approval_id is not None
+                approvals.consume_approved_binding(request.approval_id, **approval_kwargs)
+
             if self._dispatch_issuer is None:
-                return ConnectorRunOutcomeV1(
-                    success=False,
-                    connector_type=request.connection.ref.connector_type,
-                    effects=(),
-                    artifact_refs=(),
-                    attention_items=(),
-                    receipt_id="",
-                    error_code="connector_runtime_authority_required",
-                )
+                raise RuntimeError("connector_runtime_authority_required")
             context_fingerprint = ""
             if self._runtime_authority is not None:
                 context_fingerprint = self._runtime_authority._context_fingerprint(context)
@@ -544,10 +534,11 @@ class EffectInterpreter:
                 context_fingerprint=context_fingerprint,
                 appshell_operation_id=(operation.operation_id if operation else None),
                 approval_claim_receipt_hash=None,
-                lease_consume_receipt_hash=bound.consume_receipt_hash,
+                lease_consume_receipt_hash=d1_receipt.consume_receipt_hash,
                 connector_type=request.connection.ref.connector_type,
                 operation=request.operation,
             )
+            require_effect_exec_receipt()
             result = await manager._dispatch_authorized(
                 request,
                 params=actual_params,
@@ -560,11 +551,12 @@ class EffectInterpreter:
                 effects=result.effects,
                 artifact_refs=result.artifact_refs,
                 attention_items=(),
-                receipt_id=bound.consume_receipt_hash,
+                receipt_id=d1_receipt.consume_receipt_hash,
                 error_code=error_code,
             )
         finally:
-            reset_effect_exec_receipt(bind)
+            reset_effect_exec_receipt(d1_bind)
+
 
     def _admit_d1(
         self,
@@ -573,8 +565,11 @@ class EffectInterpreter:
         context: RuntimeContext,
         lease_id: str,
         grants: frozenset[str],
+        tool_name: str | None = None,
     ) -> Any:
         from echo_core.effect_authority import EffectAuthorityError, EffectProposal
+
+        from js.echo.effect_grants import assert_grants_cover_tool
 
         authority = self._effect_authority
         if authority is None:
@@ -583,6 +578,14 @@ class EffectInterpreter:
             raise EffectAuthorityError(
                 "EffectAuthority is not wired; refuse ambient Interpreter.exec"
             )
+        if effect_class in {"tool", "connector"} and not lease_id:
+            raise EffectAuthorityError("tool-class effect requires non-empty lease_id")
+        if effect_class == "tool":
+            if not tool_name:
+                raise EffectAuthorityError("tool name required to admit tool effect")
+            assert_grants_cover_tool(tool_name, grants)
+        elif effect_class == "connector" and tool_name:
+            assert_grants_cover_tool(tool_name, grants)
         proposal = EffectProposal(
             owner=context.owner_key_hash or "owner",
             session=context.session_id or "session",

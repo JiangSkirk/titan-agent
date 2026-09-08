@@ -152,15 +152,16 @@ class EffectAuthority:
         self._live[lease_id] = pending
         return pending
 
-    def stamp(self, lease_id: str) -> StampedLease:
+    def stamp(self, lease_id: str, *, args_hash: str = "") -> StampedLease:
         entry = self._live.get(lease_id)
         if entry is None or entry.phase is not TicketPhase.PENDING:
             raise EffectAuthorityError("stamp requires a PENDING lease")
         assert isinstance(entry, PendingLease)
         proposal = entry.proposal
         self._deny_if_closed(effect_class=proposal.effect_class)
-        # Always bind lease_id into GateKernel MAC. CHAT_ONLY pins ticket id
-        # to exactly chat_only:{lease_id}.
+        # Always bind lease_id into GateKernel MAC (Orin #4). CHAT_ONLY pins
+        # ticket id to exactly chat_only:{lease_id}. Tool/connector empty
+        # lease_id is rejected by GateKernel.LEASE_BOUND_EFFECTS.
         bound_lease_id = (
             chat_only_ticket_id(lease_id)
             if self.wiring is WiringMode.CHAT_ONLY
@@ -175,6 +176,7 @@ class EffectAuthority:
             budget=proposal.budget,
             taint=proposal.taint,
             lease_id=bound_lease_id,
+            args_hash=args_hash,
         )
         if self.wiring is WiringMode.CHAT_ONLY:
             expected = chat_only_ticket_id(lease_id)
@@ -193,6 +195,7 @@ class EffectAuthority:
                 "session": proposal.session,
                 "effect_class": proposal.effect_class,
                 "grants": sorted(proposal.grants),
+                "args_hash": args_hash,
             },
         )
         record_hash = getattr(record, "record_hash", None) or str(record)
@@ -247,12 +250,13 @@ class EffectAuthority:
         proposal: EffectProposal,
         *,
         lease_id: str,
+        args_hash: str = "",
     ) -> LeaseReceipt:
         """Run the full D1 chain and return the durable consume receipt."""
 
         self.propose(proposal)
         self.issue(proposal, lease_id=lease_id)
-        self.stamp(lease_id)
+        self.stamp(lease_id, args_hash=args_hash)
         return self.consume(lease_id)
 
     def require_exec(self, lease_id: str) -> LeaseReceipt:

@@ -385,72 +385,139 @@ def test_effect_bind_receipt_roundtrip(tmp_path: Path) -> None:
         require_effect_exec_receipt()
 
 
-def test_connector_path_requires_d1_receipt_not_lease_consume() -> None:
-    """Connector hot path must bind EffectAuthority receipt; no empty receipt_id fallback."""
+def test_connector_without_d1_receipt_denied(tmp_path: Path) -> None:
+    """ConnectorEffect must walk D1; unwired / unbound connector exec is denied."""
 
-    source = (REPO_ROOT / "js" / "echo" / "effect_interpreter.py").read_text(encoding="utf-8")
-    # Single D1 chain: admit + require_exec / effect_bind, not LeaseAuthority.consume_bound.
-    assert "require_effect_exec_receipt" in source
-    assert "set_effect_exec_receipt" in source
-    assert "effect_class=\"connector\"" in source or "effect_class='connector'" in source
-    # Old dual chain must not remain on the connector admit path.
-    connector_fn = source.split("async def _execute_connector_admitted", 1)[1].split(
-        "def _admit_d1", 1
-    )[0]
-    assert "consume_bound" not in connector_fn
-    assert "receipt_id=\"\"" not in connector_fn or "connector_runtime_authority_required" in connector_fn
-    assert "bound.consume_receipt_hash" in connector_fn
+    from js.echo.effect_interpreter import EffectInterpreter
+
+    interp = EffectInterpreter(object(), effect_authority=None)
+    # Minimal context: only fields _admit_d1 reads.
+    context = type(
+        "Ctx",
+        (),
+        {
+            "owner_key_hash": "owner-a",
+            "session_id": "session-a",
+            "run_id": "run-a",
+        },
+    )()
+    with pytest.raises(EffectAuthorityError, match="EffectAuthority is not wired"):
+        interp._admit_d1(
+            effect_class="connector",
+            context=context,  # type: ignore[arg-type]
+            lease_id="connector:run-a:lease-x",
+            grants=frozenset({"egress.send"}),
+            tool_name="connector.local_import.read",
+        )
+
+    # Naked require without bind — same as tool bypass for connector path.
     with pytest.raises(EffectAuthorityError, match="bypasses Echo EffectAuthority"):
         require_effect_exec_receipt()
 
+    source = (REPO_ROOT / "js" / "echo" / "effect_interpreter.py").read_text(encoding="utf-8")
+    assert "require_effect_exec_receipt" in source
+    assert 'effect_class="connector"' in source
+    assert "receipt_id=d1_receipt.consume_receipt_hash" in source
+    # Dual ticket collapsed: no lease_authority verify/consume on connector path.
+    assert "lease_authority.verify_bound" not in source
+    assert "lease_authority.consume_bound" not in source
+    assert "_get_echo_tool_lease_authority" not in source
+    assert "receipt_id=\"\"" not in source
 
-@pytest.mark.asyncio
-async def test_connector_without_effect_authority_denied(tmp_path: Path) -> None:
-    """Interpreter without EffectAuthority refuses connector ambient exec."""
 
-    import time
-    from types import SimpleNamespace
+def test_connector_single_d1_receipt_path(tmp_path: Path) -> None:
+    """Connector success carries exactly the D1 consume receipt — one chain."""
 
-    from js.connectors.manager import build_test_connector_manager
     from js.echo.effect_interpreter import EffectInterpreter
-    from js.echo.turn_context import RuntimeContext
 
-    class _Auth:
-        def validate_effect_context(self, _context: RuntimeContext, *, effect_kind: str) -> None:
-            assert effect_kind == "connector"
-
-    agent = SimpleNamespace(
-        echo_runtime=None,
-        approvals=None,
-        _get_echo_tool_lease_authority=lambda: None,
+    auth = _authority(tmp_path)
+    interp = EffectInterpreter(object(), effect_authority=auth)
+    context = type(
+        "Ctx",
+        (),
+        {
+            "owner_key_hash": "owner-a",
+            "session_id": "session-a",
+            "run_id": "run-a",
+        },
+    )()
+    receipt = interp._admit_d1(
+        effect_class="connector",
+        context=context,  # type: ignore[arg-type]
+        lease_id="connector:run-a:lease-single",
+        grants=frozenset({"egress.send"}),
+        tool_name="connector.local_import.read",
     )
-    runtime_auth = _Auth()
-    agent.echo_runtime = runtime_auth
-    interpreter = EffectInterpreter(
-        agent,
-        runtime_authority=runtime_auth,
-        connector_manager=build_test_connector_manager(),
-        effect_authority=None,
-    )
-    context = RuntimeContext(
-        product_id="js-agent",
-        channel="test",
-        owner_key_hash="owner-a",
-        session_id="session-a",
-        run_id="run-a",
-        role="user",
-        profile="default",
-        capabilities=(),
-        workspace=tmp_path / "workspace",
-        state_dir=tmp_path / "state",
-        fs_roots=(tmp_path / "workspace",),
-        deadline_ms=int(time.monotonic() * 1000) + 900_000,
-    )
-    with pytest.raises(EffectAuthorityError, match="not wired|bypasses Echo EffectAuthority|refuse"):
-        # Call _admit_d1 directly: proves connector class cannot ambient-exec.
-        interpreter._admit_d1(
+    assert receipt.consume_receipt_hash
+    assert receipt.lease_id == "connector:run-a:lease-single"
+    # Same lease cannot be admitted twice (single-use D1 chain).
+    with pytest.raises(EffectAuthorityError, match="already issued"):
+        interp._admit_d1(
             effect_class="connector",
-            context=context,
-            lease_id="connector:missing:auth",
-            grants=frozenset({"egress"}),
+            context=context,  # type: ignore[arg-type]
+            lease_id="connector:run-a:lease-single",
+            grants=frozenset({"egress.send"}),
+            tool_name="connector.local_import.read",
         )
+
+
+def test_tool_admit_does_not_hardcode_private_read() -> None:
+    """Tool admit must derive grants; hardcoding private.read is a defect."""
+
+    from js.echo.effect_grants import assert_grants_cover_tool, grants_for_effect_tool
+
+    required = grants_for_effect_tool("browser_fetch")
+    assert "private.read" not in required or required != frozenset({"private.read"})
+    assert "egress.send" in required
+    with pytest.raises(EffectAuthorityError, match="grants incomplete"):
+        assert_grants_cover_tool("browser_fetch", frozenset({"private.read"}))
+
+    source = (REPO_ROOT / "js" / "echo" / "effect_interpreter.py").read_text(encoding="utf-8")
+    assert "grants_for_effect_tool" in source
+    assert 'grants=frozenset({"private.read"})' not in source
+
+
+def test_tool_admit_denied_without_real_required_grants(tmp_path: Path) -> None:
+    """Even with private.read present, missing real tool grants are denied."""
+
+    from js.echo.effect_interpreter import EffectInterpreter
+
+    auth = _authority(tmp_path)
+    interp = EffectInterpreter(object(), effect_authority=auth)
+    context = type(
+        "Ctx",
+        (),
+        {
+            "owner_key_hash": "owner-a",
+            "session_id": "session-a",
+            "run_id": "run-a",
+        },
+    )()
+    with pytest.raises(EffectAuthorityError, match="grants incomplete"):
+        interp._admit_d1(
+            effect_class="tool",
+            context=context,  # type: ignore[arg-type]
+            lease_id="tool:run-a:browser_fetch:tc1",
+            grants=frozenset({"private.read"}),
+            tool_name="browser_fetch",
+        )
+
+
+def test_gatekernel_rejects_empty_lease_for_tool_class() -> None:
+    """Align with Orin PR #4: tool/connector issue requires non-empty lease_id."""
+
+    from orin_guard.kernel.dual import PolicyPlane
+    from orin_guard.kernel.gate import LEASE_BOUND_EFFECTS, TicketDenied
+
+    assert frozenset({"tool", "connector"}) == LEASE_BOUND_EFFECTS
+    kernel = GateKernel(b"k" * 32)
+    plane = PolicyPlane(
+        owner="o",
+        session="s",
+        run="r",
+        effect_class="tool",
+        grants=frozenset({"private.read"}),
+        budget=1,
+    )
+    with pytest.raises(TicketDenied, match="non-empty lease_id"):
+        kernel.issue(plane, lease_id="")
