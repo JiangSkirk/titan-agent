@@ -2,10 +2,10 @@ name: Release Smoke
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, feature/echo3-orin2-standalone]
     tags: ["v*"]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, feature/echo3-orin2-standalone]
   workflow_dispatch:
 
 env:

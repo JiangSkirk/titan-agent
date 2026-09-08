@@ -411,25 +411,6 @@ class EffectInterpreter:
         if not isinstance(params, Mapping) or isinstance(params, (str, bytes, bytearray)):
             raise TypeError("connector params must be a mapping")
 
-        from orin_guard.kernel.grants import grants_for_tool
-
-        connector_tool = (
-            f"connector.{request.connection.ref.connector_type}.{request.operation}"
-        )
-        self._admit_d1(
-            effect_class="connector",
-            context=context,
-            lease_id=(
-                f"connector:{context.run_id}:"
-                f"{request.connection.ref.connection_id}:{request.operation}:{id(request)}"
-            ),
-            grants=grants_for_tool(
-                connector_tool,
-                resource_scope=str(getattr(request, "scope", "") or ""),
-                context_taint=int(getattr(context, "taint", 0) or 0),
-            ),
-        )
-
         manager = self._connector_manager
         if type(manager) is not ConnectorManager:
             raise RuntimeError("Echo connector manager authority is unavailable")
@@ -460,16 +441,6 @@ class EffectInterpreter:
             ):
                 raise PermissionError("connector directory grant exceeds runtime filesystem roots")
 
-        authority_getter = getattr(self._agent, "_get_echo_tool_lease_authority", None)
-        if not callable(authority_getter):
-            raise RuntimeError("Echo connector lease authority is unavailable")
-        lease_authority = authority_getter()
-        if not is_lease_authority_handle(lease_authority):
-            raise RuntimeError("Echo connector lease authority is invalid")
-        now_fn = getattr(lease_authority, "_now", None)
-        if not callable(now_fn):
-            raise RuntimeError("Echo connector lease authority clock is unavailable")
-        now = int(now_fn())
         expected_tool = f"connector.{request.connection.ref.connector_type}.{request.operation}"
         expected_scope = f"connection:{request.connection.ref.connection_id}:{request.scope}"
         expected_fs_roots = () if grant is None else (grant.root,)
@@ -493,6 +464,18 @@ class EffectInterpreter:
             }
             approvals.validate_approved_binding(request.approval_id, **approval_kwargs)
 
+        # Request-seal check only (no LeaseAuthority consume). EffectAuthority is
+        # the single stamp/consume chain for connector effects.
+        authority_getter = getattr(self._agent, "_get_echo_tool_lease_authority", None)
+        if not callable(authority_getter):
+            raise RuntimeError("Echo connector lease authority is unavailable")
+        lease_authority = authority_getter()
+        if not is_lease_authority_handle(lease_authority):
+            raise RuntimeError("Echo connector lease authority is invalid")
+        now_fn = getattr(lease_authority, "_now", None)
+        if not callable(now_fn):
+            raise RuntimeError("Echo connector lease authority clock is unavailable")
+        now = int(now_fn())
         lease_authority.verify_bound(
             request.lease,
             expected_product_id=request.task_ref.legacy_product_id,
@@ -511,115 +494,73 @@ class EffectInterpreter:
             require_single_use=True,
         )
 
-        # Task 5 inserts the durable connector outbox/claim at this exact point.
-        # R4-A has no production I/O implementation, so consuming authority here
-        # can only reach the fail-closed local declarations or the isolated Fake.
         if approvals is not None and approval_kwargs is not None:
             assert request.approval_id is not None
             approvals.consume_approved_binding(request.approval_id, **approval_kwargs)
 
-        # Two-phase Echo anchor: record pending intent before consume.
-        # First, check if Echo already has a finalized anchor for this lease
-        # (detects valid-prefix rollback of the lease ledger alone).
-        # Echo must be available -- fail closed if it is not.
-        echo_service = getattr(self._agent, "_echo_safety_service", None)
-        if echo_service is None:
-            return ConnectorRunOutcomeV1(
-                success=False,
+        from orin_guard.kernel.grants import grants_for_tool
+
+        from js.echo.effect_bind import (
+            require_effect_exec_receipt,
+            reset_effect_exec_receipt,
+            set_effect_exec_receipt,
+        )
+
+        # Stable D1 lease id from the sealed CapabilityLease (single-use admit).
+        d1_lease_id = f"connector:{request.lease.lease_id}:{request.lease.nonce}"
+        d1_receipt = self._admit_d1(
+            effect_class="connector",
+            context=context,
+            lease_id=d1_lease_id,
+            grants=grants_for_tool(
+                expected_tool,
+                resource_scope=str(getattr(request, "scope", "") or ""),
+                context_taint=int(getattr(context, "taint", 0) or 0),
+            ),
+        )
+        bind = set_effect_exec_receipt(d1_receipt)
+        try:
+            # Same gate as tools: naked connector dispatch without D1 receipt is denied.
+            bound = require_effect_exec_receipt()
+            if self._dispatch_issuer is None:
+                return ConnectorRunOutcomeV1(
+                    success=False,
+                    connector_type=request.connection.ref.connector_type,
+                    effects=(),
+                    artifact_refs=(),
+                    attention_items=(),
+                    receipt_id="",
+                    error_code="connector_runtime_authority_required",
+                )
+            context_fingerprint = ""
+            if self._runtime_authority is not None:
+                context_fingerprint = self._runtime_authority._context_fingerprint(context)
+            capability = self._dispatch_issuer.issue(
+                authority_hash=request.authority_binding_hash(),
+                context_fingerprint=context_fingerprint,
+                appshell_operation_id=(operation.operation_id if operation else None),
+                approval_claim_receipt_hash=None,
+                lease_consume_receipt_hash=bound.consume_receipt_hash,
                 connector_type=request.connection.ref.connector_type,
-                effects=(),
-                artifact_refs=(),
-                attention_items=(),
-                receipt_id="",
-                error_code="echo_safety_service_unavailable",
+                operation=request.operation,
             )
-        existing_anchor = echo_service.lookup_lease_consume_anchor(
-            tenant_id=request.task_ref.owner,
-            product_id=request.task_ref.legacy_product_id,
-            session_id=request.task_ref.session,
-            lease_id=request.lease.lease_id,
-            nonce=request.lease.nonce,
-        )
-        if existing_anchor is not None:
-            raise PermissionError("lease consume anchor detects valid-prefix rollback")
-        echo_service.record_lease_consume_pending(
-            tenant_id=request.task_ref.owner,
-            product_id=request.task_ref.legacy_product_id,
-            session_id=request.task_ref.session,
-            run_id=request.task_ref.run,
-            lease_id=request.lease.lease_id,
-            nonce=request.lease.nonce,
-        )
-
-        consume_receipt = lease_authority.consume_bound(
-            request.lease,
-            expected_product_id=request.task_ref.legacy_product_id,
-            expected_owner=request.task_ref.owner,
-            expected_session=request.task_ref.session,
-            expected_run=request.task_ref.run,
-            expected_tool=expected_tool,
-            expected_args_schema=request.authority_binding_hash(),
-            expected_resource_scope=expected_scope,
-            expected_fs_roots=expected_fs_roots,
-            expected_network_policy="deny",
-            expected_network_hosts=(),
-            expected_max_bytes=10 * 1024 * 1024,
-            expected_max_duration_ms=30_000,
-            now=now,
-            require_single_use=True,
-        )
-
-        # Phase 2: finalize the Echo anchor with the consume receipt hash
-        echo_service.record_lease_consume_finalized(
-            tenant_id=request.task_ref.owner,
-            product_id=request.task_ref.legacy_product_id,
-            session_id=request.task_ref.session,
-            run_id=request.task_ref.run,
-            lease_id=request.lease.lease_id,
-            nonce=request.lease.nonce,
-            consume_receipt_hash=consume_receipt.ledger_record_hash,
-        )
-
-        # Issue per-execution dispatch capability (R4A-I3)
-        if self._dispatch_issuer is None:
+            result = await manager._dispatch_authorized(
+                request,
+                params=actual_params,
+                capability=capability,
+            )
+            error_code = None if result.success else (result.error or "connector_failed")
             return ConnectorRunOutcomeV1(
-                success=False,
-                connector_type=request.connection.ref.connector_type,
-                effects=(),
-                artifact_refs=(),
+                success=result.success,
+                connector_type=result.connector_type,
+                effects=result.effects,
+                artifact_refs=result.artifact_refs,
                 attention_items=(),
-                receipt_id="",
-                error_code="connector_runtime_authority_required",
+                receipt_id=bound.consume_receipt_hash,
+                error_code=error_code,
             )
-        context_fingerprint = ""
-        if self._runtime_authority is not None:
-            context_fingerprint = self._runtime_authority._context_fingerprint(context)
-        capability = self._dispatch_issuer.issue(
-            authority_hash=request.authority_binding_hash(),
-            context_fingerprint=context_fingerprint,
-            appshell_operation_id=(operation.operation_id if operation else None),
-            approval_claim_receipt_hash=None,  # R4-B will bind approval receipt
-            lease_consume_receipt_hash=consume_receipt.ledger_record_hash,
-            connector_type=request.connection.ref.connector_type,
-            operation=request.operation,
-        )
-        result = await manager._dispatch_authorized(
-            request,
-            params=actual_params,
-            capability=capability,
-        )
-        error_code = None if result.success else (result.error or "connector_failed")
-        return ConnectorRunOutcomeV1(
-            success=result.success,
-            connector_type=result.connector_type,
-            effects=result.effects,
-            artifact_refs=result.artifact_refs,
-            attention_items=(),
-            # Task 5 supplies the real EchoLedger receipt. Empty is deliberate
-            # here and never misrepresented as a durable receipt identifier.
-            receipt_id="",
-            error_code=error_code,
-        )
+        finally:
+            reset_effect_exec_receipt(bind)
 
     def _admit_d1(
         self,

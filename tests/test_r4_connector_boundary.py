@@ -443,9 +443,58 @@ async def test_signed_standalone_context_reaches_only_runtime_connector_boundary
     outcome = await runtime.execute_connector_effect(request, params=params, context=context)
 
     assert outcome.success is True
-    assert outcome.receipt_id == ""  # R4-A still has no durable receipt
+    assert outcome.receipt_id  # D1 EffectAuthority consume receipt (single chain)
+    assert outcome.receipt_id.startswith("sha256:")
     assert len(outcome.effects) == 1
     assert outcome.effects[0].effect_type == "read"
+
+    # D1 single-use: same connector request cannot re-admit (before any LeaseAuthority consume).
+    from echo_core.effect_authority import EffectAuthorityError
+
+    with pytest.raises(EffectAuthorityError, match="already issued"):
+        await runtime.execute_connector_effect(request, params=params, context=context)
+
+    # LeaseAuthority must NOT be the consume chain: sealed lease still consumable.
+    authority.consume_bound(
+        request.lease,
+        expected_product_id="js-agent",
+        expected_owner="owner-a",
+        expected_session="session-a",
+        expected_run="run-a",
+        expected_tool="connector.local_import.read",
+        expected_args_schema=request.authority_binding_hash(),
+        expected_resource_scope="connection:import-a:files",
+        expected_fs_roots=(request.directory_grant.root,),
+        expected_network_policy="deny",
+        expected_network_hosts=(),
+        expected_max_bytes=10 * 1024 * 1024,
+        expected_max_duration_ms=30_000,
+        now=1_000,
+        require_single_use=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_connector_replay_denied_by_d1_not_empty_receipt(
+    tmp_path: Path,
+) -> None:
+    """Second connector admit fails on EffectAuthority; outcome never uses empty receipt_id."""
+
+    from echo_core.effect_authority import EffectAuthorityError
+
+    _agent, runtime, context, authority, _store, _principal, _token = _runtime_bundle(tmp_path)
+    source_file = tmp_path / "workspace" / "source.txt"
+    source_file.write_text("once", encoding="utf-8")
+    params = {"path": "source.txt"}
+    request = _read_request(context, authority, params=params)
+
+    first = await runtime.execute_connector_effect(request, params=params, context=context)
+    assert first.success is True
+    assert first.receipt_id
+    assert first.receipt_id != ""
+
+    with pytest.raises(EffectAuthorityError, match="already issued"):
+        await runtime.execute_connector_effect(request, params=params, context=context)
 
 
 class _IpcLeaseAdapter:
@@ -540,10 +589,10 @@ async def test_write_consumes_exact_manual_approval_and_lease_once(
     outcome = await runtime.execute_connector_effect(request, params=params, context=context)
 
     # The connector now has real I/O but the artifact_ref is invalid,
-    # so it fails with an artifact error. The approval and lease were
-    # consumed before the I/O error.
+    # so it fails with an artifact error. Approval + D1 admit ran before I/O.
     assert outcome.success is False
-    # Approval and lease were consumed (cannot replay)
+    assert outcome.receipt_id  # D1 receipt stamped even when connector I/O fails
+    # Approval / D1 lease already used (cannot replay)
     with pytest.raises(PermissionError):
         await runtime.execute_connector_effect(request, params=params, context=context)
 
@@ -594,8 +643,9 @@ async def test_invalid_signed_lease_does_not_consume_exact_approval(
         context=context,
     )
     # Connector fails because artifact_ref is invalid, but approval and
-    # correct lease were consumed.
+    # D1 EffectAuthority admit were consumed for the correct lease.
     assert outcome.success is False
+    assert outcome.receipt_id
 
 
 @pytest.mark.asyncio

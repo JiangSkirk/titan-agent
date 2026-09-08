@@ -1,7 +1,7 @@
-"""Context bind for EffectAuthority D1 receipts on the Host tool hot path.
+"""Context bind for EffectAuthority D1 receipts on the Host effect hot path.
 
-``_execute_tool_call`` refuses naked execution unless an admitted lease receipt
-is bound here by ``EffectInterpreter``.
+``_execute_tool_call`` and connector dispatch refuse naked execution unless an
+admitted lease receipt is bound here by ``EffectInterpreter``.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def require_effect_exec_receipt() -> LeaseReceipt:
     receipt = _effect_exec_receipt.get()
     if receipt is None:
         raise EffectAuthorityError(
-            "naked tool execution bypasses Echo EffectAuthority; D1 receipt required"
+            "naked effect execution bypasses Echo EffectAuthority; D1 receipt required"
         )
     return receipt
 

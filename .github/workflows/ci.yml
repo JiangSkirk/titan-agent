@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, feature/echo3-orin2-standalone]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, feature/echo3-orin2-standalone]
 
 env:
   UV_VERSION: "0.11.24"

@@ -383,3 +383,74 @@ def test_effect_bind_receipt_roundtrip(tmp_path: Path) -> None:
         reset_effect_exec_receipt(handle)
     with pytest.raises(EffectAuthorityError):
         require_effect_exec_receipt()
+
+
+def test_connector_path_requires_d1_receipt_not_lease_consume() -> None:
+    """Connector hot path must bind EffectAuthority receipt; no empty receipt_id fallback."""
+
+    source = (REPO_ROOT / "js" / "echo" / "effect_interpreter.py").read_text(encoding="utf-8")
+    # Single D1 chain: admit + require_exec / effect_bind, not LeaseAuthority.consume_bound.
+    assert "require_effect_exec_receipt" in source
+    assert "set_effect_exec_receipt" in source
+    assert "effect_class=\"connector\"" in source or "effect_class='connector'" in source
+    # Old dual chain must not remain on the connector admit path.
+    connector_fn = source.split("async def _execute_connector_admitted", 1)[1].split(
+        "def _admit_d1", 1
+    )[0]
+    assert "consume_bound" not in connector_fn
+    assert "receipt_id=\"\"" not in connector_fn or "connector_runtime_authority_required" in connector_fn
+    assert "bound.consume_receipt_hash" in connector_fn
+    with pytest.raises(EffectAuthorityError, match="bypasses Echo EffectAuthority"):
+        require_effect_exec_receipt()
+
+
+@pytest.mark.asyncio
+async def test_connector_without_effect_authority_denied(tmp_path: Path) -> None:
+    """Interpreter without EffectAuthority refuses connector ambient exec."""
+
+    import time
+    from types import SimpleNamespace
+
+    from js.connectors.manager import build_test_connector_manager
+    from js.echo.effect_interpreter import EffectInterpreter
+    from js.echo.turn_context import RuntimeContext
+
+    class _Auth:
+        def validate_effect_context(self, _context: RuntimeContext, *, effect_kind: str) -> None:
+            assert effect_kind == "connector"
+
+    agent = SimpleNamespace(
+        echo_runtime=None,
+        approvals=None,
+        _get_echo_tool_lease_authority=lambda: None,
+    )
+    runtime_auth = _Auth()
+    agent.echo_runtime = runtime_auth
+    interpreter = EffectInterpreter(
+        agent,
+        runtime_authority=runtime_auth,
+        connector_manager=build_test_connector_manager(),
+        effect_authority=None,
+    )
+    context = RuntimeContext(
+        product_id="js-agent",
+        channel="test",
+        owner_key_hash="owner-a",
+        session_id="session-a",
+        run_id="run-a",
+        role="user",
+        profile="default",
+        capabilities=(),
+        workspace=tmp_path / "workspace",
+        state_dir=tmp_path / "state",
+        fs_roots=(tmp_path / "workspace",),
+        deadline_ms=int(time.monotonic() * 1000) + 900_000,
+    )
+    with pytest.raises(EffectAuthorityError, match="not wired|bypasses Echo EffectAuthority|refuse"):
+        # Call _admit_d1 directly: proves connector class cannot ambient-exec.
+        interpreter._admit_d1(
+            effect_class="connector",
+            context=context,
+            lease_id="connector:missing:auth",
+            grants=frozenset({"egress"}),
+        )
