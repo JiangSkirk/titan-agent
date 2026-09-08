@@ -84,6 +84,36 @@ def echo_tool_context() -> Callable[..., ToolExecutionContext]:
 
 
 @pytest.fixture(autouse=True)
+def stage_b_orin_default_opt_out_for_host_tests(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """Keep Host/unit suites on in-process leases unless they opt into Orin.
+
+    Stage B product defaults are ``orin.enabled=true`` / ``orin.enforce=true``.
+    Orin-focused suites under ``tests/orin`` / ``tests/contract`` (and package
+    orin-guard tests) exercise those defaults. Other Host/AppShell/Work tests
+    that assumed pre-Stage-B in-process leases opt out via env without
+    changing Field defaults.
+    """
+
+    path = str(getattr(request, "fspath", "") or "").replace("\\", "/")
+    if any(
+        marker in path
+        for marker in (
+            "/tests/orin/",
+            "/tests/contract/",
+            "/packages/orin-guard/",
+            "/tests/orin_guard/",
+        )
+    ):
+        return
+    if request.node.get_closest_marker("orin_live") is not None:
+        return
+    monkeypatch.setenv("JS_ORIN__ENABLED", "false")
+    monkeypatch.setenv("JS_WORK_ORIN__ENABLED", "false")
+
+
+@pytest.fixture(autouse=True)
 def bind_synthetic_effect_receipt(request: pytest.FixtureRequest):
     """Unit tests may call ``_execute_tool_call`` directly; bind a D1 receipt.
 

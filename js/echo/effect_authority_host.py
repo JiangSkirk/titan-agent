@@ -62,10 +62,12 @@ def effect_authority_from_agent(agent: Any) -> EffectAuthority:
     chat_only = bool(getattr(settings, "echo_chat_only", False))
     tool_names = getattr(agent, "_current_allowed_tools", None) or set()
     tool_table_empty = len(tool_names) == 0
-    # Stage B product defaults: orin.enabled ∧ orin.enforce (both true).
-    # CHAT_ONLY requires ¬enabled ∧ chat_only ∧ empty tools.
-    enabled = True if orin is None else bool(getattr(orin, "enabled", True))
+    # Stage B: ``orin.enforce`` is the D1 EffectAuthority enforce flag
+    # (default true). ``orin.enabled`` is orind lease routing and must not
+    # collapse D1 into UNWIRED when operators opt out of the daemon
+    # (JS_ORIND=0 / JS_ORIN__ENABLED=false).
     enforce = True if orin is None else bool(getattr(orin, "enforce", True))
+    enabled = True
     if chat_only:
         enabled = False
     return build_host_effect_authority(
