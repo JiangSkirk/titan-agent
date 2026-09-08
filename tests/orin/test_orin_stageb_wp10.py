@@ -120,7 +120,7 @@ def _prepare_local(membrane: CommitMembrane, spec: OperationSpec) -> OperationSn
 
 
 def _finish_receipted(membrane: CommitMembrane, spec: OperationSpec) -> None:
-    membrane.begin_commit(spec.operation_id)
+    membrane.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
     membrane.transition(spec.operation_id, CommitState.COMMITTED)
     membrane.transition(
         spec.operation_id,
@@ -247,7 +247,7 @@ class TestCommitStateGraph:
             assert prepared.permit_id.startswith("permit:")
             assert prepared.permit_sequence >= 1
 
-            committing = membrane.begin_commit(spec.operation_id)
+            committing = membrane.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
             assert committing.state is CommitState.COMMITTING
             assert committing.attempt_count == 1
 
@@ -272,7 +272,7 @@ class TestCommitStateGraph:
         absent = _spec()
         try:
             _prepare_local(membrane, confirmed)
-            membrane.begin_commit(confirmed.operation_id)
+            membrane.begin_commit(confirmed.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
             unknown = membrane.mark_ambiguous(confirmed.operation_id, "connection lost")
             assert unknown.state is CommitState.UNKNOWN_COMMIT
             assert (
@@ -285,18 +285,18 @@ class TestCommitStateGraph:
             )
 
             first_prepare = _prepare_local(membrane, absent)
-            membrane.begin_commit(absent.operation_id)
+            membrane.begin_commit(absent.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
             membrane.mark_ambiguous(absent.operation_id, "ack lost")
             inconclusive = membrane.reconcile(absent.operation_id, "unknown")
             assert inconclusive.state is CommitState.UNKNOWN_COMMIT
             with pytest.raises(InvalidTransition):
-                membrane.begin_commit(absent.operation_id)
+                membrane.begin_commit(absent.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
 
             retry = membrane.reconcile(absent.operation_id, "absent")
             assert retry.state is CommitState.PREPARED
             assert retry.permit_id != first_prepare.permit_id
             assert retry.permit_sequence > first_prepare.permit_sequence
-            assert membrane.begin_commit(absent.operation_id).attempt_count == 2
+            assert membrane.begin_commit(absent.operation_id, lease_id="lease:test", stamp_receipt="stamp:test").attempt_count == 2
         finally:
             membrane.close()
 
@@ -338,12 +338,12 @@ class TestCommitStateGraph:
         try:
             membrane.propose(proposed)
             with pytest.raises(InvalidTransition):
-                membrane.begin_commit(proposed.operation_id)
+                membrane.begin_commit(proposed.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
             with pytest.raises(InvalidTransition):
                 membrane.mark_ambiguous(proposed.operation_id, "not dispatched")
 
             _prepare_local(membrane, committing)
-            membrane.begin_commit(committing.operation_id)
+            membrane.begin_commit(committing.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
             with pytest.raises(InvalidTransition):
                 membrane.reconcile(committing.operation_id, "absent")
         finally:
@@ -377,7 +377,7 @@ def _reach_state(
     )
     if target is CommitState.PREPARED:
         return
-    membrane.begin_commit(spec.operation_id)
+    membrane.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
     if target is CommitState.COMMITTING:
         return
     if target is CommitState.UNKNOWN_COMMIT:
@@ -402,7 +402,7 @@ class TestDurabilityAndIdentity:
         spec = _spec()
         first = _membrane(db_path)
         prepared = _prepare_local(first, spec)
-        first.begin_commit(spec.operation_id)
+        first.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
         first.mark_ambiguous(spec.operation_id, "socket closed after dispatch")
         first.close()
 
@@ -417,7 +417,7 @@ class TestDurabilityAndIdentity:
             assert recovered.attempt_count == 1
             assert recovered.last_error == "socket closed after dispatch"
             with pytest.raises(InvalidTransition):
-                restarted.begin_commit(spec.operation_id)
+                restarted.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
 
             reconciled = restarted.reconcile(spec.operation_id, "absent")
             assert reconciled.state is CommitState.PREPARED
@@ -426,7 +426,7 @@ class TestDurabilityAndIdentity:
 
         restarted_again = _membrane(db_path)
         try:
-            retried = restarted_again.begin_commit(spec.operation_id)
+            retried = restarted_again.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
             assert retried.state is CommitState.COMMITTING
             assert retried.attempt_count == 2
         finally:
@@ -537,12 +537,12 @@ class TestCrashRestartMatrix:
 
             if recovered_state is CommitState.UNKNOWN_COMMIT:
                 with pytest.raises(InvalidTransition):
-                    restarted.begin_commit(spec.operation_id)
+                    restarted.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
                 still_unknown = restarted.reconcile(spec.operation_id, "unknown")
                 assert still_unknown.state is CommitState.UNKNOWN_COMMIT
             elif crash_state in {CommitState.COMMITTED, CommitState.RECEIPTED}:
                 with pytest.raises(InvalidTransition):
-                    restarted.begin_commit(spec.operation_id)
+                    restarted.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
         finally:
             restarted.close()
 
@@ -599,7 +599,7 @@ class TestCrashRestartMatrix:
                 spec.bytes_out,
                 prepared.permit_sequence,
             )
-            prepared_restart.begin_commit(spec.operation_id)
+            prepared_restart.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
         finally:
             prepared_restart.close()
 
@@ -617,7 +617,7 @@ class TestCrashRestartMatrix:
                 prepared.permit_sequence,
             )
             with pytest.raises(InvalidTransition):
-                inflight_restart.begin_commit(spec.operation_id)
+                inflight_restart.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
 
             retry = inflight_restart.reconcile(spec.operation_id, "absent")
             assert retry.state is CommitState.PREPARED
@@ -870,7 +870,7 @@ class TestRecoveryMetadataAndAdmission:
         spec = _spec()
         membrane = _membrane(db_path)
         _prepare_local(membrane, spec)
-        membrane.begin_commit(spec.operation_id)
+        membrane.begin_commit(spec.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
         committed = membrane.transition(
             spec.operation_id,
             CommitState.COMMITTED,
@@ -890,7 +890,7 @@ class TestRecoveryMetadataAndAdmission:
 
         unsafe = _spec()
         _prepare_local(membrane, unsafe)
-        membrane.begin_commit(unsafe.operation_id)
+        membrane.begin_commit(unsafe.operation_id, lease_id="lease:test", stamp_receipt="stamp:test")
         with pytest.raises(ValueError):
             membrane.transition(
                 unsafe.operation_id,

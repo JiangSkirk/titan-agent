@@ -48,7 +48,7 @@ def _proposal(*, effect_class: str = "tool") -> EffectProposal:
     )
 
 
-def _authority(tmp_path: Path, *, wiring: WiringMode = WiringMode.WIRED) -> EffectAuthority:
+def _authority(tmp_path: Path, *, wiring: WiringMode = WiringMode.WIRED_ENFORCE) -> EffectAuthority:
     journal = FileEchoLedger(tmp_path / "stamp.jsonl", mac_key=b"j" * 32)
     guardian = OrinGuardian(GateKernel(b"k" * 32))
     return EffectAuthority(

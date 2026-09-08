@@ -96,11 +96,13 @@ class EffectInterpreter:
         runtime_authority: Any | None = None,
         connector_manager: ConnectorManager | None = None,
         dispatch_issuer: Any | None = None,
+        effect_authority: Any | None = None,
     ) -> None:
         self._agent = agent
         self._runtime_authority = runtime_authority
         self._connector_manager = connector_manager
         self._dispatch_issuer = dispatch_issuer
+        self._effect_authority = effect_authority
 
     async def execute_model(
         self,
@@ -123,6 +125,15 @@ class EffectInterpreter:
         if not callable(authorized_chat):
             raise RuntimeError("Echo model effect requires authorized_model_chat")
 
+        receipt = self._admit_d1(
+            effect_class="model",
+            context=context,
+            lease_id=f"model:{context.run_id}:{id(effect)}",
+            grants=frozenset(),
+        )
+        from js.echo.effect_bind import reset_effect_exec_receipt, set_effect_exec_receipt
+
+        bind = set_effect_exec_receipt(receipt)
         owner_token = set_current_owner_key_hash(context.owner_key_hash)
         context_token = set_runtime_context(context)
         try:
@@ -148,6 +159,7 @@ class EffectInterpreter:
         finally:
             reset_runtime_context(context_token)
             reset_current_owner_key_hash(owner_token)
+            reset_effect_exec_receipt(bind)
 
     async def execute_model_stream(
         self,
@@ -204,6 +216,13 @@ class EffectInterpreter:
             issuer = getattr(router, "_permit_verifier", None)
         if issuer is None or not callable(getattr(issuer, "issue", None)):
             raise RuntimeError("Echo model stream effect requires the runtime permit issuer")
+
+        self._admit_d1(
+            effect_class="model",
+            context=context,
+            lease_id=f"model-stream:{context.run_id}:{id(effect)}",
+            grants=frozenset(),
+        )
 
         def _permit_grant(
             decision: Any,
@@ -304,6 +323,23 @@ class EffectInterpreter:
         if not callable(execute):
             raise RuntimeError("Echo tool effect requires the leased tool executor")
 
+        from orin_guard.kernel.grants import grants_for_tool
+
+        resource_scope = " ".join(str(root) for root in getattr(context, "fs_roots", ()) or ())
+        context_taint = int(getattr(context, "taint", 0) or 0)
+        grants = grants_for_tool(
+            effect.tool_name,
+            resource_scope=resource_scope,
+            context_taint=context_taint,
+        )
+        receipt = self._admit_d1(
+            effect_class="tool",
+            context=context,
+            lease_id=f"tool:{context.run_id}:{effect.tool_name}:{effect.tool_call_id or id(effect)}",
+            grants=grants,
+        )
+        from js.echo.effect_bind import reset_effect_exec_receipt, set_effect_exec_receipt
+
         tool_call = {
             "id": effect.tool_call_id,
             "type": "function",
@@ -312,6 +348,7 @@ class EffectInterpreter:
                 "arguments": effect.arguments_json,
             },
         }
+        bind = set_effect_exec_receipt(receipt)
         owner_token = set_current_owner_key_hash(context.owner_key_hash)
         context_token = set_runtime_context(context)
         try:
@@ -338,6 +375,7 @@ class EffectInterpreter:
         finally:
             reset_runtime_context(context_token)
             reset_current_owner_key_hash(owner_token)
+            reset_effect_exec_receipt(bind)
 
     async def execute_connector(
         self,
@@ -372,6 +410,26 @@ class EffectInterpreter:
             raise TypeError("connector request must be exact ConnectorExecutionRequestV1")
         if not isinstance(params, Mapping) or isinstance(params, (str, bytes, bytearray)):
             raise TypeError("connector params must be a mapping")
+
+        from orin_guard.kernel.grants import grants_for_tool
+
+        connector_tool = (
+            f"connector.{request.connection.ref.connector_type}.{request.operation}"
+        )
+        self._admit_d1(
+            effect_class="connector",
+            context=context,
+            lease_id=(
+                f"connector:{context.run_id}:"
+                f"{request.connection.ref.connection_id}:{request.operation}:{id(request)}"
+            ),
+            grants=grants_for_tool(
+                connector_tool,
+                resource_scope=str(getattr(request, "scope", "") or ""),
+                context_taint=int(getattr(context, "taint", 0) or 0),
+            ),
+        )
+
         manager = self._connector_manager
         if type(manager) is not ConnectorManager:
             raise RuntimeError("Echo connector manager authority is unavailable")
@@ -562,6 +620,35 @@ class EffectInterpreter:
             receipt_id="",
             error_code=error_code,
         )
+
+    def _admit_d1(
+        self,
+        *,
+        effect_class: str,
+        context: RuntimeContext,
+        lease_id: str,
+        grants: frozenset[str],
+    ) -> Any:
+        from echo_core.effect_authority import EffectAuthorityError, EffectProposal
+
+        authority = self._effect_authority
+        if authority is None:
+            authority = getattr(self._runtime_authority, "effect_authority", None)
+        if authority is None:
+            raise EffectAuthorityError(
+                "EffectAuthority is not wired; refuse ambient Interpreter.exec"
+            )
+        proposal = EffectProposal(
+            owner=context.owner_key_hash or "owner",
+            session=context.session_id or "session",
+            run=context.run_id or "run",
+            effect_class=effect_class,
+            grants=grants,
+            budget=1,
+        )
+        receipt = authority.admit_effect(proposal, lease_id=lease_id)
+        authority.require_exec(lease_id)
+        return receipt
 
     @staticmethod
     async def _call_before_deadline(

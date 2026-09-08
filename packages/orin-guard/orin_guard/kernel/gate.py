@@ -17,6 +17,7 @@ ALLOWED_EFFECTS: Final[frozenset[str]] = frozenset(
 )
 # Tool-class sinks must bind a non-empty lease_id into the stamp MAC.
 LEASE_BOUND_EFFECTS: Final[frozenset[str]] = frozenset({"tool", "connector"})
+CHAT_ONLY_TICKET_PREFIX: Final[str] = "chat_only:"
 
 
 class KernelUnavailable(RuntimeError):
@@ -107,7 +108,13 @@ class GateKernel:
             raise TicketDenied("learn.widen requires an explicit owner grant")
         stamp = now if now is not None else time.time()
         nonce = secrets.token_hex(16)
-        ticket_id = hashlib.sha256(f"{plane.owner}:{plane.run}:{nonce}".encode()).hexdigest()
+        # CHAT_ONLY tickets are pinned exactly to chat_only:{lease_id}.
+        if lease_id.startswith(CHAT_ONLY_TICKET_PREFIX):
+            ticket_id = lease_id
+        else:
+            ticket_id = hashlib.sha256(f"{plane.owner}:{plane.run}:{nonce}".encode()).hexdigest()
+        if ticket_id in self._live or ticket_id in self._consumed:
+            raise TicketDenied("ticket id already issued")
         digest = grants_digest(plane.grants)
         mac = hmac.new(
             self._key,
@@ -190,6 +197,7 @@ class GateKernel:
 
 __all__ = [
     "ALLOWED_EFFECTS",
+    "CHAT_ONLY_TICKET_PREFIX",
     "LEASE_BOUND_EFFECTS",
     "EffectTicket",
     "GateKernel",

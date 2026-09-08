@@ -989,8 +989,18 @@ class CommitMembrane:
             )
             return _snapshot(self._row(connection, operation_id))
 
-    def begin_commit(self, operation_id: str) -> OperationSnapshot:
+    def begin_commit(
+        self,
+        operation_id: str,
+        *,
+        lease_id: str = "",
+        stamp_receipt: str = "",
+    ) -> OperationSnapshot:
         self._require_enabled()
+        if not isinstance(lease_id, str) or not lease_id:
+            raise InvalidTransition("commit requires lease_id anchor")
+        if not isinstance(stamp_receipt, str) or not stamp_receipt:
+            raise InvalidTransition("commit requires stamp_receipt anchor")
         now_ms = self._now()
         with self._transaction() as connection:
             row = self._row(connection, operation_id)

@@ -27,10 +27,29 @@ class _TestRuntimeAuthority:
         assert effect_kind in {"model", "tool"}
 
 
-def _interpreter(agent: Any) -> EffectInterpreter:
+def _interpreter(agent: Any, *, tmp_path: Path | None = None) -> EffectInterpreter:
+    from echo_core.effect_authority import EffectAuthority, WiringMode
+    from echo_core.ledger.journal import FileEchoLedger
+    from orin_guard.kernel.gate import GateKernel
+
+    from js.echo.guardian_adapter import OrinGuardian
+    from js.echo.ledger_append_adapter import FileEchoLedgerAppend
+
     authority = _TestRuntimeAuthority()
     agent.echo_runtime = authority
-    return EffectInterpreter(agent, runtime_authority=authority)
+    stamp_root = tmp_path if tmp_path is not None else Path("/tmp/echo-effect-authority-tests")
+    stamp_root.mkdir(parents=True, exist_ok=True)
+    journal = FileEchoLedger(stamp_root / "stamp.jsonl", mac_key=b"j" * 32)
+    effect_authority = EffectAuthority(
+        guardian=OrinGuardian(GateKernel(b"k" * 32)),
+        ledger=FileEchoLedgerAppend(journal),
+        wiring=WiringMode.WIRED_ENFORCE,
+    )
+    return EffectInterpreter(
+        agent,
+        runtime_authority=authority,
+        effect_authority=effect_authority,
+    )
 
 
 def _context(
@@ -167,7 +186,7 @@ async def test_model_effect_uses_authorized_boundary_and_binds_context(tmp_path:
         )
 
     agent = SimpleNamespace(authorized_model_chat=authorized_model_chat)
-    interpreter = _interpreter(agent)
+    interpreter = _interpreter(agent, tmp_path=tmp_path)
     context = _context(tmp_path)
 
     response = await interpreter.execute_model(
@@ -201,7 +220,7 @@ async def test_stream_model_effect_owns_router_call_and_binds_context(tmp_path: 
     async def after_model_call(*_args: Any) -> None:
         return None
 
-    interpreter = _interpreter(SimpleNamespace(router=Router()))
+    interpreter = _interpreter(SimpleNamespace(router=Router()), tmp_path=tmp_path)
     context = _context(tmp_path)
 
     events = [
@@ -233,7 +252,10 @@ async def test_model_effect_enforces_runtime_deadline_during_provider_call(
         await never.wait()
         raise AssertionError("unreachable")
 
-    interpreter = _interpreter(SimpleNamespace(authorized_model_chat=authorized_model_chat))
+    interpreter = _interpreter(
+        SimpleNamespace(authorized_model_chat=authorized_model_chat),
+        tmp_path=tmp_path,
+    )
     context = _context(
         tmp_path,
         deadline_ms=int(time.monotonic() * 1000) + 40,
@@ -270,7 +292,7 @@ async def test_stream_model_effect_enforces_one_turn_deadline_while_waiting(
     async def after_model_call(*_args: Any) -> None:
         return None
 
-    interpreter = _interpreter(SimpleNamespace(router=Router()))
+    interpreter = _interpreter(SimpleNamespace(router=Router()), tmp_path=tmp_path)
     context = _context(
         tmp_path,
         deadline_ms=int(time.monotonic() * 1000) + 40,
@@ -300,7 +322,7 @@ async def test_tool_effect_uses_leased_executor_and_runtime_capabilities(tmp_pat
         )
     )
     agent = SimpleNamespace(_execute_tool_call=execute)
-    interpreter = _interpreter(agent)
+    interpreter = _interpreter(agent, tmp_path=tmp_path)
     context = _context(tmp_path, capabilities=("file_list",))
 
     _message, result = await interpreter.execute_tool(
@@ -329,7 +351,10 @@ async def test_tool_effect_enforces_runtime_deadline_during_handler_call(
         await never.wait()
         raise AssertionError("unreachable")
 
-    interpreter = _interpreter(SimpleNamespace(_execute_tool_call=execute))
+    interpreter = _interpreter(
+        SimpleNamespace(_execute_tool_call=execute),
+        tmp_path=tmp_path,
+    )
     context = _context(
         tmp_path,
         capabilities=("file_list",),
@@ -355,7 +380,7 @@ async def test_tool_effect_enforces_runtime_deadline_during_handler_call(
 @pytest.mark.asyncio
 async def test_tool_effect_cannot_widen_runtime_capabilities(tmp_path: Path) -> None:
     agent = SimpleNamespace(_execute_tool_call=AsyncMock())
-    interpreter = _interpreter(agent)
+    interpreter = _interpreter(agent, tmp_path=tmp_path)
 
     with pytest.raises(PermissionError, match="outside"):
         await interpreter.execute_tool(
@@ -380,7 +405,7 @@ async def test_tool_effect_denies_when_either_capability_set_is_empty(
     effect_capabilities: tuple[str, ...],
 ) -> None:
     agent = SimpleNamespace(_execute_tool_call=AsyncMock())
-    interpreter = _interpreter(agent)
+    interpreter = _interpreter(agent, tmp_path=tmp_path)
 
     with pytest.raises(PermissionError, match="outside"):
         await interpreter.execute_tool(

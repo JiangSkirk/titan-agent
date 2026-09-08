@@ -20,6 +20,7 @@ from echo_core.spi.ledger_append import LedgerAppendPort
 
 STAMP_RECEIPT_RECORD_TYPE: Final[str] = "stamp_receipt"
 LEASE_RECEIPT_RECORD_TYPE: Final[str] = "lease_consume_receipt"
+CHAT_ONLY_TICKET_PREFIX: Final[str] = "chat_only:"
 
 
 class TicketPhase(StrEnum):
@@ -31,13 +32,16 @@ class TicketPhase(StrEnum):
 class WiringMode(StrEnum):
     """Host guardian wiring classification.
 
-    Precedence: ``CHAT_ONLY ≻ UNWIRED``.
-    ``UNWIRED = enabled=false ∧ ¬chat_only``.
+    Priority: ``CHAT_ONLY ≻ WIRED_ENFORCE ≻ ILLEGAL ≻ UNWIRED``.
+
+    CHAT_ONLY requires ``chat_only=true ∧ enabled=false ∧ empty tool table``.
+    ``enabled=true ∧ chat_only=true`` is never CHAT_ONLY.
     """
 
     CHAT_ONLY = "CHAT_ONLY"
+    WIRED_ENFORCE = "WIRED_ENFORCE"
+    ILLEGAL = "ILLEGAL"
     UNWIRED = "UNWIRED"
-    WIRED = "WIRED"
 
 
 class EffectAuthorityError(PermissionError):
@@ -83,14 +87,36 @@ class LeaseReceipt:
     phase: TicketPhase = TicketPhase.CONSUMED
 
 
-def classify_wiring(*, enabled: bool, chat_only: bool) -> WiringMode:
-    """Classify host wiring. CHAT_ONLY outranks UNWIRED."""
+def chat_only_ticket_id(lease_id: str) -> str:
+    """Canonical CHAT_ONLY GateKernel ticket id."""
 
-    if chat_only:
+    if not lease_id:
+        raise EffectAuthorityError("lease_id required")
+    if lease_id.startswith(CHAT_ONLY_TICKET_PREFIX):
+        return lease_id
+    return f"{CHAT_ONLY_TICKET_PREFIX}{lease_id}"
+
+
+def classify_wiring(
+    *,
+    enabled: bool,
+    chat_only: bool,
+    enforce: bool = False,
+    tool_table_empty: bool = True,
+) -> WiringMode:
+    """Classify host wiring with frozen precedence."""
+
+    if chat_only and (not enabled) and tool_table_empty:
         return WiringMode.CHAT_ONLY
-    if not enabled:
-        return WiringMode.UNWIRED
-    return WiringMode.WIRED
+    if enabled and enforce:
+        return WiringMode.WIRED_ENFORCE
+    if enabled and not enforce:
+        return WiringMode.ILLEGAL
+    if chat_only and not tool_table_empty:
+        return WiringMode.ILLEGAL
+    if chat_only and enabled:
+        return WiringMode.ILLEGAL
+    return WiringMode.UNWIRED
 
 
 def require_boot_ok(*, enabled: bool, enforce: bool) -> None:
@@ -106,18 +132,18 @@ class EffectAuthority:
 
     guardian: GuardianSPI
     ledger: LedgerAppendPort
-    wiring: WiringMode = WiringMode.WIRED
+    wiring: WiringMode = WiringMode.WIRED_ENFORCE
     _live: dict[str, PendingLease | StampedLease | LeaseReceipt] = field(
         default_factory=dict, init=False, repr=False
     )
     _stamp_by_lease: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def propose(self, proposal: EffectProposal) -> EffectProposal:
-        self._deny_if_unwired(effect_class=proposal.effect_class)
+        self._deny_if_closed(effect_class=proposal.effect_class)
         return proposal
 
     def issue(self, proposal: EffectProposal, *, lease_id: str) -> PendingLease:
-        self._deny_if_unwired(effect_class=proposal.effect_class)
+        self._deny_if_closed(effect_class=proposal.effect_class)
         if not lease_id:
             raise EffectAuthorityError("lease_id required")
         if lease_id in self._live:
@@ -132,7 +158,14 @@ class EffectAuthority:
             raise EffectAuthorityError("stamp requires a PENDING lease")
         assert isinstance(entry, PendingLease)
         proposal = entry.proposal
-        self._deny_if_unwired(effect_class=proposal.effect_class)
+        self._deny_if_closed(effect_class=proposal.effect_class)
+        # Always bind lease_id into GateKernel MAC. CHAT_ONLY pins ticket id
+        # to exactly chat_only:{lease_id}.
+        bound_lease_id = (
+            chat_only_ticket_id(lease_id)
+            if self.wiring is WiringMode.CHAT_ONLY
+            else lease_id
+        )
         stamp_id = self.guardian.stamp(
             owner=proposal.owner,
             session=proposal.session,
@@ -141,8 +174,14 @@ class EffectAuthority:
             grants=proposal.grants,
             budget=proposal.budget,
             taint=proposal.taint,
-            lease_id=lease_id,
+            lease_id=bound_lease_id,
         )
+        if self.wiring is WiringMode.CHAT_ONLY:
+            expected = chat_only_ticket_id(lease_id)
+            if stamp_id != expected:
+                raise EffectAuthorityError(
+                    f"chat_only stamp_id must be {expected}; host cannot forge"
+                )
         record = self.ledger.append(
             record_type=STAMP_RECEIPT_RECORD_TYPE,
             tenant_id=proposal.owner,
@@ -203,6 +242,19 @@ class EffectAuthority:
         self._live[lease_id] = receipt
         return receipt
 
+    def admit_effect(
+        self,
+        proposal: EffectProposal,
+        *,
+        lease_id: str,
+    ) -> LeaseReceipt:
+        """Run the full D1 chain and return the durable consume receipt."""
+
+        self.propose(proposal)
+        self.issue(proposal, lease_id=lease_id)
+        self.stamp(lease_id)
+        return self.consume(lease_id)
+
     def require_exec(self, lease_id: str) -> LeaseReceipt:
         """Interpreter preflight: durable consume receipt required."""
 
@@ -218,7 +270,9 @@ class EffectAuthority:
         assert isinstance(entry, LeaseReceipt)
         return entry
 
-    def hydrate_from_stamped_row(self, payload: dict[str, Any], *, proposal: EffectProposal) -> StampedLease:
+    def hydrate_from_stamped_row(
+        self, payload: dict[str, Any], *, proposal: EffectProposal
+    ) -> StampedLease:
         """Rebuild live cache from a durable Echo ledger STAMPED row."""
 
         lease_id = str(payload.get("lease_id") or "")
@@ -242,20 +296,18 @@ class EffectAuthority:
         entry = self._live.get(lease_id)
         if entry is None or entry.phase is not TicketPhase.PENDING:
             raise EffectAuthorityError("forge requires PENDING lease")
-        # Host writing a forged stamp id into the ledger without guardian.stamp
-        # must not promote the live lease.
-        if forged_stamp_id and forged_stamp_id not in self._stamp_by_lease.values():
+        expected = chat_only_ticket_id(lease_id)
+        if forged_stamp_id != expected or forged_stamp_id not in self._stamp_by_lease.values():
             raise EffectAuthorityError("host cannot forge PENDING stamp")
         raise EffectAuthorityError("host cannot forge PENDING stamp")
 
-    def _deny_if_unwired(self, *, effect_class: str) -> None:
+    def _deny_if_closed(self, *, effect_class: str) -> None:
+        if self.wiring is WiringMode.ILLEGAL:
+            raise EffectAuthorityError("illegal wiring; refuse ambient effect")
         if self.wiring is WiringMode.UNWIRED:
-            if isinstance(self.guardian, NullGuardian) or effect_class in {"tool", "model", "connector"}:
-                raise GuardianDenied("unwired guardian; refuse ambient effect")
+            raise GuardianDenied("unwired guardian; refuse ambient effect")
         if self.wiring is WiringMode.CHAT_ONLY and effect_class in {"tool", "connector"}:
-            # Chat-only may stamp model/chat tickets via GateKernel; sinks stay closed.
-            if effect_class != "model":
-                raise EffectAuthorityError("chat_only path denies sink effects")
+            raise EffectAuthorityError("chat_only path denies sink effects")
 
 
 def null_unwired_authority() -> EffectAuthority:
@@ -274,6 +326,7 @@ def null_unwired_authority() -> EffectAuthority:
 
 __all__ = [
     "BootDenied",
+    "CHAT_ONLY_TICKET_PREFIX",
     "EffectAuthority",
     "EffectAuthorityError",
     "EffectProposal",
@@ -284,6 +337,7 @@ __all__ = [
     "StampedLease",
     "TicketPhase",
     "WiringMode",
+    "chat_only_ticket_id",
     "classify_wiring",
     "null_unwired_authority",
     "require_boot_ok",

@@ -129,11 +129,15 @@ class EchoRuntime:
             artifact_store=_artifact_store,
         )
         self._dispatch_issuer = self._connector_manager._create_dispatch_issuer()
+        from js.echo.effect_authority_host import effect_authority_from_agent
+
+        self._effect_authority = effect_authority_from_agent(agent)
         self.effects = EffectInterpreter(
             agent,
             runtime_authority=self,
             connector_manager=self._connector_manager,
             dispatch_issuer=self._dispatch_issuer,
+            effect_authority=self._effect_authority,
         )
         self._admission_tasks: dict[asyncio.Task[Any], int] = {}
         self._issued_control_contexts: PrivateHandoffVault[str] = PrivateHandoffVault(
@@ -141,6 +145,10 @@ class EchoRuntime:
             ttl_seconds=300.0,
         )
         self._context_mac_key = secrets.token_bytes(32)
+
+    @property
+    def effect_authority(self) -> Any:
+        return self._effect_authority
 
     @property
     def active_turn_tasks(self) -> tuple[asyncio.Task[Any], ...]:
