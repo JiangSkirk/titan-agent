@@ -551,13 +551,35 @@ var result = HarnessResult(
     finished_utc: ""
 )
 
-func writeResultAndExit(_ code: Int) -> Never {
-    result.finished_utc = utcNow()
+/// Default per-scenario ceiling. One wedged AX walk must not burn the outer
+/// 600s gate budget; prefer failing the scenario as timeout.
+let SCENARIO_HARD_TIMEOUT_SECONDS: TimeInterval = 90
+/// Cold start / restart include waitForSingleListener(100s).
+let SCENARIO_LAUNCH_TIMEOUT_SECONDS: TimeInterval = 120
+
+let resultWriteLock = NSLock()
+
+/// Mid-run durable evidence: write result.json after every scenario so a later
+/// hard kill / outer TimeoutExpired still leaves S1–Sn evidence on disk.
+func flushResult(markFinished: Bool = false) {
+    resultWriteLock.lock()
+    defer { resultWriteLock.unlock() }
+    if markFinished {
+        result.finished_utc = utcNow()
+    }
+    guard !resultPath.isEmpty else { return }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    if !resultPath.isEmpty, let data = try? encoder.encode(result) {
-        try? data.write(to: URL(fileURLWithPath: resultPath))
-    }
+    guard let data = try? encoder.encode(result) else { return }
+    let url = URL(fileURLWithPath: resultPath)
+    // Atomic replace so a kill mid-write cannot leave a torn JSON file.
+    try? data.write(to: url, options: [.atomic])
+}
+
+func writeResultAndExit(_ code: Int) -> Never {
+    flushResult(markFinished: true)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     if let data = try? encoder.encode(result), let s = String(data: data, encoding: .utf8) {
         print(s)
     }
@@ -574,6 +596,7 @@ result.scenarios["accessibility_probe"] = ScenarioResult(
     duration_ms: 0,
     error_code: ax.authorized ? nil : "accessibility_not_authorized"
 )
+flushResult()
 
 if !ax.authorized {
     result.status = "accessibility_not_authorized"
@@ -651,18 +674,80 @@ var appProcess: Process?
 var ownedExtraPids = Set<Int>()
 var capturedBootstrapToken: String?
 
-func scenario(_ name: String, errorCode: String = "assertion_failed", _ fn: () throws -> String) {
+func scenario(
+    _ name: String,
+    errorCode: String = "assertion_failed",
+    timeout: TimeInterval = SCENARIO_HARD_TIMEOUT_SECONDS,
+    _ fn: () throws -> String
+) {
     let start = Date()
+    let gate = NSLock()
+    var finished = false
+
+    let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+    watchdog.schedule(deadline: .now() + timeout, leeway: .milliseconds(100))
+    watchdog.setEventHandler {
+        gate.lock()
+        let alreadyDone = finished
+        if !alreadyDone {
+            finished = true
+        }
+        gate.unlock()
+        guard !alreadyDone else { return }
+        let duration = Date().timeIntervalSince(start) * 1000
+        result.scenarios[name] = ScenarioResult(
+            passed: false,
+            status: "timeout",
+            detail: "scenario hard timeout after \(Int(timeout))s",
+            duration_ms: duration,
+            error_code: "scenario_timeout"
+        )
+        result.ok = false
+        result.status = "failed"
+        print("[TIMEOUT] \(name): hard timeout after \(Int(timeout))s")
+        // Flush BEFORE exit so the Python wrapper can salvage evidence even if
+        // the wedged AX thread never returns and the outer gate must reap us.
+        flushResult(markFinished: true)
+        exit(Int32(EXIT_ASSERT))
+    }
+    watchdog.resume()
+
     do {
         let detail = try fn()
+        gate.lock()
+        let alreadyDone = finished
+        if !alreadyDone {
+            finished = true
+        }
+        gate.unlock()
+        watchdog.cancel()
+        guard !alreadyDone else { return }
         let duration = Date().timeIntervalSince(start) * 1000
-        result.scenarios[name] = ScenarioResult(passed: true, detail: detail, duration_ms: duration, error_code: nil)
+        result.scenarios[name] = ScenarioResult(
+            passed: true, detail: detail, duration_ms: duration, error_code: nil
+        )
         print("[PASS] \(name): \(detail)")
+        flushResult()
     } catch {
+        gate.lock()
+        let alreadyDone = finished
+        if !alreadyDone {
+            finished = true
+        }
+        gate.unlock()
+        watchdog.cancel()
+        guard !alreadyDone else { return }
         let duration = Date().timeIntervalSince(start) * 1000
-        result.scenarios[name] = ScenarioResult(passed: false, status: "failed", detail: "\(error)", duration_ms: duration, error_code: errorCode)
+        result.scenarios[name] = ScenarioResult(
+            passed: false,
+            status: "failed",
+            detail: "\(error)",
+            duration_ms: duration,
+            error_code: errorCode
+        )
         result.ok = false
         print("[FAIL] \(name): \(error)")
+        flushResult()
     }
 }
 
@@ -699,7 +784,11 @@ func waitForSingleListener(proc: Process, timeout: TimeInterval) throws -> Liste
 // Scenarios
 // ---------------------------------------------------------------------------
 
-scenario("cold_start_controlled_env", errorCode: "launch_failed") {
+scenario(
+    "cold_start_controlled_env",
+    errorCode: "launch_failed",
+    timeout: SCENARIO_LAUNCH_TIMEOUT_SECONDS
+) {
     if let forced = targetPidArg {
         // Attach-only mode: never enumerate other apps; require explicit PID.
         let rows = processRows()
@@ -1093,7 +1182,10 @@ scenario("clean_quit_no_orphans", errorCode: "cleanup_failed") {
 }
 
 if result.scenarios["clean_quit_no_orphans"]?.passed == true {
-    scenario("restart_simplified_flow") {
+    scenario(
+        "restart_simplified_flow",
+        timeout: SCENARIO_LAUNCH_TIMEOUT_SECONDS
+    ) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: fullExecutable)
         proc.currentDirectoryURL = URL(fileURLWithPath: launchDir)
@@ -1131,6 +1223,7 @@ if result.scenarios["clean_quit_no_orphans"]?.passed == true {
         duration_ms: 0,
         error_code: "cleanup_failed"
     )
+    flushResult()
 }
 
 // Final cleanup guarantee: KILL is permitted only after clean-quit failure was recorded.
