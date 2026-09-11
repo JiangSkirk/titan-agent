@@ -352,7 +352,7 @@ def test_swift_harness_per_scenario_timeout_and_mid_run_flush() -> None:
 
 
 def test_swift_harness_cold_start_timeout_records_host_and_listener_evidence() -> None:
-    """S2 scenario_timeout / waitForSingleListener fail must record dual-host vs none."""
+    """S2 timeout detail must keep host process inventory separate from LISTEN."""
     source = (
         Path(__file__).resolve().parents[1] / "desktop/tests/harness/tauri_webview_harness.swift"
     ).read_text(encoding="utf-8")
@@ -370,6 +370,10 @@ def test_swift_harness_cold_start_timeout_records_host_and_listener_evidence() -
     assert "stderr_tail=" in source
     assert "ps=" in source
     assert "lsof=" in source
+    # Host PIDs must not be treated as listeners (onefile parent+child).
+    assert "never treat host_count as listener_count" in source
+    assert "Gate on LISTEN count only" in source
+    assert "found.count == 1" in source
     # Watchdog detail must append the evidence blob, not only the bare timeout text.
     assert "scenario hard timeout after \\(Int(timeout))s | \\(evidence)" in source
     assert "no single loopback listener within" in source
@@ -385,20 +389,44 @@ def test_swift_harness_cold_start_timeout_records_host_and_listener_evidence() -
     assert cold.index("appStdoutLogPath = outLog") < cold.index("try waitForSingleListener")
 
 
-def test_parse_listener_wait_evidence_distinguishes_dual_host_from_never_spawned() -> None:
-    dual = (
+def test_parse_listener_wait_evidence_keeps_host_pids_separate_from_listens() -> None:
+    """host_count=2 is onefile inventory; only listener_count diagnoses Ready/double-open."""
+    # 2026091202-shaped: two host PIDs, zero LISTENs → sidecar not Ready (not double-open).
+    not_ready = (
         "scenario hard timeout after 120s | app_running=true "
         "tree_pids=[25649,25654,25656] host_count=2 host_pids=[25654,25656] "
         "listener_count=0 listeners=[] ps=ok lsof=ok stdout_tail= stderr_tail="
     )
-    parsed = gate.parse_listener_wait_evidence(dual)
-    assert parsed["host_count"] == "2"
-    assert parsed["host_pids"] == "[25654,25656]"
-    assert parsed["listener_count"] == "0"
-    assert parsed["listeners"] == "[]"
-    assert parsed["tree_pids"] == "[25649,25654,25656]"
-    assert parsed["ps"] == "ok"
-    assert parsed["lsof"] == "ok"
+    not_ready_parsed = gate.parse_listener_wait_evidence(not_ready)
+    assert not_ready_parsed["host_count"] == "2"
+    assert not_ready_parsed["host_pids"] == "[25654,25656]"
+    assert not_ready_parsed["listener_count"] == "0"
+    assert not_ready_parsed["listeners"] == "[]"
+    assert not_ready_parsed["host_count"] != not_ready_parsed["listener_count"]
+
+    # Onefile parent+child with exactly one LISTEN — normal Ready, not double-open.
+    onefile_ready = (
+        "pid=25649 listener=127.0.0.1:54321 | app_running=true "
+        "tree_pids=[25649,25654,25656] host_count=2 host_pids=[25654,25656] "
+        "listener_count=1 listeners=[127.0.0.1:54321] ps=ok lsof=ok "
+        "stdout_tail= stderr_tail="
+    )
+    ready_parsed = gate.parse_listener_wait_evidence(onefile_ready)
+    assert ready_parsed["host_count"] == "2"
+    assert ready_parsed["listener_count"] == "1"
+    assert ready_parsed["listeners"] == "[127.0.0.1:54321]"
+
+    # Two distinct LISTEN addresses — real double-open (independent of host_count).
+    double_open = (
+        "no single loopback listener within 100s | app_running=true "
+        "tree_pids=[25649,25654,25656] host_count=2 host_pids=[25654,25656] "
+        "listener_count=2 listeners=[127.0.0.1:4001,127.0.0.1:4002] "
+        "ps=ok lsof=ok stdout_tail= stderr_tail="
+    )
+    double_parsed = gate.parse_listener_wait_evidence(double_open)
+    assert double_parsed["host_count"] == "2"
+    assert double_parsed["listener_count"] == "2"
+    assert double_parsed["listeners"] == "[127.0.0.1:4001,127.0.0.1:4002]"
 
     none_host = (
         "no single loopback listener within 100s | app_running=true "
@@ -423,7 +451,7 @@ def test_parse_listener_wait_evidence_distinguishes_dual_host_from_never_spawned
 def test_wrapper_preserves_cold_start_timeout_evidence_fields(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Salvage path must keep enriched S2 detail (host_count / listeners) parseable."""
+    """Salvage path must keep host_count and listener_count as separate fields."""
 
     detail = (
         "scenario hard timeout after 120s | app_running=true "
@@ -456,6 +484,9 @@ def test_wrapper_preserves_cold_start_timeout_evidence_fields(
     assert parsed["host_count"] == "2"
     assert parsed["host_pids"] == "[25654,25656]"
     assert parsed["listener_count"] == "0"
+    assert parsed["listeners"] == "[]"
+    # Explicit contract: two host PIDs are not two listeners.
+    assert parsed["host_count"] != parsed["listener_count"]
     err = capsys.readouterr().err
     assert "preserved result.json" in err
 

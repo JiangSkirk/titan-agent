@@ -352,9 +352,16 @@ func recalledListenerWaitEvidence() -> String {
 }
 
 /// Durable cold-start / listener-wait evidence for result.json detail.
-/// Distinguishes: host never spawned / hosts alive but no unique listener /
-/// multiple listeners / ps or lsof hung. Short probe timeouts so a wedged
-/// lsof on the main thread cannot block the watchdog flush path.
+///
+/// `host_count` / `host_pids` are **process** counts (cmd contains js-agent-host).
+/// PyInstaller onefile often shows parent+child (host_count=2) with a **single**
+/// LISTEN — that is not a double-open. `listener_count` / `listeners` come only
+/// from lsof TCP LISTEN and are recorded separately:
+/// - listener_count=0 → sidecar not Ready (or no bind yet)
+/// - listener_count=1 → unique loopback listener (success path)
+/// - listener_count=2+ → real double-open
+/// Also distinguishes host-never-spawned (host_count=0) and ps/lsof hung.
+/// Short probe timeouts so a wedged lsof cannot block the watchdog flush path.
 func listenerWaitEvidenceFromSnapshot(
     rootPid: Int,
     psStatus: String,
@@ -376,10 +383,12 @@ func listenerWaitEvidenceFromSnapshot(
     } else {
         tree = []
     }
+    // Process inventory only — never treat host_count as listener_count.
     let hostPids = tree.filter { pid in
         guard let (_, _, cmd) = rows[pid] else { return false }
         return cmd.contains("js-agent-host")
     }.sorted()
+    // LISTEN inventory only — independent of how many js-agent-host PIDs exist.
     let listenerAddrs = found
         .map { "\($0.host):\($0.port)" }
         .sorted()
@@ -958,6 +967,8 @@ func waitForSingleListener(proc: Process, timeout: TimeInterval) throws -> Liste
             Thread.sleep(forTimeInterval: 0.25)
             continue
         }
+        // Gate on LISTEN count only. host_count=2 (onefile parent+child) with a
+        // single LISTEN is success; never treat two host PIDs as two listeners.
         if found.count == 1, let first = found.first {
             if first.port == 8765 {
                 throw NSError(
