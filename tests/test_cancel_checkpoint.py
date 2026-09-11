@@ -503,12 +503,13 @@ class TestCancelAPI:
         agent._finalize_run = paused_finalize  # type: ignore[method-assign]
         session_id = "cancel-before-finalizer-commit"
         run_task = asyncio.create_task(agent.run("finish", session_id=session_id))
-        await asyncio.wait_for(finalizer_entered.wait(), timeout=1)
+        # Reach finalizer under full-suite / coverage load can exceed 1s.
+        await asyncio.wait_for(finalizer_entered.wait(), timeout=5)
 
         assert agent.request_cancel(session_id) is True
         assert agent.request_cancel(session_id) is True
         release_finalizer.set()
-        state = await asyncio.wait_for(run_task, timeout=1)
+        state = await asyncio.wait_for(run_task, timeout=5)
 
         assert state.status == "cancelled"
         assert cleanup_finished.is_set()
@@ -555,11 +556,12 @@ class TestCancelAPI:
         agent.memory.store_messages = paused_store_messages  # type: ignore[method-assign]
         session_id = "cancel-after-finalizer-commit"
         run_task = asyncio.create_task(agent.run("finish", session_id=session_id))
-        assert await asyncio.to_thread(cleanup_started.wait, 1)
+        # Terminal cleanup barrier under full-suite load can exceed 1s.
+        assert await asyncio.to_thread(cleanup_started.wait, 5)
 
         assert agent.request_cancel(session_id) is False
         release_cleanup.set()
-        state = await asyncio.wait_for(run_task, timeout=1)
+        state = await asyncio.wait_for(run_task, timeout=5)
 
         assert state.status == "completed"
         lifecycle = agent.lifecycle_store.get(session_id, "local-user")
@@ -761,7 +763,9 @@ class TestGracefulShutdown:
         run_task = asyncio.create_task(agent.run("finish", session_id=session_id))
         close_task: asyncio.Task[None] | None = None
         try:
-            assert await asyncio.to_thread(episode_started.wait, 1)
+            # Finalizer store_episode can take >1s under full-suite load
+            # (test (3.12) run 34623620565: wait,1 returned False before barrier).
+            assert await asyncio.to_thread(episode_started.wait, 5)
             close_task = asyncio.create_task(agent.close())
             await asyncio.sleep(0.05)
 
