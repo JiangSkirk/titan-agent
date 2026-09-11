@@ -14,6 +14,8 @@ def _names(schemas: list[dict[str, object]]) -> list[str]:
 def test_echo_adaptive_tool_schema_keeps_core_tools_for_plain_chat() -> None:
     schemas = [
         _schema("file_read"),
+        _schema("file_search"),
+        _schema("file_edit"),
         _schema("file_delete"),
         _schema("web_search"),
         _schema("web_click"),
@@ -24,12 +26,15 @@ def test_echo_adaptive_tool_schema_keeps_core_tools_for_plain_chat() -> None:
 
     names = _names(_echo_tool_schema_subset("explain this simply", schemas))
 
-    assert names == ["file_read", "web_search"]
+    # Lite boot surface only — web_search is expand-on-demand, not default.
+    assert names == ["file_read", "file_search", "file_edit"]
 
 
 def test_echo_adaptive_tool_schema_expands_when_query_needs_specific_tools() -> None:
     schemas = [
         _schema("file_read"),
+        _schema("file_search"),
+        _schema("file_edit"),
         _schema("file_delete"),
         _schema("web_search"),
         _schema("web_click"),
@@ -47,6 +52,8 @@ def test_echo_adaptive_tool_schema_expands_when_query_needs_specific_tools() -> 
 
     assert names == [
         "file_read",
+        "file_search",
+        "file_edit",
         "web_search",
         "web_click",
         "excel_read",

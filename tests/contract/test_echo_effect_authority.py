@@ -454,3 +454,37 @@ async def test_connector_without_effect_authority_denied(tmp_path: Path) -> None
             lease_id="connector:missing:auth",
             grants=frozenset({"egress"}),
         )
+
+
+def test_no_turn_executor_class_on_merge_target() -> None:
+    """Frozen: TurnExecutor must stay removed from Echo Host runtime sources."""
+
+    offenders: list[str] = []
+    roots = (REPO_ROOT / "js" / "echo", REPO_ROOT / "js" / "agent", ECHO_CORE_ROOT)
+    for root in roots:
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name == "TurnExecutor":
+                    offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert offenders == []
+    runner = (REPO_ROOT / "js" / "agent" / "runner.py").read_text(encoding="utf-8")
+    assert "TurnExecutor" not in runner
+
+
+def test_model_tool_connector_appshell_share_single_d1_admit() -> None:
+    """Model/Tool/Connector effects and AppShell ops share one Interpreter D1 gate."""
+
+    source = (REPO_ROOT / "js" / "echo" / "effect_interpreter.py").read_text(encoding="utf-8")
+    assert 'effect_class="model"' in source or "effect_class='model'" in source
+    assert 'effect_class="tool"' in source or "effect_class='tool'" in source
+    assert 'effect_class="connector"' in source or "effect_class='connector'" in source
+    # AppShell binds epoch operations on the same interpreter; it must not grow
+    # a parallel admit/exec path outside _admit_d1.
+    assert "def _admit_d1(" in source
+    assert source.count("authority.admit_effect(") == 1
+    assert "def _begin_effect_operation(" in source
+    assert "appshell_epoch_binding" in source
+    # No second ambient tool executor entry on the interpreter.
+    assert "async def execute_tool_call" not in source
+    assert "class TurnExecutor" not in source

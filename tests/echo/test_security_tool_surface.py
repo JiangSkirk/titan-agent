@@ -21,6 +21,8 @@ def _names(schemas: list[dict[str, object]]) -> list[str]:
 
 _ALL = [
     _schema("file_read"),
+    _schema("file_search"),
+    _schema("file_edit"),
     _schema("shell"),
     _schema("python"),
     _schema("web_search"),
@@ -41,10 +43,11 @@ class TestEmptyInputToolSurface:
         assert names != _names(_ALL)
         assert "web_click" not in names
 
-    def test_empty_query_keeps_read_only_core(self) -> None:
+    def test_empty_query_keeps_lite_core_only(self) -> None:
         names = _names(_echo_tool_schema_subset("", _ALL))
-        assert "file_read" in names
-        assert "web_search" in names
+        assert names == ["file_read", "file_search", "file_edit"]
+        assert "web_search" not in names
+        assert len(names) <= 5
 
 
 class TestExecToolsRemovedFromCore:
