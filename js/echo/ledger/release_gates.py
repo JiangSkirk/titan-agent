@@ -494,7 +494,11 @@ def validate_release_source_integrity(root: Path) -> None:
         return path.relative_to(resolved_root)
 
     def is_ignored(relative: Path) -> bool:
-        return not _release_source_member_included(relative)
+        # Digest prefixes omit bytes from the hash; integrity still inspects
+        # files under a surface root that is itself prefix-excluded (repo-root
+        # tests/) so empty-package allowlisting keeps working. Nested prefixes
+        # under other surfaces (desktop/tests/harness) stay integrity-ignored.
+        return not _release_source_member_included(relative, for_digest=False)
 
     def validate_file(path: Path) -> None:
         relative = relative_path(path)
@@ -550,10 +554,7 @@ def validate_release_source_integrity(root: Path) -> None:
         return regular_files
 
     for relative in _RELEASE_SOURCE_DIGEST_SURFACES:
-        # Skip exact excludes and prefix-excluded surface roots the same way
-        # (e.g. Path("tests") on SURFACES but in EXCLUDE_PREFIXES must not
-        # fail closed as "tests: empty directory" after every child is ignored).
-        if not _release_source_member_included(relative):
+        if relative in _RELEASE_SOURCE_DIGEST_EXCLUDE:
             continue
         candidate = resolved_root / relative
         try:
@@ -569,7 +570,13 @@ def validate_release_source_integrity(root: Path) -> None:
         elif stat.S_ISREG(mode):
             validate_file(candidate)
         elif stat.S_ISDIR(mode):
-            if walk_directory(candidate) == 0:
+            # Prefix-excluded surface roots (Path("tests")) are still walked for
+            # empty-marker / syntax preflight, but must not fail closed as an
+            # empty directory when every digest byte under them is omitted.
+            if (
+                walk_directory(candidate) == 0
+                and relative not in _RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES
+            ):
                 findings.append(f"{relative.as_posix()}: empty directory")
         else:
             findings.append(f"{relative.as_posix()}: special file")
@@ -3473,14 +3480,19 @@ def _baseline_workload_corpus_digest() -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _release_source_member_included(relative: Path) -> bool:
+def _release_source_member_included(relative: Path, *, for_digest: bool = True) -> bool:
     # Exact paths and directory prefixes are both omitted from the digest.
+    # Integrity (for_digest=False) still inspects surface-root prefixes such as
+    # Path("tests") so empty-package allowlisting works; nested prefixes under
+    # other surfaces (desktop/tests/harness) remain omitted either way.
     if relative in _RELEASE_SOURCE_DIGEST_EXCLUDE:
         return False
-    if any(
-        relative == prefix or prefix in relative.parents
-        for prefix in _RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES
-    ):
+    prefixes = _RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES
+    if not for_digest:
+        prefixes = frozenset(
+            prefix for prefix in prefixes if prefix not in _RELEASE_SOURCE_DIGEST_SURFACES
+        )
+    if any(relative == prefix or prefix in relative.parents for prefix in prefixes):
         return False
     if (
         any(part in _RELEASE_SOURCE_TOOL_CACHE_PARTS for part in relative.parts)

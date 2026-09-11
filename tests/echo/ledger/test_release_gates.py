@@ -34,7 +34,9 @@ from js.echo.ledger.slo_contract import SLO_CONTRACT
 
 _OLD_BASELINE_COMMIT = "65cc545e3ec893f5bab62d356514643f14456a58"
 _OLD_BASELINE_TREE = "679b1172facba3f13af6b32e70bd6b815138ef13"
-_OLD_BASELINE_SOURCE_DIGEST = "3774de07b6652deeef91535a11730da860bf2d8572a81374c07d0b258b4effe5"
+# Recomputed for commit 65cc545 under ECHO-RELEASE-SOURCE-V2 after repo-root
+# tests/ joined EXCLUDE_PREFIXES (packages/*/tests stay digest-bound).
+_OLD_BASELINE_SOURCE_DIGEST = "bbe3722b9abcfddf48138a2dd227ed08eda896e715977598318476b3d20ea490"
 _OLD_BASELINE_UV_LOCK_SHA256 = "ff448bc032a8bf5dc4dd85ddaf3e1b495a95acd1f9ac9a5a7dae83dd94a0c1c8"
 _OLD_BASELINE_IMPORT_ROOT_SHA256 = (
     "52ca898f824bc6698dce23993fa86adfa9c3a56125f799eeda72ebcb8b5991f0"
@@ -956,7 +958,8 @@ def test_harness_webview_gate_mutations_do_not_change_release_source_digest(
             for prefix in rg._RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES
         )
 
-    # Prefix-excluded surface root must not fail closed as empty directory.
+    # Prefix-excluded surface root still gets integrity preflight (empty markers)
+    # but must not fail closed as an empty directory for digest omission alone.
     rg.validate_release_source_integrity(tmp_path)
 
     before = rg.release_source_digest(tmp_path)
