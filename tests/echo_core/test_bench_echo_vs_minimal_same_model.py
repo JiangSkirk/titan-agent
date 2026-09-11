@@ -36,7 +36,10 @@ def test_dry_run_matrix_same_model_lock() -> None:
     echo = next(c for c in cells if c["mode"] == "echo")
     assert minimal["advertised_tools"] == []
     assert "file_edit" in echo["advertised_tools"]
+    assert "file_write" not in echo["advertised_tools"]
+    assert "web_search" not in echo["advertised_tools"]
     assert "shell" not in echo["advertised_tools"]
+    assert len(echo["advertised_tools"]) <= 5
 
 
 def test_build_fixture_modes() -> None:

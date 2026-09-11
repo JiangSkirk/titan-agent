@@ -7,15 +7,38 @@ from typing import Any
 from echo_core.deepseek_v4_protocol import (
     DEFAULT_CORE_TOOL_NAMES,
     EXPAND_ON_DEMAND_EXEC_TOOL_NAMES,
+    EXPAND_ON_DEMAND_META_TOOL_NAMES,
 )
 
-# Pinned by echo_core.deepseek_v4_protocol (DeepSeek V4 same-model lock).
+# Pinned by echo_core.deepseek_v4_protocol (DeepSeek V4 lite boot surface ≤5).
 _ECHO_CORE_TOOL_NAMES = set(DEFAULT_CORE_TOOL_NAMES)
-# F-14: execution tools are NOT part of the always-on core subset.  They are
-# only advertised when the operator opts in via
-# ``SecurityConfig.echo_exec_tools`` (or the query explicitly needs them).
+# F-14 / v0.4.1: execution tools are NOT part of the always-on lite subset.
+# Advertised only when the operator opts in via ``SecurityConfig.echo_exec_tools``.
 _ECHO_EXEC_TOOL_NAMES = set(EXPAND_ON_DEMAND_EXEC_TOOL_NAMES)
+# Meta expand-on-demand names (write/list/view/code_search/web_search) — never boot default.
+_ECHO_META_EXPAND_TOOL_NAMES = set(EXPAND_ON_DEMAND_META_TOOL_NAMES)
 _ECHO_DELETE_TERMS = ("delete", "remove", "rm ", "unlink", "删除", "删掉", "移除")
+_ECHO_WRITE_TERMS = (
+    "write",
+    "create file",
+    "new file",
+    "overwrite",
+    "save to",
+    "写入",
+    "创建文件",
+    "新建",
+)
+_ECHO_LIST_VIEW_TERMS = (
+    "list",
+    "ls ",
+    "directory",
+    "tree",
+    "view file",
+    "目录",
+    "列出",
+    "查看文件",
+)
+_ECHO_CODE_SEARCH_TERMS = ("code search", "grep", "regex", "ripgrep", "代码搜索", "正则")
 _ECHO_WEB_TERMS = (
     "http://",
     "https://",
@@ -60,14 +83,13 @@ def _echo_tool_schema_subset(
     """Select a lower-token Echo tool schema for the current turn.
 
     The full registry is still available to the agent runtime; this only trims
-    what is advertised to the model for a single provider call.  Core tools stay
-    visible, while high-volume browser/office/skill schemas are included only
-    when the user request gives a direct signal that they are useful.
+    what is advertised to the model for a single provider call.  Lite core tools
+    stay visible (≤5), while meta expand-on-demand / browser / office / skill
+    schemas are included only when the user request gives a direct signal.
 
-    F-14: an empty/blank query gets ONLY the core subset (fail-closed: the
-    model receives the minimum tool surface, never the full registry), and
-    execution tools (shell/python) are advertised only when
-    ``allow_exec_tools`` is set by explicit configuration.
+    F-14 / v0.4.1: an empty/blank query gets ONLY the lite core subset
+    (fail-closed: never the full registry), and execution tools (shell/python)
+    are advertised only when ``allow_exec_tools`` is set by explicit configuration.
     """
     if not schemas:
         return schemas
@@ -89,6 +111,9 @@ def _echo_tool_schema_subset(
     needs_packing = _query_has_any(query_l, _ECHO_PACKING_TERMS)
     needs_routine = _query_has_any(query_l, _ECHO_ROUTINE_TERMS)
     needs_delete = _query_has_any(query_l, _ECHO_DELETE_TERMS)
+    needs_write = _query_has_any(query_l, _ECHO_WRITE_TERMS)
+    needs_list_view = _query_has_any(query_l, _ECHO_LIST_VIEW_TERMS)
+    needs_code_search = _query_has_any(query_l, _ECHO_CODE_SEARCH_TERMS)
     needs_skill = "skill" in query_l or "技能" in query_l
     selected: list[dict[str, Any]] = []
     for schema in schemas:
@@ -96,6 +121,9 @@ def _echo_tool_schema_subset(
         if (
             name in core_names
             or (name == "file_delete" and needs_delete)
+            or (name == "file_write" and needs_write and name in _ECHO_META_EXPAND_TOOL_NAMES)
+            or (name in {"file_list", "file_view"} and needs_list_view)
+            or (name == "code_search" and needs_code_search)
             or ((name.startswith("web_") or name.startswith("browser")) and needs_web)
             or ((name.startswith("excel") or name.startswith("csv")) and needs_office)
             or (name.startswith("word") and needs_word)
