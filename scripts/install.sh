@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 #
 # JS Agent macOS One-Click Installer
-# Usage:
+# Usage (preferred, offline-friendly):
 #   cd /path/to/titan-agent && bash scripts/install.sh
-#   or: curl -sSL https://raw.githubusercontent.com/.../install.sh | bash
+#
+# Do NOT pipe remote scripts into a shell. Download install.sh from a trusted
+# source, verify it locally, then run it. Remote ``curl | sh`` install paths
+# are intentionally unsupported until a pinned checksum/signature is published.
 #
 set -euo pipefail
 
@@ -50,14 +53,25 @@ else
     log_step "将以远程模式安装到: $SOURCE_DIR"
 fi
 
+# Remote mode is fail-closed until a pinned artifact + checksum/signature exists.
+if [[ "$RUN_MODE" == "remote" ]]; then
+    log_err "远程安装模式已禁用：缺少可信制品、摘要或签名钉扎。"
+    log_err "请在已校验的本地仓库目录中运行: bash scripts/install.sh"
+    exit 1
+fi
+
 # ───────────────────────────────────────────────
 # 2. Check macOS
 # ───────────────────────────────────────────────
 if [[ "$OSTYPE" != "darwin"* ]]; then
     log_warn "当前不是 macOS 系统。此脚本主要针对 macOS 优化。"
-    read -p "是否继续? (y/n) " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    if [[ -t 0 ]]; then
+        read -p "是否继续? (y/n) " -n 1 -r
+        echo
+        [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    else
+        log_warn "非交互环境：跳过确认并继续前置检查。"
+    fi
 fi
 
 # ───────────────────────────────────────────────
@@ -66,7 +80,7 @@ fi
 log_step "检查 Python 环境..."
 
 is_supported_python() {
-    "$1" -c "import sys; v=sys.version_info; exit(0 if ('$PYTHON_MIN' <= f'{v.major}.{v.minor}' < '$PYTHON_MAX') else 1)" 2>/dev/null
+    PYTHONNOUSERSITE=1 "$1" -c "import sys; v=sys.version_info; exit(0 if ('$PYTHON_MIN' <= f'{v.major}.{v.minor}' < '$PYTHON_MAX') else 1)" 2>/dev/null
 }
 
 find_python() {
@@ -89,8 +103,28 @@ PYTHON_BIN="$(find_python)" || {
     exit 1
 }
 
-PYTHON_VERSION="$($PYTHON_BIN -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    PYTHON_VERSION="$(PYTHONNOUSERSITE=1 "$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 log_ok "Python $PYTHON_VERSION 可用"
+
+# ───────────────────────────────────────────────
+# 4. Check uv and frozen lock (required even for DRY_RUN)
+# ───────────────────────────────────────────────
+log_step "检查 uv 包管理器..."
+if command -v uv >/dev/null 2>&1; then
+    log_ok "uv 已安装"
+else
+    log_err "未找到 uv。请从 https://github.com/astral-sh/uv/releases 下载已验证的发行版并安装后重试。"
+    log_err "本安装器不会通过 curl|sh 拉取远程脚本（缺少钉扎摘要/签名）。"
+    exit 1
+fi
+
+cd "$SOURCE_DIR"
+
+if [[ ! -f "uv.lock" ]]; then
+    log_err "缺少 uv.lock；无法执行冻结依赖安装。"
+    exit 1
+fi
+log_ok "uv.lock 存在"
 
 if [[ "$DRY_RUN" == "1" ]]; then
     log_warn "干运行模式 — 仅检查，不执行安装"
@@ -100,40 +134,19 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 # ───────────────────────────────────────────────
-# 4. Install uv (if not present)
-# ───────────────────────────────────────────────
-log_step "检查 uv 包管理器..."
-if command -v uv >/dev/null 2>&1; then
-    log_ok "uv 已安装"
-else
-    log_step "安装 uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    # Source uv for current session
-    export PATH="$HOME/.local/bin:$PATH"
-    if command -v uv >/dev/null 2>&1; then
-        log_ok "uv 安装成功"
-    else
-        log_warn "uv 安装可能需要重新打开终端才能使用"
-    fi
-fi
-
-# ───────────────────────────────────────────────
-# 5. Create venv and install
+# 5. Create venv and install from frozen lock
 # ───────────────────────────────────────────────
 log_step "创建虚拟环境..."
-cd "$SOURCE_DIR"
 
 if [[ ! -d ".venv" ]]; then
-    "$PYTHON_BIN" -m venv .venv
+    PYTHONNOUSERSITE=1 "$PYTHON_BIN" -m venv .venv
 fi
 log_ok "虚拟环境就绪"
 
-log_step "安装依赖..."
-if command -v uv >/dev/null 2>&1; then
-    uv pip install -e "." 2>&1 | grep -v "^Resolved\|^Prepared\|^Installed\|^Audited" || true
-else
-    .venv/bin/python -m pip install --upgrade pip >/dev/null 2>&1
-    .venv/bin/python -m pip install -e "." >/dev/null 2>&1
+log_step "安装依赖 (uv sync --frozen)..."
+if ! uv sync --frozen; then
+    log_err "依赖安装失败（uv sync --frozen）。"
+    exit 1
 fi
 log_ok "依赖安装完成"
 
@@ -142,7 +155,10 @@ log_ok "依赖安装完成"
 # ───────────────────────────────────────────────
 log_step "运行首次配置向导..."
 if [[ ! -f "$HOME/.config/js/config.yaml" ]]; then
-    .venv/bin/python -m js setup -y
+    if ! .venv/bin/python -m js setup -y; then
+        log_err "首次配置向导失败"
+        exit 1
+    fi
     log_ok "配置完成"
 else
     log_ok "配置文件已存在，跳过"
@@ -161,9 +177,9 @@ SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SOURCE_DIR"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
-echo "Starting JS Agent Web UI..."
-echo "Open http://${HOST}:${PORT} in your browser"
-.venv/bin/python -m js open --host "$HOST" --port "$PORT"
+echo "Preparing JS Agent..."
+echo "Open the JS Agent desktop app."
+echo "Local Host (does not open a browser): .venv/bin/python -m js appshell --no-browser --host ${HOST} --port ${PORT}"
 EOF
 chmod +x "$SOURCE_DIR/start.sh"
 
@@ -232,16 +248,11 @@ echo -e "${GREEN}  JS Agent 安装完成!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 echo "启动方式:"
-echo "  1. 双击启动: ~/Applications/JS Agent.app"
-echo "  2. 命令行启动: $SOURCE_DIR/start.sh"
-echo "  3. CLI 命令: js-agent (如果 ~/.local/bin 在 PATH 中)"
-echo ""
-echo "Web UI 地址: http://127.0.0.1:8000"
+echo "  1. 打开 JS Agent 桌面应用"
+echo "  2. 命令行 CLI: js-agent (如果 ~/.local/bin 在 PATH 中)"
+echo "  3. 本机 Host（不打开浏览器）: $SOURCE_DIR/.venv/bin/python -m js appshell"
 echo ""
 
 # Ask to start
-read -p "是否立即启动? (y/n) " -n 1 -r
+read -p "配置已完成。请打开 JS Agent 桌面应用。按 Enter 退出。 " -n 1 -r
 echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    "$SOURCE_DIR/start.sh"
-fi

@@ -3,18 +3,27 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: production
     container_name: js-agent
     ports:
-      - "8000:8000"
+      # Loopback-only by default: the API is key-gated, but a personal agent
+      # harness should not be LAN-reachable unless the user opts in.
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./workspace:/app/workspace
       - ./state:/app/state
+      # Work home is independent of JS_STATE_DIR; without this mount, a
+      # container recreate wipes Work credentials, memory, and ledger.
+      - ./state-work:/home/appuser/.js-work
     environment:
       - JS_LOG_LEVEL=INFO
       - JS_STATE_DIR=/app/state
+      - JS_APPSHELL_PROVISION_KEY=1
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/status')"]
+      # Probe the unauthenticated static index route. /api/status and
+      # /api/health require credentials and would always answer 401 here.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -26,16 +35,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: dev
     container_name: js-agent-dev
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./workspace:/app/workspace
       - ./state:/app/state
       - .:/app
+      # Separate from prod: this profile runs as root, so Work home is /root.
+      - ./state-work-dev:/root/.js-work
     environment:
       - JS_LOG_LEVEL=DEBUG
       - JS_STATE_DIR=/app/state
+      - JS_APPSHELL_PROVISION_KEY=1
     # Run as root in dev so the mounted host volumes are writable
     user: root
-    command: ["js", "web", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["js", "appshell", "--host", "0.0.0.0", "--port", "8000", "--no-browser"]

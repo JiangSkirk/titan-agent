@@ -5,7 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.5] - 2026-06-24
+
+### Added
+
+- **`[office]` / `[pdf]` install extras**: heavy parsing/generation libraries are now optional.
+  - `pip install -e ".[office]"` installs `openpyxl>=3.1` and `pandas>=2.2` (Excel read/write).
+  - `pip install -e ".[pdf]"` installs `pypdf>=5.0`, `pdfplumber>=0.11`, `reportlab>=4.0` (PDF read/generate).
+  - Core install no longer requires these libraries; the related Office/PDF tools degrade with a clear error when the extra is not installed.
+- **Tool output budget (default 20k chars)**: `ToolLimits.tool_output_budget_chars` (default `20_000`) caps the size of any single tool result returned to the model. Two code paths handle oversize:
+  - `file_read` checks early (after `offset`/`limit` paging) and, if still oversize, returns `success=True` with empty `output` and `metadata.too_large=True` plus a paging suggestion (`js/tools/files.py`).
+  - All other tools fall through to the registry, which truncates `output` to the budget, appends a `... [output truncated: N chars; ...]` notice, and sets `metadata.truncated=True` + `metadata.original_len=N` (`js/tools/registry.py`).
+  Both paths keep `success` consistent with the underlying tool outcome and never stuff the full payload into the prompt.
+- **Task Review Capsule (deterministic MVP, no LLM)**: at the end of every run the agent stores a lightweight, owner-scoped record in `review_capsules.db` containing the first user message, last assistant message, tool-call summary, token totals, turn count and exit status. Secrets are redacted before storage. This is a deterministic post-run summary, **not** an LLM-generated reflection.
+- **Session lifecycle tracking + abnormal-exit recovery (marker only)**: `SessionLifecycleStore` records `running` / `completed` / `aborted` state with heartbeats. On startup, runs whose heartbeats have gone stale beyond the configured threshold are marked as `aborted` with `exit_reason="abnormal_exit_recovery"`. **This is a status marker, not full task resumption**: the agent does not automatically re-run, re-tool, or continue an aborted session from its last checkpoint. Resuming work after an abnormal exit still requires the user to start a new run (existing checkpoint-resume APIs unchanged).
+- **Tool batch telemetry**: after each tool batch the agent emits a `TOOL_BATCH` audit event recording `turn`, `tool_names`, `all_failed`, `batch_size`, `total_output_chars`, `owner_key_hash`, plus `session_id` / `run_id`, and increments a `tool_batches_total{all_failed,tool_count}` Prometheus counter. Per-tool **latency** is *not* in this batch event — per-tool latency continues to flow through the existing `js.utils.metrics` histograms/counters. `TOOL_BATCH` only describes batch shape and outcome.
+- **Skill Promotion Gate CLI/Web controls**: auto curator and evolver no longer mutate trust levels or overwrite entry files directly — both produce `proposed` events in `skill_promotions.db`, which an operator then reviews and applies through a 5-step gate (`protected → validate → security → tests → smoke`; smoke is bounded by a 30 s `asyncio.wait_for`). New surfaces:
+  - **CLI**: `js skill promote list | show <event_id> | approve <event_id> | reject <event_id> | revert <event_id>`. `approve` runs the gate via `SkillManager.apply_proposal`; `reject` only flips event status (never touches trust or files); `revert` rolls back trust + entry file via `SkillManager.revert_promotion`.
+  - **Web**: `GET /api/skills/promotions` and `/api/skills/promotions/{event_id}` require normal auth and are scoped by `memory_owner(auth)`. `POST /api/skills/promotions/{event_id}/{approve|reject|revert}` all require `require_admin`. Responses never include `owner_key_hash`. Routes are registered before `/api/skills/{skill_id}` so the wildcard cannot swallow them.
+  - **Failure surfaces**: every gate decision emits an `AuditEventType.SKILL_PROMOTION_GATE` audit row and a `skill_promotion_events_total{decision,failed_step}` Prometheus counter. Failure context lives in `event.details.failed_step` (one of `protected/validate/security/tests/smoke`) and, for smoke timeouts, `event.details.timeout=True` + `event.details.smoke_error`.
+
+### Changed
+
+- **Owner isolation hardened across persistence layers**: `SessionLifecycleStore`, `ReviewStore`, and `StateStore` now use a composite `(session_id, owner_key_hash)` primary key. `owner_key_hash=None` is normalized to the `__legacy_local__` sentinel everywhere; `list_active(None)` / `list_recent(None)` / `list_sessions(None)` no longer return rows belonging to authenticated owners. Existing tables migrate in place on first open.
+- **`TurnExecutor` owner field**: the per-run owner key hash is now stored on the executor instance instead of a shared attribute on the agent, so concurrent runs for different users cannot race on heartbeats.
+- **`StateStore.load()`** now returns `owner_key_hash` in its result dict.
+
+### Fixed
+
+- **`file_read` budget vs. paging order**: paging by `offset`/`limit` is applied before the 20k char budget check, so requested line slices on large files no longer get rejected as oversized.
+
+### Verified
+
+- `ruff check js/ tests/ scripts/` → All checks passed
+- `mypy js/ --no-error-summary` → zero errors
+- `pytest tests/ -q --tb=short` → 1321 passed, 3 skipped, 11 deselected
+- `python -m benchmarks.runner --mock` → Overall score 1.000 / Baseline 1.000
+- `python scripts/release_smoke.py --all` → passed
+- `python -m js --help` → CLI loads cleanly
 
 ## [0.1.3-alpha] - 2026-06-22
 
@@ -192,3 +229,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.1.1-alpha]: https://github.com/JiangSkirk/titan-agent/releases/tag/v0.1.1-alpha
 [0.1.2-alpha]: https://github.com/JiangSkirk/titan-agent/releases/tag/v0.1.2-alpha
 [0.1.3-alpha]: https://github.com/JiangSkirk/titan-agent/releases/tag/v0.1.3-alpha
+[0.1.5]: https://github.com/JiangSkirk/titan-agent/releases/tag/v0.1.5

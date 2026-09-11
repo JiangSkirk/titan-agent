@@ -72,14 +72,31 @@ class TestScenarioRegistry:
         assert len(all_scenarios) >= 3
 
 
+class TestScenarioGoalTemplate:
+    def test_instantiate_creates_owner_scoped_goal(self, tmp_path: Path) -> None:
+        from js.bots.store import BotStore
+        from js.scenarios.instantiate import instantiate_scenario
+
+        scenario = load_builtin_scenarios()[0]
+        created = instantiate_scenario(
+            scenario,
+            owner_key_hash="owner-a",
+            state_dir=tmp_path,
+        )
+        store = BotStore(tmp_path)
+        goals = store.list_goal_runs(owner_key_hash="owner-a")
+        assert [item.id for item in goals] == [created["goal_id"]]
+        assert store.list_goal_runs(owner_key_hash="owner-b") == []
+
+
 @pytest.fixture
-def client() -> TestClient:
+def client(tmp_path: Path) -> TestClient:
     from js.web import server as web_server
     from js.web.deps import set_globals
 
     mock_agent = MagicMock()
-    mock_agent.settings.workspace = Path("/tmp")
-    mock_agent.settings.state_dir = Path("/tmp")
+    mock_agent.settings.workspace = tmp_path / "workspace"
+    mock_agent.settings.state_dir = tmp_path / "state"
     mock_agent.settings.security.api_key_required = False
     mock_agent.skills.get.return_value = None
 
@@ -111,11 +128,31 @@ class TestScenarioAPI:
         res = client.get("/api/scenarios/nonexistent")
         assert res.status_code == 404
 
-    def test_start_scenario(self, client: TestClient) -> None:
-        res = client.post("/api/scenarios/code-review/start")
+    def test_start_scenario(self, tmp_path: Path) -> None:
+        from js.config import JSSettings
+        from js.web.auth import AuthManager
+
+        settings = JSSettings(
+            workspace=tmp_path / "workspace",
+            state_dir=tmp_path / "state",
+            first_run_completed=True,
+            providers=[],
+            models=[],
+        )
+        key = AuthManager(settings.state_dir).create_key("scenario-user", role="user")
+        app = create_app(runtime_settings=settings)
+        with TestClient(
+            app,
+            headers={"Host": "localhost", "Origin": "http://localhost", "X-API-Key": key},
+        ) as client:
+            res = client.post("/api/scenarios/code-review/start")
         assert res.status_code == 200
         data = res.json()
         assert data["success"] is True
         assert data["scenario_id"] == "code-review"
         assert "fleet_config" in data
         assert "example_prompts" in data
+        assert data["goal_id"]
+        assert data["room_id"]
+        assert data["bot_ids"]
+        assert data["goal"]["phase"] == "clarify"

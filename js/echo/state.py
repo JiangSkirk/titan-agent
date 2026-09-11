@@ -1,0 +1,84 @@
+"""Echo-owned ephemeral state for one agent turn."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from js.models.providers import ChatMessage
+from js.tools.registry import ToolResult
+
+
+@dataclass
+class AgentState:
+    """Mutable turn state owned by the Echo runtime."""
+
+    session_id: str
+    run_id: str
+    turn_count: int = 0
+    messages: list[ChatMessage] = field(default_factory=list)
+    tool_results: list[ToolResult] = field(default_factory=list)
+    total_tokens: dict[str, int] = field(default_factory=lambda: {"input": 0, "output": 0})
+    cached_tokens: int = 0
+    usage_buckets: dict[str, int] = field(
+        default_factory=lambda: {
+            "uncached_input": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "output": 0,
+            "reasoning": 0,
+            "input_total": 0,
+        }
+    )
+    usage_source: str = "unavailable"
+    prefix_id: str = ""
+    cost_estimate: float = 0.0
+    status: str = "running"
+    error_message: str = ""
+    compression_stats: dict[str, Any] = field(default_factory=dict)
+    model: str = ""
+
+    @property
+    def context_taint(self) -> int:
+        """OR of live message taint bits. Not persisted (see ``to_dict``)."""
+
+        from echo_core.taint import recompute_context_taint
+
+        return recompute_context_taint(
+            [int(getattr(message, "taint", 0) or 0) for message in self.messages]
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "run_id": self.run_id,
+            "turn_count": self.turn_count,
+            "messages": [
+                {
+                    "role": message.role,
+                    "content": message.content,
+                    "name": getattr(message, "name", None),
+                    "tool_calls": getattr(message, "tool_calls", None),
+                    "tool_call_id": getattr(message, "tool_call_id", None),
+                    "reasoning_content": getattr(message, "reasoning_content", None),
+                }
+                for message in self.messages
+            ],
+            "tool_results": [
+                {"success": result.success, "output": result.output, "error": result.error}
+                for result in self.tool_results
+            ],
+            "total_tokens": self.total_tokens,
+            "cached_tokens": self.cached_tokens,
+            "usage_buckets": self.usage_buckets,
+            "usage_source": self.usage_source,
+            "prefix_id": self.prefix_id,
+            "cost_estimate": self.cost_estimate,
+            "status": self.status,
+            "error_message": self.error_message,
+            "compression_stats": self.compression_stats,
+            "model": self.model,
+        }
+
+
+__all__ = ["AgentState"]

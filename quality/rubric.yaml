@@ -1,0 +1,487 @@
+# Canonical quality criteria. New bars require a rubric_version bump + changelog.
+# Chat / PR checklists that are not listed here are RUBRIC_DRIFT, not a failed peak.
+
+rubric_version: "2026.09.17"
+
+label_enum:
+  - OPEN
+  - PEAK
+  - FROZEN
+  - WONT_FIX
+  - REGRESSED
+
+terminal_labels:
+  - PEAK
+  - FROZEN
+  - WONT_FIX
+
+forbidden_at_peak:
+  - OPEN
+  - REGRESSED
+
+# Package-level inventory. Do not score every .py file.
+inventory_units:
+  echo.ledger:
+    paths:
+      - js/echo/ledger/
+    scopes:
+      - repo.default
+      - m3.structure
+      - echo.tip_anchor
+  echo.runtime:
+    paths:
+      - js/echo/turn_loop/
+      - js/echo/capability.py
+      - js/echo/spi.py
+      - js/echo/context_store.py
+    scopes:
+      - repo.default
+      - m1.structure
+      - echo.lease_compact
+      - echo.observability
+  orin.orind:
+    paths:
+      - js/orin/
+      - js/orind/
+    scopes:
+      - repo.default
+      - m3.structure
+      - orin.process_split
+      - orin.provider_via_cell
+      - orin.signed_receipts
+      - orin.cell_product_routes
+  web.appshell:
+    paths:
+      - js/web/
+      - js/appshell/
+    scopes:
+      - repo.default
+      - web.auth_contracts
+      - tasks.empty_shell
+      - scenarios.goal_templates
+      - m2.structure
+      - appshell.process_split
+      - security.onboarding_admin
+  memory:
+    paths:
+      - js/memory/
+    scopes:
+      - repo.default
+      - m1.structure
+  agent.tools:
+    paths:
+      - js/agent/
+      - js/tools/
+    scopes:
+      - repo.default
+      - m2.structure
+  security:
+    paths:
+      - js/security/
+    scopes:
+      - repo.default
+      - m3.security
+      - skills.key_registry
+      - security.posture
+  runtime.governor:
+    paths:
+      - js/runtime/
+    scopes:
+      - repo.default
+      - runtime.wal_allowlist
+  reserved:
+    paths:
+      - js/pipeline/
+      - js/mobile/
+      - docs/mobile/MOBILE_CLOSEOUT.md
+    scopes:
+      - repo.default
+      - reserved.isolation
+      - reserved.closeout
+  js_work:
+    paths:
+      - js_work/
+    scopes:
+      - repo.default
+  docs.debt:
+    paths:
+      - TECH_DEBT.md
+      - AGENTS.md
+      - SECURITY.md
+      - SECURITY_en.md
+      - constraints.txt
+      - scripts/export_constraints.py
+    scopes:
+      - repo.default
+      - security.policy_doc
+      - ci.frozen_install
+      - ci.constraints
+  evolution:
+    paths:
+      - js/evolution/
+    scopes:
+      - repo.default
+      - evolution.cycle
+  friends:
+    paths:
+      - js/friends/
+    scopes:
+      - repo.default
+      - friends.v1
+  bots.surface:
+    paths:
+      - js/bots/
+    scopes:
+      - repo.default
+  gateway:
+    paths:
+      - js/gateway/
+    scopes:
+      - repo.default
+      - gateway.cold_start
+      - gateway.webhook
+      - gateway.discord
+  security.audit:
+    paths:
+      - docs/security/THREAT_MODEL.md
+      - docs/security/AUDIT_PACK.md
+      - tests/multiuser/
+      - docker-compose.staging.yaml
+      - docs/security/staging-trial-2026-08-29.md
+      - scripts/staging_trial.py
+    scopes:
+      - repo.default
+      - security.threat_model
+      - security.staging_trial
+  tests.quality:
+    paths:
+      - tests/adversarial/
+      - tests/property/
+      - tests/faults/
+      - scripts/test_density_report.py
+      - scripts/check_coverage_floors.py
+      - scripts/run_mutation.py
+      - docs/quality/mutation-2026-08-29.md
+    scopes:
+      - repo.default
+      - tests.density
+      - tests.coverage
+      - tests.mutation
+
+scopes:
+  repo.default:
+    criteria:
+      - id: gate.ruff
+        description: ruff lint
+        evidence_kind: command
+        command:
+          - uv
+          - run
+          - ruff
+          - check
+          - .
+      - id: gate.mypy
+        description: mypy on js/
+        evidence_kind: command
+        command:
+          - uv
+          - run
+          - mypy
+          - js
+      - id: gate.pytest
+        description: full pytest; environment skips only
+        evidence_kind: recorded
+        command:
+          - uv
+          - run
+          - pytest
+          - tests/
+          - -q
+  reserved.isolation:
+    criteria:
+      - id: reserved.isolation
+        description: Host startup does not import pipeline/friends/mobile
+        evidence_kind: pytest_node
+        nodeid: tests/test_reserved_runtime_isolation.py
+  reserved.closeout:
+    criteria:
+      - id: reserved.closeout
+        description: Mobile reserved layer has a not_implemented closeout
+        evidence_kind: pytest_node
+        nodeid: tests/test_reserved_runtime_isolation.py::test_mobile_closeout_declares_not_implemented
+  web.auth_contracts:
+    criteria:
+      - id: web.auth_contracts
+        description: unfreeze admin, managed Origin, scenarios write
+        evidence_kind: pytest_node
+        nodeid: tests/test_appshell_single_host.py
+  runtime.wal_allowlist:
+    criteria:
+      - id: runtime.wal_allowlist
+        description: governor WAL only touches PRODUCT_STATE_DB_NAMES
+        evidence_kind: pytest_node
+        nodeid: tests/test_governor_event_retention.py::test_governor_wal_checkpoint_only_touches_known_state_dbs
+  tasks.empty_shell:
+    criteria:
+      - id: tasks.empty_shell
+        description: /api/tasks is a read-only bots goals view; mutate stays 503
+        evidence_kind: pytest_node
+        nodeid: tests/test_tasks_empty_shell.py
+  scenarios.goal_templates:
+    criteria:
+      - id: scenarios.goal_templates
+        description: Scenario start creates owner-scoped bots room + goal
+        evidence_kind: pytest_node
+        nodeid: tests/test_scenarios.py::TestScenarioAPI::test_start_scenario
+  m1.structure:
+    criteria:
+      - id: m1.structure
+        description: office/fleet/memory/turn_loop facades keep old imports
+        evidence_kind: pytest_node
+        nodeid: tests/test_m_wave_facades.py::test_m1_facades
+  m2.structure:
+    criteria:
+      - id: m2.structure
+        description: server.py and tool_executor facades keep old imports
+        evidence_kind: pytest_node
+        nodeid: tests/test_m_wave_facades.py::test_m2_facades
+  m3.structure:
+    criteria:
+      - id: m3.structure
+        description: local tip seal + lease compaction + ledger/orind facades
+        evidence_kind: pytest_node
+        nodeid: tests/test_m_wave_facades.py::test_m3_facades
+  m3.security:
+    criteria:
+      - id: m3.security
+        description: rules.py has direct unit tests
+        evidence_kind: pytest_node
+        nodeid: tests/test_security_rules.py
+  echo.lease_compact:
+    criteria:
+      - id: echo.lease_compact
+        description: LeaseAuthority.maybe_compact + governor scheduling
+        evidence_kind: pytest_node
+        nodeid: tests/echo/test_capability_lease_compaction.py
+  echo.tip_anchor:
+    criteria:
+      - id: echo.tip_anchor
+        description: External tip anchor rejects journal+seal rewind
+        evidence_kind: pytest_node
+        nodeid: tests/echo/ledger/test_tip_anchor.py
+  echo.observability:
+    criteria:
+      - id: echo.observability
+        description: Effect id binding and Amber overwrite counters
+        evidence_kind: pytest_node
+        nodeid: tests/echo/test_observability_ids.py
+  skills.key_registry:
+    criteria:
+      - id: skills.key_registry
+        description: Self-sign is COMMUNITY; registry grants TRUSTED
+        evidence_kind: pytest_node
+        nodeid: tests/test_skill_key_registry.py
+  appshell.process_split:
+    criteria:
+      - id: appshell.process_split
+        description: Opt-in process split observation + stripped worker env
+        evidence_kind: pytest_node
+        nodeid: tests/test_appshell_process_split.py
+  orin.process_split:
+    criteria:
+      - id: orin.process_split
+        description: Default split bits stay unobserved
+        evidence_kind: pytest_node
+        nodeid: tests/orin/test_orin_stagec_process_split.py
+  orin.provider_via_cell:
+    criteria:
+      - id: orin.provider_via_cell
+        description: Cell-backed provider holds no api_key
+        evidence_kind: pytest_node
+        nodeid: tests/test_cell_model_transport.py
+  orin.signed_receipts:
+    criteria:
+      - id: orin.signed_receipts
+        description: CellBase attaches K§8.5 HMAC receipts
+        evidence_kind: pytest_node
+        nodeid: tests/orin/test_signed_receipts_cells.py
+  orin.cell_product_routes:
+    criteria:
+      - id: orin.cell_product_routes
+        description: Supervisor can pass Desktop/Memory argv without enforce
+        evidence_kind: pytest_node
+        nodeid: tests/orin/test_orin_supervisor.py
+  security.onboarding_admin:
+    criteria:
+      - id: security.onboarding_admin
+        description: User cannot reopen onboarding after skip
+        evidence_kind: pytest_node
+        nodeid: tests/test_onboarding_skip_and_status.py::TestOnboardingSkip::test_user_cannot_reopen_onboarding
+  security.policy_doc:
+    criteria:
+      - id: security.policy_doc
+        description: SECURITY.md trust model matches config defaults
+        evidence_kind: pytest_node
+        nodeid: tests/test_security_policy_doc.py
+  ci.frozen_install:
+    criteria:
+      - id: ci.frozen_install
+        description: CI workflows use uv --frozen and SHA-pinned actions
+        evidence_kind: pytest_node
+        nodeid: tests/test_ci_workflow_frozen.py
+  ci.constraints:
+    criteria:
+      - id: ci.constraints
+        description: Runtime deps have upper bounds; constraints.txt matches uv.lock
+        evidence_kind: pytest_node
+        nodeid: tests/test_supply_chain_pins.py
+  security.posture:
+    criteria:
+      - id: security.posture
+        description: Isolation posture detection and doctor findings
+        evidence_kind: pytest_node
+        nodeid: tests/security/test_posture.py
+  gateway.cold_start:
+    criteria:
+      - id: gateway.cold_start
+        description: Gateway default-off and Host cold start does not import js.gateway
+        evidence_kind: pytest_node
+        nodeid: tests/gateway/test_gateway_cold_start.py
+  gateway.webhook:
+    criteria:
+      - id: gateway.webhook
+        description: HMAC webhook rejects bad signatures and replay; unpaired drops Echo
+        evidence_kind: pytest_node
+        nodeid: tests/gateway/test_webhook.py
+  friends.v1:
+    criteria:
+      - id: friends.v1
+        description: Friends v1 owner isolation, real E2E, dual-HOME tainted ingest
+        evidence_kind: pytest_node
+        nodeid: tests/friends/test_friends_v1.py
+  evolution.cycle:
+    criteria:
+      - id: evolution.cycle
+        description: Evolution cycle generates proposals only; approve+benchmark can roll back
+        evidence_kind: pytest_node
+        nodeid: tests/evolution/test_cycle.py
+  gateway.discord:
+    criteria:
+      - id: gateway.discord
+        description: Discord mock transport e2e and lease-gated cron push
+        evidence_kind: pytest_node
+        nodeid: tests/gateway/test_discord_e2e.py
+  tests.density:
+    criteria:
+      - id: tests.density
+        description: M1 density >= 1.2 and py-only density >= 0.94
+        evidence_kind: pytest_node
+        nodeid: tests/test_density_report.py
+  tests.mutation:
+    criteria:
+      - id: tests.mutation
+        description: Local mutmut sample report exists; mutmut is not a CI gate
+        evidence_kind: pytest_node
+        nodeid: tests/test_mutation_report.py
+  tests.coverage:
+    criteria:
+      - id: tests.coverage
+        description: M1 coverage ratchet security 86 / echo 85 / lib 65 branch; 90/85/75 is M2
+        evidence_kind: pytest_node
+        nodeid: tests/test_coverage_floors.py
+  security.threat_model:
+    criteria:
+      - id: security.threat_model
+        description: Threat model maps multi-owner surfaces; audit pack and staging compose exist
+        evidence_kind: pytest_node
+        nodeid: tests/test_audit_pack.py
+  security.staging_trial:
+    criteria:
+      - id: security.staging_trial
+        description: Process-level multi-owner HTTP trial is internal, not an external audit
+        evidence_kind: pytest_node
+        nodeid: tests/test_staging_trial.py
+
+changelog:
+  - version: "2026.09.17"
+    date: "2026-08-30"
+    changes:
+      - "Py-only density ratchet 0.94 after bots/inbox unit coverage buffer"
+  - version: "2026.09.16"
+    date: "2026-08-30"
+    changes:
+      - "Internal live-deployment multi-owner trial; external red team still pending"
+  - version: "2026.09.15"
+    date: "2026-08-30"
+    changes:
+      - "Py-only density ratchet 0.937; local mutmut sample on security core"
+  - version: "2026.09.14"
+    date: "2026-08-29"
+    changes:
+      - "Mobile reserved layer closeout: 376-line contract, not_implemented"
+  - version: "2026.09.13"
+    date: "2026-08-29"
+    changes:
+      - "Runtime deps cap next major; hashed constraints.txt exported from uv.lock"
+  - version: "2026.09.12"
+    date: "2026-08-29"
+    changes:
+      - "In-repo audit pack: THREAT_MODEL, multiuser abuse matrix, staging compose"
+  - version: "2026.09.11"
+    date: "2026-08-29"
+    changes:
+      - "M1 density ratchet 1.2:1; coverage floors; hypothesis + adversarial corpus + fault matrix"
+  - version: "2026.09.10"
+    date: "2026-08-29"
+    changes:
+      - "Friends v1 store + X25519/ChaCha20-Poly1305 + Host-to-Host HMAC; default off"
+  - version: "2026.09.9"
+    date: "2026-08-29"
+    changes:
+      - "Scenarios instantiate bots goals; /api/tasks is a read-only goals view"
+  - version: "2026.09.8"
+    date: "2026-08-29"
+    changes:
+      - "Evolution cycle is proposal-only; admin approve applies and mock-benchmark rollback"
+  - version: "2026.09.7"
+    date: "2026-08-29"
+    changes:
+      - "Discord channel + mock transport e2e; cron whitelist push via control_gateway_push lease"
+  - version: "2026.09.6"
+    date: "2026-08-29"
+    changes:
+      - "Telegram moved under js/gateway/channels with facade; HMAC webhook + inbound taint"
+  - version: "2026.09.5"
+    date: "2026-08-29"
+    changes:
+      - "Gateway surface skeleton (ADR 0008); pairing fail-closed; Host cold start isolation"
+  - version: "2026.09.4"
+    date: "2026-08-29"
+    changes:
+      - "Isolation posture detection, js doctor --security, hardened compose"
+  - version: "2026.09.3"
+    date: "2026-08-29"
+    changes:
+      - "CI/Release Smoke/weekly audit use uv lock --check and SHA-pinned actions"
+      - "Desktop Python build pins include --hash; pip install requires hashes"
+  - version: "2026.09.2"
+    date: "2026-08-29"
+    changes:
+      - "Public SECURITY.md / SECURITY_en.md trust model; policy-doc consistency test"
+      - "README comparison table true-up: security posture + self-learning is not a closed loop"
+  - version: "2026.09.1"
+    date: "2026-08-27"
+    changes:
+      - "Wave 0–5 Echo/Orin upgrades: lease compact schedule, tip anchor v1, skill registry, opt-in process split, provider-via-cell, signed receipts, C6/C7 evidence, ADRs 0005/0006"
+      - "Not in v1: orin.enforce default true, TPM tip, official TCC, K§15.6 #8/#9, pulse Exec cutover"
+  - version: "2026.08.2"
+    date: "2026-08-26"
+    changes:
+      - "M1–M3 mechanical splits + old import facades + local tip seal/lease compaction"
+      - "Not in v2: orin.enforce default true, external tip anchor, pipeline cold-start, TaskManager revival, Windows desktop, roadmap metrics"
+  - version: "2026.08.1"
+    date: "2026-08-26"
+    changes:
+      - "v1 lock: 三件套 + reserved isolation + auth contracts + WAL allowlist + tasks empty shell"
+      - "Later monolith waves M1/M2/M3 require a version bump before those units can leave FROZEN"
+      - "Not in v1: monolith splits, Stage C, tip seal, lease compaction, roadmap metrics, Windows desktop"
