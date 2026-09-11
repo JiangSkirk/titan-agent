@@ -278,9 +278,14 @@ def test_stage_and_build_commands_are_source_stable_locked_and_offline(
     collected = {cmd[i + 1] for i in collect_idxs if i + 1 < len(cmd)}
     hidden_idxs = [i for i, part in enumerate(cmd) if part == "--hidden-import"]
     hidden = {cmd[i + 1] for i in hidden_idxs if i + 1 < len(cmd)}
-    for package in ("echo_core", "orin_proto", "orin_guard"):
+    for package in build_driver.SIDECAR_KERNEL_TRIAD_MODULES:
         assert package in collected
         assert package in hidden
+    assert set(build_driver.SIDECAR_KERNEL_TRIAD_MODULES) == {
+        "echo_core",
+        "orin_proto",
+        "orin_guard",
+    }
     for relative, package_name in build_driver.SIDECAR_KERNEL_PACKAGE_ROOTS:
         assert str(stage_root / relative) in cmd
         assert (stage_root / relative / package_name).is_dir()

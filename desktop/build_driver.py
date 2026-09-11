@@ -70,10 +70,15 @@ _BUILD_INPUT_PATHS = {
 # Workspace kernel packages consumed by Host at import time. Staged under
 # release-source closure; PyInstaller needs their parent dirs on sys.path
 # (``packages/echo-core`` not ``packages``) plus explicit collect flags.
+# Architecture gate: freeze MUST include the full triad together — never
+# ``echo_core`` alone without ``orin_proto`` / ``orin_guard``.
 SIDECAR_KERNEL_PACKAGE_ROOTS: tuple[tuple[str, str], ...] = (
     ("packages/echo-core", "echo_core"),
     ("packages/orin-proto", "orin_proto"),
     ("packages/orin-guard", "orin_guard"),
+)
+SIDECAR_KERNEL_TRIAD_MODULES: tuple[str, ...] = tuple(
+    package_name for _relative, package_name in SIDECAR_KERNEL_PACKAGE_ROOTS
 )
 _ENVIRONMENT_FILE_KEYS = ("python", "pnpm", "cargo", "node", "ditto")
 _ENVIRONMENT_TREE_KEYS = ("cargo_home", "pnpm_store")
@@ -835,6 +840,31 @@ def _cleanup_pnpm_store_project_links(store: Path) -> None:
             child.unlink()
 
 
+def sidecar_kernel_pyinstaller_flags() -> list[str]:
+    """PyInstaller flags that freeze the full kernel triad (architecture gate).
+
+    Freezing only ``echo_core`` while omitting Orin peers is a reject. Both
+    ``--hidden-import`` and ``--collect-submodules`` are required for each
+    triad top-level package so cold-start Host cannot raise triad
+    ``ModuleNotFoundError``.
+    """
+    if SIDECAR_KERNEL_TRIAD_MODULES != ("echo_core", "orin_proto", "orin_guard"):
+        raise RuntimeError("sidecar kernel triad constant drifted")
+    flags: list[str] = [
+        "--hidden-import",
+        "echo_core",
+        "--hidden-import",
+        "echo_core.primitives",
+    ]
+    for package_name in SIDECAR_KERNEL_TRIAD_MODULES:
+        if package_name == "echo_core":
+            continue
+        flags.extend(["--hidden-import", package_name])
+    for package_name in SIDECAR_KERNEL_TRIAD_MODULES:
+        flags.extend(["--collect-submodules", package_name])
+    return flags
+
+
 def sidecar_kernel_import_roots(stage_root: Path) -> list[Path]:
     """Return staged kernel package parents required on PYTHONPATH / ``-p``."""
     roots: list[Path] = []
@@ -947,20 +977,7 @@ def build_sidecar(
         "tiktoken_ext",
         # Kernel triad: js.echo imports echo_core at package import time; Orin
         # guard/proto follow. Ambient site-packages must not be required.
-        "--hidden-import",
-        "echo_core",
-        "--hidden-import",
-        "echo_core.primitives",
-        "--hidden-import",
-        "orin_proto",
-        "--hidden-import",
-        "orin_guard",
-        "--collect-submodules",
-        "echo_core",
-        "--collect-submodules",
-        "orin_proto",
-        "--collect-submodules",
-        "orin_guard",
+        *sidecar_kernel_pyinstaller_flags(),
         "-p",
         str(stage_root),
     ]
