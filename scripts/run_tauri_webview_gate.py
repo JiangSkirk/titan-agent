@@ -219,6 +219,33 @@ def reap_owned_tree(
     return owned
 
 
+def _salvage_partial_result(result_path: Path, published_result: Path) -> bool:
+    """Copy mid-run harness result.json before private_dir is removed.
+
+    On outer TimeoutExpired the harness may already have flushed completed
+    scenarios. Preserve that evidence at the durable published path so S1–Sn
+    are not lost with the ephemeral private_dir.
+    """
+    try:
+        result_stat = result_path.lstat()
+        if not stat.S_ISREG(result_stat.st_mode) or result_stat.st_nlink != 1:
+            return False
+        # Validate it is parseable JSON object; do not require full pass schema.
+        strict_load_object(result_path)
+    except (OSError, ValueError, StrictJSONError):
+        return False
+    try:
+        published_result.parent.mkdir(parents=True, exist_ok=True)
+        # replace is atomic on same filesystem (private_dir lives under result_dir).
+        os.replace(result_path, published_result)
+    except OSError:
+        try:
+            shutil.copy2(result_path, published_result)
+        except OSError:
+            return False
+    return True
+
+
 def _run_harness(
     cmd: list[str],
     *,
@@ -516,11 +543,32 @@ def main(argv: list[str] | None = None) -> int:
     try:
         completed = _run_harness(cmd, timeout=_HARNESS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        # Reap already ran inside _run_harness. Preserve any mid-run flush
+        # BEFORE deleting private_dir (the hang root cause of missing evidence).
+        salvaged = _salvage_partial_result(result_path, published_result)
         print(
             f"[FAIL] tauri_webview_lifecycle: harness timed out after "
             f"{_HARNESS_TIMEOUT_SECONDS}s (owned .app + sidecar reaped)",
             file=sys.stderr,
         )
+        if salvaged:
+            try:
+                partial = strict_load_object(published_result)
+                scenarios = partial.get("scenarios", {}) if isinstance(partial, dict) else {}
+                recorded = sorted(scenarios) if isinstance(scenarios, dict) else []
+            except (OSError, ValueError, StrictJSONError):
+                recorded = []
+            print(
+                f"[FAIL] tauri_webview_lifecycle: preserved partial result.json "
+                f"scenarios={recorded}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[FAIL] tauri_webview_lifecycle: no durable partial result.json "
+                "(harness never flushed)",
+                file=sys.stderr,
+            )
         print(format_release_result_line(gate="tauri_webview_lifecycle", ok=False))
         shutil.rmtree(private_dir, ignore_errors=True)
         return 1
@@ -534,6 +582,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if completed.stderr:
             print(completed.stderr, file=sys.stderr)
+        _salvage_partial_result(result_path, published_result)
         print(format_release_result_line(gate="tauri_webview_lifecycle", ok=False))
         shutil.rmtree(private_dir, ignore_errors=True)
         return 1
@@ -548,6 +597,21 @@ def main(argv: list[str] | None = None) -> int:
         if completed.stdout:
             # Harness may emit JSON result on stdout for diagnostics.
             print(completed.stdout[:4000], file=sys.stderr)
+        # Scenario hard-timeout exits EXIT_ASSERT after flushing result.json —
+        # preserve that evidence the same way as outer TimeoutExpired.
+        salvaged = _salvage_partial_result(result_path, published_result)
+        if salvaged:
+            try:
+                partial = strict_load_object(published_result)
+                scenarios = partial.get("scenarios", {}) if isinstance(partial, dict) else {}
+                recorded = sorted(scenarios) if isinstance(scenarios, dict) else []
+            except (OSError, ValueError, StrictJSONError):
+                recorded = []
+            print(
+                f"[FAIL] tauri_webview_lifecycle: preserved result.json "
+                f"scenarios={recorded}",
+                file=sys.stderr,
+            )
         print(format_release_result_line(gate="tauri_webview_lifecycle", ok=False))
         shutil.rmtree(private_dir, ignore_errors=True)
         return 1

@@ -305,7 +305,7 @@ def test_swift_harness_contract_has_real_replay_mode_readback_and_term_first() -
     assert "posixPermissions" in source
     assert 'entryType: "directory"' in source
     clean_quit = source.index('scenario("clean_quit_no_orphans"')
-    restart = source.index('scenario("restart_simplified_flow"')
+    restart = source.index('"restart_simplified_flow"')
     clean_block = source[clean_quit:restart]
     assert "SIGKILL" not in clean_block
     assert "terminateOwned" not in clean_block
@@ -328,6 +328,27 @@ def test_swift_harness_ax_walks_are_bounded() -> None:
     assert "maxDepth: Int = 8" not in source
     assert "budget.expired" in source
     assert "AX_MESSAGING_TIMEOUT_SECONDS" in source
+
+
+def test_swift_harness_per_scenario_timeout_and_mid_run_flush() -> None:
+    """One wedged AX scenario must not burn the whole 600s; flush before exit/reap."""
+    source = (
+        Path(__file__).resolve().parents[1] / "desktop/tests/harness/tauri_webview_harness.swift"
+    ).read_text(encoding="utf-8")
+
+    assert "SCENARIO_HARD_TIMEOUT_SECONDS" in source
+    assert "SCENARIO_LAUNCH_TIMEOUT_SECONDS" in source
+    assert "func flushResult" in source
+    assert "scenario_timeout" in source
+    assert 'status: "timeout"' in source
+    assert "DispatchSource.makeTimerSource" in source
+    # Mid-run flush must happen after each scenario outcome, and watchdog must
+    # flush BEFORE exit so Python TimeoutExpired can still salvage evidence.
+    assert "flushResult()" in source
+    assert "flushResult(markFinished: true)" in source
+    assert source.index("flushResult(markFinished: true)") < source.index(
+        "exit(Int32(EXIT_ASSERT))"
+    )
 
 
 def test_process_tree_expands_sidecar_leader_group_only() -> None:
@@ -426,6 +447,149 @@ def test_wrapper_timeout_reaps_owned_tree(
     )
     assert rc == 1
     assert reaped == [4242]
+    # No mid-run flush → nothing durable published.
+    assert not (evidence / "tauri-webview/result.json").exists()
+
+
+def test_wrapper_timeout_preserves_partial_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On outer TimeoutExpired, salvage mid-run result.json before private_dir rmtree."""
+    evidence, app, harness_bundle, manifest = _fixture(tmp_path)
+    harness_exec = harness_bundle / "Contents/MacOS/js-agent-ui-test-harness"
+    monkeypatch.setattr("desktop.build_driver.verify_manifest", lambda *_a, **_kw: [])
+    reaped: list[int] = []
+
+    class FakePopen:
+        def __init__(self, cmd: list[str], *_a: object, **_kw: object) -> None:
+            self.pid = 4242
+            self._cmd = cmd
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            result_path = Path(self._cmd[self._cmd.index("--result-path") + 1])
+            nonce = self._cmd[self._cmd.index("--nonce") + 1]
+            # Simulate harness flush after early scenarios, then AX wedge.
+            partial = {
+                "schema_version": gate.RESULT_SCHEMA_VERSION,
+                "ok": False,
+                "status": "running",
+                "nonce": nonce,
+                "scenarios": {
+                    "accessibility_probe": {
+                        "passed": True,
+                        "status": "passed",
+                        "detail": "authorized",
+                        "duration_ms": 1.0,
+                        "error_code": None,
+                    },
+                    "cold_start_controlled_env": {
+                        "passed": True,
+                        "status": "passed",
+                        "detail": "launched",
+                        "duration_ms": 10.0,
+                        "error_code": None,
+                    },
+                    "webview_shows_content": {
+                        "passed": False,
+                        "status": "timeout",
+                        "detail": "scenario hard timeout after 90s",
+                        "duration_ms": 90000.0,
+                        "error_code": "scenario_timeout",
+                    },
+                },
+                "app_sha256": _sha256(app / "Contents/MacOS/js-agent-desktop"),
+                "app_tree_sha256": "a" * 64,
+                "harness_sha256": _sha256(harness_exec),
+                "desktop_manifest_sha256": _sha256(manifest),
+                "bundle_identifier": "com.titan.js-agent",
+                "accessibility_authorized": True,
+                "target_pid": 99,
+                "started_utc": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "finished_utc": datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(json.dumps(partial), encoding="utf-8")
+            raise subprocess.TimeoutExpired(cmd=self._cmd, timeout=timeout or 1)
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return -9
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    def fake_reap(root_pid: int, **_kwargs: object) -> set[int]:
+        reaped.append(root_pid)
+        return {root_pid}
+
+    monkeypatch.setattr(gate, "reap_owned_tree", fake_reap)
+
+    rc = gate.main(
+        [
+            "--evidence-dir",
+            str(evidence),
+            "--app-path",
+            str(app),
+            "--harness-path",
+            str(harness_bundle),
+        ]
+    )
+    assert rc == 1
+    assert reaped == [4242]
+    published = evidence / "tauri-webview/result.json"
+    assert published.is_file()
+    payload = json.loads(published.read_text(encoding="utf-8"))
+    assert payload["ok"] is False
+    assert "accessibility_probe" in payload["scenarios"]
+    assert "cold_start_controlled_env" in payload["scenarios"]
+    assert payload["scenarios"]["webview_shows_content"]["error_code"] == "scenario_timeout"
+    # Ephemeral private run dir must be gone; durable evidence stays.
+    assert list(evidence.glob("tauri-webview/run-*")) == []
+    err = capsys.readouterr().err
+    assert "preserved partial result.json" in err
+    assert "accessibility_probe" in err
+
+
+def test_wrapper_scenario_hard_timeout_exit_preserves_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Watchdog exit(EXIT_ASSERT) after flush must still publish durable evidence."""
+
+    def mutate(result: dict[str, object], _cmd: list[str]) -> None:
+        result["ok"] = False
+        result["status"] = "failed"
+        scenarios = result["scenarios"]
+        assert isinstance(scenarios, dict)
+        scenarios["webview_shows_content"] = {
+            "passed": False,
+            "status": "timeout",
+            "detail": "scenario hard timeout after 90s",
+            "duration_ms": 90000.0,
+            "error_code": "scenario_timeout",
+        }
+
+    rc, evidence, _, _ = _run(monkeypatch, tmp_path, mutate=mutate, returncode=2)
+    assert rc == 1
+    published = evidence / "tauri-webview/result.json"
+    assert published.is_file()
+    payload = json.loads(published.read_text(encoding="utf-8"))
+    assert payload["scenarios"]["webview_shows_content"]["error_code"] == "scenario_timeout"
+    err = capsys.readouterr().err
+    assert "preserved result.json" in err
+    assert "harness exit=2" in err
+
+
+def test_salvage_partial_result_rejects_unreadable(
+    tmp_path: Path,
+) -> None:
+    published = tmp_path / "result.json"
+    missing = tmp_path / "missing.json"
+    assert gate._salvage_partial_result(missing, published) is False
+    bad = tmp_path / "bad.json"
+    bad.write_text("not-json", encoding="utf-8")
+    assert gate._salvage_partial_result(bad, published) is False
+    assert not published.exists()
 
 
 def _artifact_bindings(
