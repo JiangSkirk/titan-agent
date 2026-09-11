@@ -10,6 +10,7 @@ with bundle id local.js-agent.ui-test-harness. A bare binary is not accepted.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import plistlib
@@ -35,7 +36,14 @@ _HARNESS_SOURCE = Path("desktop/tests/harness/tauri_webview_harness.swift")
 _HARNESS_MANIFEST_SCHEMA = "JSAgentTauriHarnessProvenanceV1"
 _HARNESS_BUNDLE_IDENTIFIER = "local.js-agent.ui-test-harness"
 _AX_EXIT = 10
+_HARNESS_TIMEOUT_EXIT = 14
+# Outer safety-net reap. The Swift harness wall deadline is strictly below this
+# (HARNESS_WALL_DEADLINE_SECONDS=480) so hangs fail closed with a flushed
+# result.json before this path runs; this remains the last-resort orphan reap.
 _HARNESS_TIMEOUT_SECONDS = 600
+# Must match desktop/tests/harness/tauri_webview_harness.swift
+_HARNESS_INNER_DEADLINE_SECONDS = 480
+assert _HARNESS_INNER_DEADLINE_SECONDS < _HARNESS_TIMEOUT_SECONDS
 RESULT_SCHEMA_VERSION = "js-agent-tauri-webview-result-v1"
 EXPECTED_BUNDLE_IDENTIFIER = "com.titan.js-agent"
 REQUIRED_SCENARIOS = frozenset(
@@ -263,18 +271,69 @@ def _run_harness(
     )
 
 
-def _default_harness_path(evidence_dir: Path) -> Path:
-    return (evidence_dir / "harness" / _HARNESS_APP_NAME).resolve()
+def _write_fail_reason(result_dir: Path, reason: str) -> Path:
+    path = result_dir / "fail_reason.txt"
+    path.write_text(reason.rstrip() + "\n", encoding="utf-8")
+    return path
 
 
-def _harness_executable(harness_path: Path) -> Path:
-    if harness_path.is_dir() and harness_path.name.endswith(".app"):
-        return harness_path / _HARNESS_EXEC
-    return harness_path
+def _synthetic_timeout_result(*, nonce: str, reason: str) -> dict[str, object]:
+    now = datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "ok": False,
+        "status": "harness_timeout",
+        "nonce": nonce,
+        "scenarios": {
+            "harness_wall_deadline": {
+                "passed": False,
+                "status": "failed",
+                "detail": reason,
+                "duration_ms": float(_HARNESS_TIMEOUT_SECONDS) * 1000.0,
+                "error_code": "harness_timeout",
+            }
+        },
+        "app_sha256": None,
+        "app_tree_sha256": None,
+        "harness_sha256": None,
+        "desktop_manifest_sha256": None,
+        "bundle_identifier": "",
+        "accessibility_authorized": False,
+        "target_pid": None,
+        "started_utc": now,
+        "finished_utc": now,
+    }
 
 
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def publish_failure_evidence(
+    *,
+    private_dir: Path,
+    published_result: Path,
+    result_dir: Path,
+    fail_reason: str,
+    nonce: str,
+) -> Path:
+    """Keep result.json + fail_reason after reap; never delete the only copy first.
+
+    Prefer the harness-flushed private result when present; otherwise write a
+    synthetic timeout payload so outer smoke always has a durable fail reason.
+    """
+    _write_fail_reason(result_dir, fail_reason)
+    private_result = private_dir / "result.json"
+    if private_result.is_file() and not private_result.is_symlink():
+        try:
+            payload = private_result.read_bytes()
+            if payload.strip():
+                published_result.write_bytes(payload)
+                return published_result
+        except OSError:
+            pass
+    published_result.write_text(
+        json.dumps(_synthetic_timeout_result(nonce=nonce, reason=fail_reason), indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    return published_result
 
 
 def _trusted_harness_hash(
@@ -516,39 +575,80 @@ def main(argv: list[str] | None = None) -> int:
     try:
         completed = _run_harness(cmd, timeout=_HARNESS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        print(
-            f"[FAIL] tauri_webview_lifecycle: harness timed out after "
-            f"{_HARNESS_TIMEOUT_SECONDS}s (owned .app + sidecar reaped)",
-            file=sys.stderr,
+        fail_reason = (
+            f"harness timed out after {_HARNESS_TIMEOUT_SECONDS}s "
+            f"(owned .app + sidecar reaped; inner deadline "
+            f"{_HARNESS_INNER_DEADLINE_SECONDS}s)"
         )
+        print(f"[FAIL] tauri_webview_lifecycle: {fail_reason}", file=sys.stderr)
         print(format_release_result_line(gate="tauri_webview_lifecycle", ok=False))
+        # Publish evidence BEFORE deleting private_dir — the previous path
+        # wiped the only result.json copy on the 600s reap.
+        publish_failure_evidence(
+            private_dir=private_dir,
+            published_result=published_result,
+            result_dir=result_dir,
+            fail_reason=fail_reason,
+            nonce=nonce,
+        )
         shutil.rmtree(private_dir, ignore_errors=True)
         return 1
     invocation_finished = datetime.now(tz=UTC)
 
     if completed.returncode == _AX_EXIT:
-        print(
-            "[FAIL] tauri_webview_lifecycle: accessibility_not_authorized "
-            "(grant Accessibility only to JS Agent UI Test Harness.app)",
-            file=sys.stderr,
+        fail_reason = (
+            "accessibility_not_authorized "
+            "(grant Accessibility only to JS Agent UI Test Harness.app)"
         )
+        print(f"[FAIL] tauri_webview_lifecycle: {fail_reason}", file=sys.stderr)
         if completed.stderr:
             print(completed.stderr, file=sys.stderr)
         print(format_release_result_line(gate="tauri_webview_lifecycle", ok=False))
+        publish_failure_evidence(
+            private_dir=private_dir,
+            published_result=published_result,
+            result_dir=result_dir,
+            fail_reason=fail_reason,
+            nonce=nonce,
+        )
+        shutil.rmtree(private_dir, ignore_errors=True)
+        return 1
+
+    if completed.returncode == _HARNESS_TIMEOUT_EXIT:
+        fail_reason = (
+            f"harness self-timeout after {_HARNESS_INNER_DEADLINE_SECONDS}s wall deadline "
+            f"(exit={_HARNESS_TIMEOUT_EXIT})"
+        )
+        print(f"[FAIL] tauri_webview_lifecycle: {fail_reason}", file=sys.stderr)
+        if completed.stderr:
+            print(completed.stderr, file=sys.stderr)
+        print(format_release_result_line(gate="tauri_webview_lifecycle", ok=False))
+        publish_failure_evidence(
+            private_dir=private_dir,
+            published_result=published_result,
+            result_dir=result_dir,
+            fail_reason=fail_reason,
+            nonce=nonce,
+        )
         shutil.rmtree(private_dir, ignore_errors=True)
         return 1
 
     if completed.returncode != 0:
-        print(
-            f"[FAIL] tauri_webview_lifecycle: harness exit={completed.returncode}",
-            file=sys.stderr,
-        )
+        fail_reason = f"harness exit={completed.returncode}"
+        print(f"[FAIL] tauri_webview_lifecycle: {fail_reason}", file=sys.stderr)
         if completed.stderr:
             print(completed.stderr, file=sys.stderr)
         if completed.stdout:
             # Harness may emit JSON result on stdout for diagnostics.
             print(completed.stdout[:4000], file=sys.stderr)
         print(format_release_result_line(gate="tauri_webview_lifecycle", ok=False))
+        publish_failure_evidence(
+            private_dir=private_dir,
+            published_result=published_result,
+            result_dir=result_dir,
+            fail_reason=fail_reason,
+            nonce=nonce,
+        )
         shutil.rmtree(private_dir, ignore_errors=True)
         return 1
 

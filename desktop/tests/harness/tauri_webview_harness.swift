@@ -37,6 +37,16 @@ let EXIT_AX_NOT_AUTHORIZED = 10
 let EXIT_TARGET_NOT_FOUND = 11
 let EXIT_LAUNCH_FAILED = 12
 let EXIT_CLEANUP_FAILED = 13
+let EXIT_HARNESS_TIMEOUT = 14
+
+/// Wall-clock deadline for the whole harness run. Must stay strictly below the
+/// Python gate's 600s reap so a hang is reported by the harness itself with a
+/// flushed result.json — not only by the outer TimeoutExpired path.
+let HARNESS_WALL_DEADLINE_SECONDS: TimeInterval = 480
+/// Hard wall for one AX walk (thread wait). Messaging timeout alone is not
+/// enough: WKWebView IPC can ignore AXUIElementSetMessagingTimeout and stall
+/// forever inside AXUIElementCopyAttributeValue, past AxWalkBudget checks.
+let AX_WALK_HARD_TIMEOUT_SECONDS: TimeInterval = 10
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -305,8 +315,9 @@ struct AxWalkBudget {
     let maxNodes: Int
     var nodes: Int = 0
     var truncated: Bool = false
+    var hardTimedOut: Bool = false
 
-    var expired: Bool { Date() >= deadline || nodes >= maxNodes || truncated }
+    var expired: Bool { Date() >= deadline || nodes >= maxNodes || truncated || hardTimedOut }
 
     mutating func consume() -> Bool {
         if expired {
@@ -343,6 +354,9 @@ func collectAxTree(
     return items
 }
 
+/// Run an AX walk on a detached thread and abandon waiting after `timeout`.
+/// AxWalkBudget alone cannot unblock a stuck AXUIElementCopyAttributeValue;
+/// this hard wall lets the harness fail closed instead of eating the 600s gate.
 func collectAxTreeBounded(
     _ element: AXUIElement,
     timeout: TimeInterval = 8,
@@ -350,12 +364,116 @@ func collectAxTreeBounded(
     maxNodes: Int = AX_TREE_MAX_NODES
 ) -> [(String, String, AXUIElement)] {
     configureAxTimeout(element)
-    var budget = AxWalkBudget(
-        deadline: Date().addingTimeInterval(timeout),
-        maxDepth: maxDepth,
-        maxNodes: maxNodes
-    )
-    return collectAxTree(element, budget: &budget)
+    let hardTimeout = min(timeout, AX_WALK_HARD_TIMEOUT_SECONDS)
+    let box = AxWalkBox()
+    let thread = Thread {
+        var budget = AxWalkBudget(
+            deadline: Date().addingTimeInterval(hardTimeout),
+            maxDepth: maxDepth,
+            maxNodes: maxNodes
+        )
+        let tree = collectAxTree(element, budget: &budget)
+        box.finish(tree: tree, timedOut: budget.hardTimedOut || budget.truncated)
+    }
+    thread.name = "ax-walk-bounded"
+    thread.start()
+
+    let waitDeadline = Date().addingTimeInterval(hardTimeout)
+    while Date() < waitDeadline {
+        if box.isFinished { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    if let finished = box.snapshot() {
+        return finished.tree
+    }
+    // Thread is wedged in AX IPC; abandon it and fail closed for this walk.
+    box.markAbandoned()
+    return []
+}
+
+/// Thread-safe carrier for a hard-timeout AX walk result.
+final class AxWalkBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tree: [(String, String, AXUIElement)] = []
+    private var finished = false
+    private var abandoned = false
+
+    var isFinished: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return finished
+    }
+
+    func finish(tree: [(String, String, AXUIElement)], timedOut: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if abandoned { return }
+        self.tree = tree
+        self.finished = true
+        _ = timedOut
+    }
+
+    func markAbandoned() {
+        lock.lock(); defer { lock.unlock() }
+        abandoned = true
+        finished = true
+        tree = []
+    }
+
+    func snapshot() -> (tree: [(String, String, AXUIElement)], finished: Bool)? {
+        lock.lock(); defer { lock.unlock() }
+        guard finished else { return nil }
+        return (tree, finished)
+    }
+}
+
+/// Hard-timeout wrapper for a single AX attribute copy that can stall forever
+/// even after AXUIElementSetMessagingTimeout (observed on WKWebView).
+func axCopyAttributeValue(
+    _ element: AXUIElement,
+    _ attr: String,
+    timeout: TimeInterval = AX_WALK_HARD_TIMEOUT_SECONDS
+) -> CFTypeRef? {
+    configureAxTimeout(element)
+    let box = AxAttrBox()
+    let thread = Thread {
+        var ref: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(element, attr as CFString, &ref)
+        box.finish(status == .success ? ref : nil)
+    }
+    thread.name = "ax-attr-bounded"
+    thread.start()
+    let waitDeadline = Date().addingTimeInterval(min(timeout, AX_WALK_HARD_TIMEOUT_SECONDS))
+    while Date() < waitDeadline {
+        if box.isFinished { break }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    return box.snapshot()
+}
+
+final class AxAttrBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: CFTypeRef?
+    private var finished = false
+
+    var isFinished: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return finished
+    }
+
+    func finish(_ value: CFTypeRef?) {
+        lock.lock(); defer { lock.unlock() }
+        self.value = value
+        self.finished = true
+    }
+
+    func snapshot() -> CFTypeRef? {
+        lock.lock(); defer { lock.unlock() }
+        return finished ? value : nil
+    }
+}
+
+func getAxAttributeBounded(_ element: AXUIElement, _ attr: String) -> String? {
+    guard let ref = axCopyAttributeValue(element, attr), let value = ref as? String else { return nil }
+    return value
 }
 
 func pressAxButton(appPid: pid_t, matching predicates: [String]) -> Bool {
@@ -551,17 +669,131 @@ var result = HarnessResult(
     finished_utc: ""
 )
 
-func writeResultAndExit(_ code: Int) -> Never {
-    result.finished_utc = utcNow()
+let resultLock = NSLock()
+let harnessWallDeadline = Date().addingTimeInterval(HARNESS_WALL_DEADLINE_SECONDS)
+var harnessWatchdogArmed = false
+
+/// Persist the current result to `--result-path` without exiting.
+/// Called after every scenario and from the wall-deadline watchdog so the
+/// Python gate can salvage evidence even if the process is later reaped.
+func flushResultToDisk() {
+    resultLock.lock()
+    defer { resultLock.unlock() }
+    var snapshot = result
+    if snapshot.finished_utc.isEmpty {
+        snapshot.finished_utc = utcNow()
+    }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    if !resultPath.isEmpty, let data = try? encoder.encode(result) {
-        try? data.write(to: URL(fileURLWithPath: resultPath))
+    guard !resultPath.isEmpty, let data = try? encoder.encode(snapshot) else { return }
+    let url = URL(fileURLWithPath: resultPath)
+    let tmpURL = URL(fileURLWithPath: resultPath + ".tmp")
+    do {
+        try data.write(to: tmpURL, options: [.atomic])
+        _ = try? FileManager.default.removeItem(at: url)
+        try FileManager.default.moveItem(at: tmpURL, to: url)
+    } catch {
+        try? data.write(to: url)
     }
-    if let data = try? encoder.encode(result), let s = String(data: data, encoding: .utf8) {
+}
+
+func writeResultAndExit(_ code: Int) -> Never {
+    resultLock.lock()
+    result.finished_utc = utcNow()
+    let snapshot = result
+    resultLock.unlock()
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    if !resultPath.isEmpty, let data = try? encoder.encode(snapshot) {
+        let url = URL(fileURLWithPath: resultPath)
+        let tmpURL = URL(fileURLWithPath: resultPath + ".tmp")
+        do {
+            try data.write(to: tmpURL, options: [.atomic])
+            _ = try? FileManager.default.removeItem(at: url)
+            try FileManager.default.moveItem(at: tmpURL, to: url)
+        } catch {
+            try? data.write(to: url)
+        }
+    }
+    if let data = try? encoder.encode(snapshot), let s = String(data: data, encoding: .utf8) {
         print(s)
     }
     exit(Int32(code))
+}
+
+func failClosedOnHarnessDeadline(reason: String) -> Never {
+    resultLock.lock()
+    result.status = "harness_timeout"
+    result.ok = false
+    if result.scenarios["harness_wall_deadline"] == nil {
+        result.scenarios["harness_wall_deadline"] = ScenarioResult(
+            passed: false,
+            status: "failed",
+            detail: reason,
+            duration_ms: HARNESS_WALL_DEADLINE_SECONDS * 1000,
+            error_code: "harness_timeout"
+        )
+    }
+    resultLock.unlock()
+    if let proc = appProcess {
+        terminateOwned(proc, extraPids: ownedExtraPids)
+        appProcess = nil
+    }
+    FileHandle.standardError.write(
+        "harness_timeout: \(reason)\n".data(using: .utf8)!
+    )
+    writeResultAndExit(EXIT_HARNESS_TIMEOUT)
+}
+
+func installHarnessWatchdog() {
+    guard !harnessWatchdogArmed else { return }
+    harnessWatchdogArmed = true
+    let thread = Thread {
+        let remaining = harnessWallDeadline.timeIntervalSinceNow
+        if remaining > 0 {
+            Thread.sleep(forTimeInterval: remaining)
+        }
+        // Flush first so even a wedged main thread leaves evidence on disk,
+        // then force-exit. Python gate stays at 600s as a backup reap.
+        resultLock.lock()
+        result.status = "harness_timeout"
+        result.ok = false
+        result.scenarios["harness_wall_deadline"] = ScenarioResult(
+            passed: false,
+            status: "failed",
+            detail: "harness wall deadline \(Int(HARNESS_WALL_DEADLINE_SECONDS))s elapsed (watchdog)",
+            duration_ms: HARNESS_WALL_DEADLINE_SECONDS * 1000,
+            error_code: "harness_timeout"
+        )
+        result.finished_utc = utcNow()
+        resultLock.unlock()
+        flushResultToDisk()
+        if let proc = appProcess {
+            terminateOwned(proc, extraPids: ownedExtraPids)
+            appProcess = nil
+        }
+        FileHandle.standardError.write(
+            "harness_timeout: wall deadline \(Int(HARNESS_WALL_DEADLINE_SECONDS))s (watchdog)\n"
+                .data(using: .utf8)!
+        )
+        // exit() terminates the process even if main is stuck in AX IPC.
+        exit(Int32(EXIT_HARNESS_TIMEOUT))
+    }
+    thread.name = "harness-wall-watchdog"
+    thread.start()
+}
+
+func ensureWithinHarnessDeadline(during label: String) throws {
+    if Date() >= harnessWallDeadline {
+        throw NSError(
+            domain: "harness",
+            code: EXIT_HARNESS_TIMEOUT,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "harness wall deadline \(Int(HARNESS_WALL_DEADLINE_SECONDS))s exceeded during \(label)",
+            ]
+        )
+    }
 }
 
 // Always probe first — fail closed fast when unauthorized.
@@ -651,19 +883,44 @@ var appProcess: Process?
 var ownedExtraPids = Set<Int>()
 var capturedBootstrapToken: String?
 
+installHarnessWatchdog()
+flushResultToDisk()
+
 func scenario(_ name: String, errorCode: String = "assertion_failed", _ fn: () throws -> String) {
     let start = Date()
     do {
+        try ensureWithinHarnessDeadline(during: name)
         let detail = try fn()
         let duration = Date().timeIntervalSince(start) * 1000
+        resultLock.lock()
         result.scenarios[name] = ScenarioResult(passed: true, detail: detail, duration_ms: duration, error_code: nil)
+        resultLock.unlock()
         print("[PASS] \(name): \(detail)")
     } catch {
         let duration = Date().timeIntervalSince(start) * 1000
-        result.scenarios[name] = ScenarioResult(passed: false, status: "failed", detail: "\(error)", duration_ms: duration, error_code: errorCode)
+        let ns = error as NSError
+        let timedOut = ns.domain == "harness" && ns.code == EXIT_HARNESS_TIMEOUT
+        resultLock.lock()
+        result.scenarios[name] = ScenarioResult(
+            passed: false,
+            status: "failed",
+            detail: "\(error)",
+            duration_ms: duration,
+            error_code: timedOut ? "harness_timeout" : errorCode
+        )
         result.ok = false
+        if timedOut {
+            result.status = "harness_timeout"
+        }
+        resultLock.unlock()
         print("[FAIL] \(name): \(error)")
+        flushResultToDisk()
+        if timedOut {
+            failClosedOnHarnessDeadline(reason: "\(error)")
+        }
+        return
     }
+    flushResultToDisk()
 }
 
 func requireApp() throws -> Process {
@@ -772,9 +1029,8 @@ scenario("webview_shows_content", errorCode: "window_not_found") {
     var window: AXUIElement?
     let deadline = Date().addingTimeInterval(45)
     while Date() < deadline {
-        var windowsRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef)
-        if let windows = windowsRef as? [AXUIElement], let w = windows.first {
+        try ensureWithinHarnessDeadline(during: "webview_shows_content")
+        if let w = findFirstWindow(app: appElement) {
             window = w
             break
         }
@@ -786,16 +1042,17 @@ scenario("webview_shows_content", errorCode: "window_not_found") {
     configureAxTimeout(win)
 
     var urlValue: String?
-    var title = getAxAttribute(win, kAXTitleAttribute as String) ?? ""
+    var title = getAxAttributeBounded(win, kAXTitleAttribute as String) ?? ""
     let urlDeadline = Date().addingTimeInterval(30)
     while Date() < urlDeadline {
-        // Each walk is independently budgeted; never let one AX crawl dominate
-        // the remaining scenario window.
+        try ensureWithinHarnessDeadline(during: "webview_shows_content")
+        // Each walk is independently budgeted + hard-thread-timed; never let
+        // one AX crawl dominate the remaining scenario window or the gate.
         let perWalk = min(8.0, max(1.0, urlDeadline.timeIntervalSinceNow))
         let tree = collectAxTreeBounded(win, timeout: perWalk)
         for (role, _, el) in tree {
             if role == "AXWebArea" || role == "AXBrowser" {
-                if let url = getAxAttribute(el, "AXURL") {
+                if let url = getAxAttributeBounded(el, "AXURL") {
                     urlValue = url
                     if let components = URLComponents(string: url),
                        let fragment = components.fragment {
@@ -806,7 +1063,7 @@ scenario("webview_shows_content", errorCode: "window_not_found") {
                 }
             }
         }
-        title = getAxAttribute(win, kAXTitleAttribute as String) ?? title
+        title = getAxAttributeBounded(win, kAXTitleAttribute as String) ?? title
         if urlValue != nil || !title.isEmpty { break }
         Thread.sleep(forTimeInterval: 0.5)
     }
@@ -834,12 +1091,13 @@ scenario("bootstrap_fragment_cleared") {
     var finalUrl: String?
     let deadline = Date().addingTimeInterval(20)
     while Date() < deadline {
+        try ensureWithinHarnessDeadline(during: "bootstrap_fragment_cleared")
         if let win = findFirstWindow(app: appElement) {
             configureAxTimeout(win)
             let perWalk = min(8.0, max(1.0, deadline.timeIntervalSinceNow))
             for (role, _, el) in collectAxTreeBounded(win, timeout: perWalk) {
                 if role == "AXWebArea" || role == "AXBrowser" {
-                    if let url = getAxAttribute(el, "AXURL") {
+                    if let url = getAxAttributeBounded(el, "AXURL") {
                         finalUrl = url
                         if url.contains("#bootstrap=") || url.contains("bootstrap=") {
                             sawBootstrap = true
@@ -875,10 +1133,10 @@ scenario("bootstrap_fragment_cleared") {
 }
 
 func findFirstWindow(app: AXUIElement) -> AXUIElement? {
-    var windowsRef: CFTypeRef?
-    AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef)
-    if let windows = windowsRef as? [AXUIElement] { return windows.first }
-    return nil
+    guard let windowsRef = axCopyAttributeValue(app, kAXWindowsAttribute as String),
+          let windows = windowsRef as? [AXUIElement]
+    else { return nil }
+    return windows.first
 }
 
 scenario("http_api_status") {

@@ -328,6 +328,218 @@ def test_swift_harness_ax_walks_are_bounded() -> None:
     assert "maxDepth: Int = 8" not in source
     assert "budget.expired" in source
     assert "AX_MESSAGING_TIMEOUT_SECONDS" in source
+    # Hard wall: budget alone still stalls when AX IPC ignores messaging timeout.
+    assert "AX_WALK_HARD_TIMEOUT_SECONDS" in source
+    assert "HARNESS_WALL_DEADLINE_SECONDS" in source
+    assert "EXIT_HARNESS_TIMEOUT" in source
+    assert "installHarnessWatchdog" in source
+    assert "flushResultToDisk" in source
+    assert "axCopyAttributeValue" in source
+    assert "getAxAttributeBounded" in source
+    # Inner wall must stay strictly below the Python gate's 600s reap.
+    assert "let HARNESS_WALL_DEADLINE_SECONDS: TimeInterval = 480" in source
+    assert gate._HARNESS_INNER_DEADLINE_SECONDS == 480
+    assert gate._HARNESS_INNER_DEADLINE_SECONDS < gate._HARNESS_TIMEOUT_SECONDS
+    assert gate._HARNESS_TIMEOUT_SECONDS == 600
+    assert gate._HARNESS_TIMEOUT_EXIT == 14
+
+
+def test_harness_and_gate_remain_excluded_from_release_source_digest() -> None:
+    """Falsifiable: harness/gate/integrity edits must not move product digest membership."""
+    from js.echo.ledger import release_gates as rg
+
+    assert not rg._release_source_member_included(
+        Path("desktop/tests/harness/tauri_webview_harness.swift")
+    )
+    assert not rg._release_source_member_included(Path("scripts/run_tauri_webview_gate.py"))
+    assert not rg._release_source_member_included(
+        Path("tests/test_tauri_webview_gate_integrity.py")
+    )
+    prefixes = {path.as_posix() for path in rg._RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES}
+    excludes = {path.as_posix() for path in rg._RELEASE_SOURCE_DIGEST_EXCLUDE}
+    assert "desktop/tests/harness" in prefixes
+    assert "scripts/run_tauri_webview_gate.py" in excludes
+    assert "tests/test_tauri_webview_gate_integrity.py" in excludes
+
+
+def test_wrapper_timeout_publishes_result_and_fail_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Timeout must leave durable evidence; never delete the only result.json first."""
+    evidence, app, harness_bundle, _manifest = _fixture(tmp_path)
+    monkeypatch.setattr("desktop.build_driver.verify_manifest", lambda *_a, **_kw: [])
+    reaped: list[int] = []
+    flushed_detail = "partial-before-reap"
+
+    class FakePopen:
+        def __init__(self, cmd: list[str], **_kw: object) -> None:
+            self.pid = 4242
+            self._result_path = Path(cmd[cmd.index("--result-path") + 1])
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            # Simulate harness flush mid-run, then outer 600s reap.
+            self._result_path.parent.mkdir(parents=True, exist_ok=True)
+            self._result_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": gate.RESULT_SCHEMA_VERSION,
+                        "ok": False,
+                        "status": "running",
+                        "nonce": "a" * 64,
+                        "scenarios": {
+                            "cold_start_controlled_env": {
+                                "passed": True,
+                                "status": "passed",
+                                "detail": flushed_detail,
+                                "duration_ms": 1.0,
+                                "error_code": None,
+                            }
+                        },
+                        "app_sha256": None,
+                        "app_tree_sha256": None,
+                        "harness_sha256": None,
+                        "desktop_manifest_sha256": None,
+                        "bundle_identifier": "",
+                        "accessibility_authorized": True,
+                        "target_pid": 1,
+                        "started_utc": "2026-09-12T00:00:00Z",
+                        "finished_utc": "2026-09-12T00:00:01Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            raise subprocess.TimeoutExpired(cmd=["harness"], timeout=timeout or 1)
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return -9
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    def fake_reap(root_pid: int, **_kwargs: object) -> set[int]:
+        reaped.append(root_pid)
+        return {root_pid}
+
+    monkeypatch.setattr(gate, "reap_owned_tree", fake_reap)
+
+    rc = gate.main(
+        [
+            "--evidence-dir",
+            str(evidence),
+            "--app-path",
+            str(app),
+            "--harness-path",
+            str(harness_bundle),
+        ]
+    )
+    assert rc == 1
+    assert reaped == [4242]
+    published = evidence / "tauri-webview/result.json"
+    fail_reason = evidence / "tauri-webview/fail_reason.txt"
+    assert published.is_file()
+    assert fail_reason.is_file()
+    payload = json.loads(published.read_text(encoding="utf-8"))
+    assert payload["scenarios"]["cold_start_controlled_env"]["detail"] == flushed_detail
+    reason_text = fail_reason.read_text(encoding="utf-8")
+    assert "timed out after 600s" in reason_text
+    assert "owned .app + sidecar reaped" in reason_text
+    # private_dir must be gone, but evidence must remain outside it.
+    leftovers = [
+        path
+        for path in (evidence / "tauri-webview").iterdir()
+        if path.is_dir() and path.name.startswith("run-")
+    ]
+    assert leftovers == []
+
+
+def test_wrapper_timeout_writes_synthetic_result_when_harness_never_flushed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    evidence, app, harness_bundle, _manifest = _fixture(tmp_path)
+    monkeypatch.setattr("desktop.build_driver.verify_manifest", lambda *_a, **_kw: [])
+
+    class FakePopen:
+        def __init__(self, *_a: object, **_kw: object) -> None:
+            self.pid = 4242
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            raise subprocess.TimeoutExpired(cmd=["harness"], timeout=timeout or 1)
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return -9
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(gate, "reap_owned_tree", lambda *_a, **_k: {4242})
+
+    rc = gate.main(
+        [
+            "--evidence-dir",
+            str(evidence),
+            "--app-path",
+            str(app),
+            "--harness-path",
+            str(harness_bundle),
+        ]
+    )
+    assert rc == 1
+    published = json.loads((evidence / "tauri-webview/result.json").read_text(encoding="utf-8"))
+    assert published["ok"] is False
+    assert published["status"] == "harness_timeout"
+    assert "harness_wall_deadline" in published["scenarios"]
+    assert (evidence / "tauri-webview/fail_reason.txt").is_file()
+
+
+def test_wrapper_harness_self_timeout_exit_publishes_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exit 14 (inner wall) must publish flushed result before private_dir delete."""
+
+    def mutate(result: dict[str, object], _cmd: list[str]) -> None:
+        result["ok"] = False
+        result["status"] = "harness_timeout"
+        result["scenarios"] = {
+            "harness_wall_deadline": {
+                "passed": False,
+                "status": "failed",
+                "detail": "wall deadline",
+                "duration_ms": 480000.0,
+                "error_code": "harness_timeout",
+            }
+        }
+
+    rc, evidence, _, _ = _run(
+        monkeypatch, tmp_path, mutate=mutate, returncode=gate._HARNESS_TIMEOUT_EXIT
+    )
+    assert rc == 1
+    published = evidence / "tauri-webview/result.json"
+    assert published.is_file()
+    payload = json.loads(published.read_text(encoding="utf-8"))
+    assert payload["status"] == "harness_timeout"
+    assert "self-timeout" in (evidence / "tauri-webview/fail_reason.txt").read_text()
+
+
+def test_publish_failure_evidence_prefers_flushed_private_result(tmp_path: Path) -> None:
+    result_dir = tmp_path / "tauri-webview"
+    private_dir = result_dir / "run-abc"
+    private_dir.mkdir(parents=True)
+    private_result = private_dir / "result.json"
+    private_result.write_text('{"ok":false,"status":"running","nonce":"x"}', encoding="utf-8")
+    published = result_dir / "result.json"
+    out = gate.publish_failure_evidence(
+        private_dir=private_dir,
+        published_result=published,
+        result_dir=result_dir,
+        fail_reason="unit-test-timeout",
+        nonce="n" * 64,
+    )
+    assert out == published
+    assert published.read_text(encoding="utf-8") == private_result.read_text(encoding="utf-8")
+    assert (result_dir / "fail_reason.txt").read_text(encoding="utf-8") == "unit-test-timeout\n"
 
 
 def test_process_tree_expands_sidecar_leader_group_only() -> None:
@@ -426,6 +638,9 @@ def test_wrapper_timeout_reaps_owned_tree(
     )
     assert rc == 1
     assert reaped == [4242]
+    # Evidence must still be published on the reap path.
+    assert (evidence / "tauri-webview/fail_reason.txt").is_file()
+    assert (evidence / "tauri-webview/result.json").is_file()
 
 
 def _artifact_bindings(
