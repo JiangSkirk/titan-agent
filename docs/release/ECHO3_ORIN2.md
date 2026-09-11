@@ -42,9 +42,16 @@ pip install ./packages/echo-core ./packages/orin-proto ./packages/orin-guard
 Do not push a hyphen-free `v*` tag (that runs `stable-release-gate`).
 Pre-release tags must contain a hyphen, for example `v0.1.5-rc`.
 
+Kernel source RC tags are separate from the **outer-shell** calendar tag
+`js-agent-outer-2026.09` (Host + desktop packaging cut #3). See
+[JS_AGENT_OUTER.md](JS_AGENT_OUTER.md).
+
 ## Host vs kernel
 
 - Kernel: `packages/echo-core`, `packages/orin-guard`, `packages/orin-proto`
 - Host shims: `js.echo`, `js.orin`
+- Outer shell (cut #3): Host pip package + `desktop/` Tauri + release scripts
+  + root `LICENSE` — depends on the triad; does not republish Orin internals
+  ([JS_AGENT_OUTER.md](JS_AGENT_OUTER.md))
 - Load-bearing boundary against an adversarial model remains **OS isolation**
   ([SECURITY.md](../../SECURITY.md)). Echo/Orin are authorization and depth.

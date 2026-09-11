@@ -8,6 +8,12 @@ The model is the engine. The harness is the complete frame that lets the engine 
 >
 > [Security policy / trust model](SECURITY_en.md) · [中文安全政策](SECURITY.md)
 
+Echo 3.0 / Orin 2.0 live as workspace packages (`packages/echo-core`,
+`packages/orin-proto`, `packages/orin-guard`) — path-install via `uv sync`;
+not on PyPI yet. Kernel RC: [docs/release/ECHO3_ORIN2.md](docs/release/ECHO3_ORIN2.md).
+Outer Host / desktop packaging cut #3 (proposed tag `js-agent-outer-2026.09`):
+[docs/release/JS_AGENT_OUTER.md](docs/release/JS_AGENT_OUTER.md).
+
 ## Core Harness Capabilities
 
 ### 🧠 Memory & Context Capsules

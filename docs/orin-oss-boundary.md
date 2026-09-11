@@ -44,6 +44,22 @@ installed alone for framing. A GateKernel host still needs the full triad.
 - Stage B product-default flip (`orin.enabled` / `orin.enforce=true`) —
   Host debt date **2026-10-01**
 
+## Outer shell (separate packaging cut #3)
+
+The **JS Agent outer shell** is the Host + desktop releasable surface. It
+depends on this open triad at install / sidecar freeze time and does **not**
+republish `orin-*` / GateKernel internals.
+
+| Outer piece | Role |
+| --- | --- |
+| Host pip (`js` / `js_work`, root `LICENSE`) | `js-agent` 0.1.5 wheel/sdist |
+| Desktop / Tauri (`desktop/`) | Unsigned macOS app (product 0.1.0) |
+| Release scripts / gates | Dry-run + evidence; not kernel publish |
+
+Proposed outer tag: **`js-agent-outer-2026.09`**. Full matrix and dry-run
+recipe: [docs/release/JS_AGENT_OUTER.md](release/JS_AGENT_OUTER.md).
+Kernel RC notes remain in [docs/release/ECHO3_ORIN2.md](release/ECHO3_ORIN2.md).
+
 ## Authority chain (unchanged)
 
 ```text
