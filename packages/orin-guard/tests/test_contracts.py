@@ -101,6 +101,31 @@ def test_tool_effect_empty_lease_id_denied() -> None:
     assert model.effect_class == "model"
 
 
+def test_connector_effect_empty_lease_id_denied() -> None:
+    kernel = GateKernel(b"k" * 32)
+    with pytest.raises(TicketDenied, match="lease_id"):
+        kernel.issue(_plane(effect_class="connector"), lease_id="")
+
+
+def test_mac_lease_id_mismatch_denied() -> None:
+    kernel = GateKernel(b"k" * 32)
+    ticket = kernel.issue(_plane(), lease_id="lease-bound", args_hash="args-1")
+    tampered = dataclasses.replace(ticket, lease_id="lease-other")
+    with pytest.raises(TicketDenied, match="MAC mismatch"):
+        kernel.consume(tampered, owner="o", run="r")
+
+
+def test_chat_only_ticket_id_pinned_by_gatekernel() -> None:
+    from orin_guard.kernel.gate import CHAT_ONLY_TICKET_PREFIX
+
+    kernel = GateKernel(b"k" * 32)
+    lease = f"{CHAT_ONLY_TICKET_PREFIX}chat-oss-1"
+    ticket = kernel.issue(_plane(effect_class="model"), lease_id=lease)
+    assert ticket.ticket_id == lease
+    assert ticket.lease_id == lease
+    kernel.consume(ticket, owner="o", run="r")
+
+
 def test_stored_expires_at_enforced() -> None:
     kernel = GateKernel(b"k" * 32)
     ticket = kernel.issue(_plane(), lease_id="lease-exp", now=100.0)
@@ -139,3 +164,64 @@ def test_orin_allow_ambient_env_ignored_still_denies(
     kernel = GateKernel(b"k" * 32)
     with pytest.raises(TicketDenied, match="lease_id"):
         kernel.issue(_plane(), lease_id="")
+
+
+def test_conjunction_has_no_timeout_or_yolo_allow_hatch() -> None:
+    """timeout / scanner-unavailable / ambient hatches must never flip deny → allow."""
+
+    root = PACKAGE_ROOT / "orin_guard"
+    # Hatch identifiers only — prose that says "no YOLO" is fine.
+    banned = (
+        "ORIN_ALLOW_AMBIENT",
+        "ALLOW_ON_TIMEOUT",
+        "timeout_allow",
+        "scanner_unavailable_allow",
+        "yolo_allow",
+        "YOLO_ALLOW",
+    )
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for token in banned:
+            if token in text:
+                offenders.append(f"{path.relative_to(PACKAGE_ROOT)}:{token}")
+    assert offenders == []
+    with pytest.raises(ConjunctionDenied, match="unsatisfiable"):
+        require_conjunction(frozenset({"private.read", "web.read", "egress.send"}))
+
+
+def test_orin_guard_tests_has_no_init_py() -> None:
+    """Package tests must not ship ``__init__.py`` (shadows repo ``tests``)."""
+
+    assert not (PACKAGE_ROOT / "tests" / "__init__.py").exists()
+
+
+def test_package_ships_standalone_mit_license() -> None:
+    """Independent publish must not rely on the monorepo root LICENSE only."""
+
+    license_path = PACKAGE_ROOT / "LICENSE"
+    text = license_path.read_text(encoding="utf-8")
+    assert license_path.is_file()
+    assert "MIT License" in text
+    assert "Permission is hereby granted" in text
+    notices = PACKAGE_ROOT / "THIRD_PARTY_NOTICES.md"
+    assert notices.is_file()
+    assert "echo-core" in notices.read_text(encoding="utf-8")
+
+
+def test_no_public_effect_ticket_symbol() -> None:
+    """EffectTicket is GateKernel-internal; CapabilityLease is the public ticket."""
+
+    import orin_guard
+
+    assert "EffectTicket" not in orin_guard.__all__
+    assert not hasattr(orin_guard, "EffectTicket")
+
+
+def test_frozen_kernel_denies_when_enforce() -> None:
+    from orin_guard.kernel.gate import KernelUnavailable
+
+    kernel = GateKernel(b"k" * 32, enforce=True)
+    kernel.freeze()
+    with pytest.raises(KernelUnavailable, match="frozen"):
+        kernel.issue(_plane(), lease_id="lease-frozen")

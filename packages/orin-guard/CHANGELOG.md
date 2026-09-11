@@ -6,6 +6,16 @@
   CredBroker, MCPGate, conjunction).
 - Tickets are single-use; `consume` rejects stored `expires_at`.
 - GateKernel MAC binds `grants_digest`, `args_hash`, and `lease_id`.
+- Empty `lease_id` denied for tool/connector; `chat_only:{lease_id}` pin.
 - CredBroker `exchange` pops the secret after one use.
-- Lethal trifecta is structurally unsatisfiable.
+- Lethal trifecta is structurally unsatisfiable; no
+  `ORIN_ALLOW_AMBIENT` / YOLO / timeout→allow hatch.
+- Openable README/API surface for third-party hosts (no JS Agent / desktop
+  private paths). Stage B product-default flip remains Host debt
+  (2026-10-01); Stage C cells stay `not_implemented`.
+- Public ticket is Echo `CapabilityLease` only; `EffectTicket` is
+  GateKernel-internal and is not exported from `orin_guard`.
+- Standalone package `LICENSE` (MIT) + `THIRD_PARTY_NOTICES.md` for
+  independent publish. Hard peers: `echo-core` + `orin-proto` (no taint stub);
+  see `docs/orin-oss-boundary.md`.
 - Not published to PyPI. Install from the titan-agent monorepo.

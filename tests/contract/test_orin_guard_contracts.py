@@ -253,3 +253,69 @@ def test_tool_effect_empty_lease_id_denied() -> None:
             PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1),
             lease_id="",
         )
+
+
+def test_open_packages_ship_standalone_mit_license() -> None:
+    """orin-guard / orin-proto / echo-core each carry MIT for independent publish."""
+
+    for rel in (
+        "packages/orin-guard/LICENSE",
+        "packages/orin-proto/LICENSE",
+        "packages/echo-core/LICENSE",
+    ):
+        path = REPO_ROOT / rel
+        text = path.read_text(encoding="utf-8")
+        assert "MIT License" in text
+        assert "Permission is hereby granted" in text
+
+
+def test_no_public_effect_ticket_symbol() -> None:
+    """Frozen: EffectTicket stays GateKernel-internal; no dual-ticket public API."""
+
+    import orin_guard
+
+    assert "EffectTicket" not in orin_guard.__all__
+    assert not hasattr(orin_guard, "EffectTicket")
+
+
+def test_orin_guard_declares_echo_core_hard_dependency() -> None:
+    """No stub: echo-core remains a required peer of orin-guard."""
+
+    text = (REPO_ROOT / "packages" / "orin-guard" / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    assert "echo-core==3.0.0" in text
+    assert "orin-proto==2.0.0" in text
+
+
+def test_connector_effect_empty_lease_id_denied() -> None:
+    kernel = GateKernel(b"k" * 32)
+    with pytest.raises(TicketDenied, match="lease_id"):
+        kernel.issue(
+            PolicyPlane("o", "s", "r", "connector", frozenset({"private.read"}), 1),
+            lease_id="",
+        )
+
+
+def test_mac_lease_id_mismatch_denied() -> None:
+    import dataclasses
+
+    kernel = GateKernel(b"k" * 32)
+    plane = PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1)
+    ticket = kernel.issue(plane, lease_id="lease-ml", args_hash="args-1")
+    bad = dataclasses.replace(ticket, lease_id="lease-forged")
+    with pytest.raises(TicketDenied, match="MAC mismatch"):
+        kernel.consume(bad, owner="o", run="r")
+
+
+def test_chat_only_ticket_id_pinned_by_gatekernel() -> None:
+    from orin_guard.kernel.gate import CHAT_ONLY_TICKET_PREFIX
+
+    kernel = GateKernel(b"k" * 32)
+    lease = f"{CHAT_ONLY_TICKET_PREFIX}chat-contract-1"
+    ticket = kernel.issue(
+        PolicyPlane("o", "s", "r", "model", frozenset({"private.read"}), 1),
+        lease_id=lease,
+    )
+    assert ticket.ticket_id == lease
+    assert ticket.lease_id == lease
