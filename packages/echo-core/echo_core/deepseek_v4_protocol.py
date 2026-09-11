@@ -114,8 +114,10 @@ class ProtocolDenyCode(StrEnum):
     """Fail-closed deny reason codes (never allow-on-soft-fail).
 
     These are Echo protocol-pin codes. Host/Orin GateKernel ``reason_code``
-    strings are a separate plane — see docs mapping. Do not treat a missing
-    Orin reason_code as soft-allow for these denials.
+    strings are a separate plane. Single source of truth for the correlation
+    table: :mod:`echo_core.deny_code_mapping` (and
+    ``docs/echo/DEEPSEEK_V4_TOOL_EDIT_PROTOCOL.md``). A missing Orin
+    ``reason_code`` must never soft-allow these denials.
     """
 
     UNKNOWN_MODEL = "deepseek_v4.unknown_model"

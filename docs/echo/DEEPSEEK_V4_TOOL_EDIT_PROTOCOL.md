@@ -47,20 +47,41 @@ the DeepSeek V4 default:
 Contract tests fail closed if a competing protocol is wired as the V4 default.
 Deny reason codes (`ProtocolDenyCode`) never create allow-on-soft-fail.
 
-## `ProtocolDenyCode` ↔ Host/Orin `reason_code` (docs only)
+## `ProtocolDenyCode` ↔ Host/Orin `reason_code`
 
-| Echo `ProtocolDenyCode` | Meaning | Relation to Orin/Host |
-| --- | --- | --- |
-| `deepseek_v4.unknown_model` | Model outside V4 lock | Echo pin only; not an Orin GateKernel ticket |
-| `deepseek_v4.competing_default_protocol` | Non-`file_edit` default wire format | Echo pin only |
-| `deepseek_v4.thick_default_surface` | Default tool set >5 or includes meta expand names | Echo pin / Host advertising |
-| `deepseek_v4.ambient_exec_default` | shell/python ambient on harness_edit | Echo pin; Host `echo_exec_tools` must stay opt-in |
-| `deepseek_v4.invalid_*` | Schema/args/error envelope shape | Echo pin validation |
+**Single source of truth (code):** `packages/echo-core/echo_core/deny_code_mapping.py`  
+**Docs mirror:** this section (must match `mapping_manifest()` / the module rows).
 
-Orin GateKernel `reason_code` strings (MAC / empty-lease / chat_only) remain
-Orin-owned. This table is a **mapping note only** — it does not invent a second
-authority plane. A missing Orin `reason_code` must never soft-allow an Echo pin
-denial.
+This is a **mapping table only** — not a second authority. Orin GateKernel /
+`orin-guard` ownership of MAC / empty-lease / chat_only semantics is unchanged.
+Fail-closed: **unknown mapping = deny, never allow**. A missing Orin
+`reason_code` must never soft-allow an Echo pin denial.
+
+| Echo `ProtocolDenyCode` | Host/Orin `reason_code` | Plane | Notes |
+| --- | --- | --- | --- |
+| `deepseek_v4.unknown_model` | *(none — Echo-pin-only)* | `echo_pin` | Outside V4 lock; not a GateKernel ticket |
+| `deepseek_v4.competing_default_protocol` | *(none — Echo-pin-only)* | `echo_pin` | Non-`file_edit` default wire format |
+| `deepseek_v4.invalid_tool_schema` | *(none — Echo-pin-only)* | `echo_pin` | OpenAI FC schema shape invalid |
+| `deepseek_v4.invalid_edit_args` | *(none — Echo-pin-only)* | `echo_pin` | `file_edit` path/search/replace invalid |
+| `deepseek_v4.invalid_error_shape` | *(none — Echo-pin-only)* | `echo_pin` | Error envelope must be `success=false` + error |
+| `deepseek_v4.ambient_exec_default` | `echo_exec_tools_required` | `host_advertising` | Correlate with `SecurityConfig.echo_exec_tools=false`; Orin `local_policy_denied` must not soft-allow |
+| `deepseek_v4.thick_default_surface` | `echo_tool_surface_exceeds_lite` | `host_advertising` | Default boot surface >5 / includes meta expand tools |
+
+### Related Orin/Host tokens (correlation only)
+
+These may appear near D1 / GateKernel denials. **None authorize a
+`ProtocolDenyCode`:**
+
+`local_policy_denied`, `freeze_active`, `budget_exhausted`,
+`effect_class_not_granted`, `intent_expired`, `no_state_witness`,
+`unregistered_or_invalid_manifest`, `bypasses_echo_effect_authority`,
+`chat_only_path_denies_sink_effects`, `refuse_ambient_effect`,
+`enabled_without_enforce`, `exec_without_stamp`, `consume_before_stamp`,
+`echo_exec_tools_required`, `echo_tool_surface_exceeds_lite`.
+
+Lookup API: `lookup_protocol_deny_mapping` / `host_orin_reason_for` /
+`assert_mapping_denies` — unknown codes raise `DenyMappingError`.
+
 
 ## Host wiring
 
@@ -77,3 +98,4 @@ Advertisement is not authority: expanding the advertised schema does not bypass
 - Same-model scaffold: `benchmarks/bench_echo_vs_minimal_same_model.py`
 - D1 contracts: `tests/contract/test_echo_effect_authority.py`,
   `tests/contract/test_deepseek_v4_protocol.py`
+- Deny-code SSOT: `packages/echo-core/echo_core/deny_code_mapping.py`

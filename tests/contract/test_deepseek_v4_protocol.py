@@ -208,3 +208,45 @@ def test_default_edit_protocol_enum_exclusive() -> None:
     assert DEFAULT_EDIT_PROTOCOL is EditProtocolId.OPENAI_FUNCTION_FILE_EDIT
     assert DEFAULT_EDIT_PROTOCOL not in COMPETING_EDIT_PROTOCOLS
     assert EditProtocolId.APPLY_PATCH in COMPETING_EDIT_PROTOCOLS
+
+
+def test_deny_code_mapping_ssot_complete_and_fail_closed() -> None:
+    """ProtocolDenyCode ↔ Host/Orin reason_code: mapping only, unknown ≠ allow."""
+
+    from echo_core.deny_code_mapping import (
+        RELATED_ORIN_HOST_REASON_CODES,
+        DenyMappingError,
+        assert_mapping_denies,
+        host_orin_reason_for,
+        lookup_protocol_deny_mapping,
+        mapping_manifest,
+        protocol_deny_code_mapping_rows,
+    )
+
+    rows = protocol_deny_code_mapping_rows()
+    codes = {row.protocol_deny_code for row in rows}
+    assert codes == {c.value for c in ProtocolDenyCode}
+    assert mapping_manifest()["second_authority"] is False
+    assert mapping_manifest()["rule"] == "unknown_mapping_is_deny_not_allow"
+
+    for code in ProtocolDenyCode:
+        row = lookup_protocol_deny_mapping(code)
+        assert assert_mapping_denies(code) == row
+        mapped = host_orin_reason_for(code)
+        if mapped is not None:
+            assert mapped in RELATED_ORIN_HOST_REASON_CODES
+        # None mapping is still deny (Echo-pin-only), never allow.
+
+    with pytest.raises(DenyMappingError, match="unknown ProtocolDenyCode"):
+        lookup_protocol_deny_mapping("deepseek_v4.not_a_real_code")
+    with pytest.raises(DenyMappingError):
+        host_orin_reason_for("deepseek_v4.not_a_real_code")
+    with pytest.raises(DenyMappingError):
+        assert_mapping_denies("allow_please")
+
+    # Docs must point at the SSOT module.
+    doc = (REPO_ROOT / "docs" / "echo" / "DEEPSEEK_V4_TOOL_EDIT_PROTOCOL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "deny_code_mapping.py" in doc
+    assert "unknown mapping = deny" in doc.lower() or "unknown_mapping_is_deny" in doc
