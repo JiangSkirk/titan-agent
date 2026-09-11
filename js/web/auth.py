@@ -1006,9 +1006,16 @@ class AuthManager:
             try:
                 persist(plaintext)
             except Exception:
-                with db_connection(self._db_path) as conn:
-                    conn.execute("DELETE FROM api_keys WHERE key_hash = ?", (key_hash,))
-                    conn.commit()
+                # Same compensation shape as AppShell shared bootstrap: revoke
+                # the reserved DB row when recovery-file persistence fails.
+                try:
+                    self.revoke_key(key_hash)
+                except Exception:
+                    with db_connection(self._db_path) as conn:
+                        conn.execute(
+                            "DELETE FROM api_keys WHERE key_hash = ?", (key_hash,)
+                        )
+                        conn.commit()
                 raise
         logger.info("Created bootstrap API key with admin role")
         return plaintext
