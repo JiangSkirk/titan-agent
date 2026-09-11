@@ -169,9 +169,12 @@ _RELEASE_SOURCE_DIGEST_EXCLUDE = frozenset(
     }
 )
 # Directory prefixes omitted from the digest (exact file excludes stay in the set above).
+# Matching is relative == prefix or prefix in relative.parents only — never
+# "tests" in relative.parts — so packages/*/tests (orin-*/echo-core) stay in.
 _RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES = frozenset(
     {
         Path("desktop/tests/harness"),
+        Path("tests"),
     }
 )
 _RELEASE_SOURCE_ALLOWED_EMPTY_FILES = frozenset({Path("tests/echo/__init__.py")})
@@ -547,7 +550,10 @@ def validate_release_source_integrity(root: Path) -> None:
         return regular_files
 
     for relative in _RELEASE_SOURCE_DIGEST_SURFACES:
-        if relative in _RELEASE_SOURCE_DIGEST_EXCLUDE:
+        # Skip exact excludes and prefix-excluded surface roots the same way
+        # (e.g. Path("tests") on SURFACES but in EXCLUDE_PREFIXES must not
+        # fail closed as "tests: empty directory" after every child is ignored).
+        if not _release_source_member_included(relative):
             continue
         candidate = resolved_root / relative
         try:
