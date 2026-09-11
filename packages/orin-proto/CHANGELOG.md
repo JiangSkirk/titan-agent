@@ -6,4 +6,6 @@
 - No runtime, no secrets, no I/O.
 - Documented openable `pack` / `unpack` / `KNOWN_KINDS` surface for
   GateKernel sidecar hosts (GuardianSPI stays in echo-core).
+- Standalone package `LICENSE` (MIT) for independent publish; see
+  `docs/orin-oss-boundary.md`.
 - Not published to PyPI. Install from the titan-agent monorepo.

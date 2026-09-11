@@ -196,6 +196,19 @@ def test_orin_guard_tests_has_no_init_py() -> None:
     assert not (PACKAGE_ROOT / "tests" / "__init__.py").exists()
 
 
+def test_package_ships_standalone_mit_license() -> None:
+    """Independent publish must not rely on the monorepo root LICENSE only."""
+
+    license_path = PACKAGE_ROOT / "LICENSE"
+    text = license_path.read_text(encoding="utf-8")
+    assert license_path.is_file()
+    assert "MIT License" in text
+    assert "Permission is hereby granted" in text
+    notices = PACKAGE_ROOT / "THIRD_PARTY_NOTICES.md"
+    assert notices.is_file()
+    assert "echo-core" in notices.read_text(encoding="utf-8")
+
+
 def test_frozen_kernel_denies_when_enforce() -> None:
     from orin_guard.kernel.gate import KernelUnavailable
 

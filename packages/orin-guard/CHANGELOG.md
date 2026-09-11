@@ -13,4 +13,7 @@
 - Openable README/API surface for third-party hosts (no JS Agent / desktop
   private paths). Stage B product-default flip remains Host debt
   (2026-10-01); Stage C cells stay `not_implemented`.
+- Standalone package `LICENSE` (MIT) + `THIRD_PARTY_NOTICES.md` for
+  independent publish. Hard peers: `echo-core` + `orin-proto` (no taint stub);
+  see `docs/orin-oss-boundary.md`.
 - Not published to PyPI. Install from the titan-agent monorepo.

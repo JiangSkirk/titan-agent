@@ -18,8 +18,9 @@ propose → issue(PENDING) → GuardianSPI.stamp(GateKernel)
   → Host LedgerAppendPort durable consume → Interpreter.exec
 ```
 
-Depends on workspace packages `echo-core` (lease/taint vocabulary) and
-`orin-proto`. Does **not** import `js.*`.
+**Required peers:** `echo-core` (lease / taint / sink vocabulary — also an
+openable kernel) and `orin-proto` (orin/v2 frames). Does **not** import
+`js.*`. See [docs/orin-oss-boundary.md](../../docs/orin-oss-boundary.md).
 
 The lethal trifecta `private.read ∩ web.read ∩ egress.send` is
 structurally unsatisfiable. There is **no** YOLO / timeout /
@@ -31,13 +32,22 @@ PyPI is **not** published. Install from this monorepo.
 
 ## Install
 
-From the repository root:
+Third parties must install the **full open triad** (echo-core is a hard
+peer, not optional — do not stub taint/sinks):
 
 ```bash
-uv sync
-# or
+# explicit path installs (recommended for consumers)
 pip install ./packages/echo-core ./packages/orin-proto ./packages/orin-guard
+
+# or from the repository root
+uv sync
 ```
+
+| Package | Why required |
+| --- | --- |
+| `echo-core==3.0.0` | lease / taint / sink vocabulary used by grants, IFC, exec checks |
+| `orin-proto==2.0.0` | orin/v2 wire kinds (no I/O) |
+| `orin-guard==2.0.0` | this GateKernel package |
 
 Data directory: `~/.orin-guard/` (never writes into JS Agent state dirs).
 
@@ -101,4 +111,7 @@ receipt = kernel.consume(ticket, owner="owner", run="run")
 
 ## License
 
-MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+This package ships its own standalone MIT [LICENSE](LICENSE) for
+independent publish (does not rely on the monorepo root license file).
+See also [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for peer
+package attributions (`echo-core`, `orin-proto`).

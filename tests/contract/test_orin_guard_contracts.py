@@ -255,6 +255,30 @@ def test_tool_effect_empty_lease_id_denied() -> None:
         )
 
 
+def test_open_packages_ship_standalone_mit_license() -> None:
+    """orin-guard / orin-proto / echo-core each carry MIT for independent publish."""
+
+    for rel in (
+        "packages/orin-guard/LICENSE",
+        "packages/orin-proto/LICENSE",
+        "packages/echo-core/LICENSE",
+    ):
+        path = REPO_ROOT / rel
+        text = path.read_text(encoding="utf-8")
+        assert "MIT License" in text
+        assert "Permission is hereby granted" in text
+
+
+def test_orin_guard_declares_echo_core_hard_dependency() -> None:
+    """No stub: echo-core remains a required peer of orin-guard."""
+
+    text = (REPO_ROOT / "packages" / "orin-guard" / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    assert "echo-core==3.0.0" in text
+    assert "orin-proto==2.0.0" in text
+
+
 def test_connector_effect_empty_lease_id_denied() -> None:
     kernel = GateKernel(b"k" * 32)
     with pytest.raises(TicketDenied, match="lease_id"):
