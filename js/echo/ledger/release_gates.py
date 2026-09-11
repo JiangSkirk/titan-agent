@@ -162,6 +162,12 @@ _RELEASE_SOURCE_DIGEST_EXCLUDE = frozenset(
         # while still validating them via the independent audit-report gate.
         Path("docs/echo/ECHO_10_ROUND_AUDIT.md"),
         Path("docs/echo/ECHO_FINAL_REPLACEMENT_REPORT.md"),
+        # UI-test harness / webview gate / gate-integrity tests bind the product .app
+        # via release_source_digest but are not themselves product release inputs.
+        # Prefix-exclude the harness tree so future harness files stay out too.
+        Path("desktop/tests/harness"),
+        Path("scripts/run_tauri_webview_gate.py"),
+        Path("tests/test_tauri_webview_gate_integrity.py"),
     }
 )
 _RELEASE_SOURCE_ALLOWED_EMPTY_FILES = frozenset({Path("tests/echo/__init__.py")})
@@ -3458,7 +3464,11 @@ def _baseline_workload_corpus_digest() -> str:
 
 
 def _release_source_member_included(relative: Path) -> bool:
-    if relative in _RELEASE_SOURCE_DIGEST_EXCLUDE:
+    # Exact paths and directory prefixes in EXCLUDE are both omitted from the digest.
+    if any(
+        relative == excluded or excluded in relative.parents
+        for excluded in _RELEASE_SOURCE_DIGEST_EXCLUDE
+    ):
         return False
     if (
         any(part in _RELEASE_SOURCE_TOOL_CACHE_PARTS for part in relative.parts)

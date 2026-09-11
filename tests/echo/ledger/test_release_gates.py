@@ -808,9 +808,17 @@ def test_release_source_digest_version_and_surfaces_cover_release_inputs() -> No
     assert "docs/security/ECHO_LIVE_ACCEPTANCE.json" in excludes
     assert "docs/echo/ECHO_10_ROUND_AUDIT.md" in excludes
     assert "docs/echo/ECHO_FINAL_REPLACEMENT_REPORT.md" in excludes
+    # Harness / webview-gate / gate-integrity sources are not product digest inputs.
+    assert "desktop/tests/harness" in excludes
+    assert "scripts/run_tauri_webview_gate.py" in excludes
+    assert "tests/test_tauri_webview_gate_integrity.py" in excludes
     # No duplicate nested file listings alongside parent dirs.
     assert "benchmarks/baseline.json" not in surfaces
     assert len(surfaces) == len(set(surfaces))
+    # Surfaces stay broad; harness exclusion is via EXCLUDE, not surface removal.
+    assert "desktop" in surfaces
+    assert "scripts" in surfaces
+    assert "tests" in surfaces
 
 
 def test_package_tool_caches_are_excluded_from_release_source_integrity(
@@ -886,6 +894,104 @@ def test_audit_report_updates_do_not_change_runtime_source_digest(
     assert "docs/echo/ECHO_10_ROUND_AUDIT.md" in {
         path.as_posix() for path in rg._RELEASE_SOURCE_DIGEST_EXCLUDE
     }
+
+
+def test_harness_webview_gate_mutations_do_not_change_release_source_digest(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Harness / webview-gate / integrity-test edits must not invalidate product digest."""
+    from js.echo.ledger import release_gates as rg
+
+    monkeypatch.setattr(
+        rg,
+        "_RELEASE_SOURCE_DIGEST_SURFACES",
+        (
+            pathlib.Path("desktop"),
+            pathlib.Path("scripts"),
+            pathlib.Path("tests"),
+        ),
+    )
+    tree = {
+        "desktop/build_driver.py": "DRIVER_VERSION = 1\n",
+        "desktop/sidecar/host.py": "HOST_VERSION = 1\n",
+        "desktop/tests/harness/tauri_webview_harness.swift": "// harness v1\n",
+        "desktop/tests/harness/package_harness_app.sh": "#!/bin/sh\necho v1\n",
+        "scripts/run_tauri_webview_gate.py": "GATE_VERSION = 1\n",
+        "scripts/other_release_script.py": "OTHER = 1\n",
+        "tests/test_tauri_webview_gate_integrity.py": "INTEGRITY = 1\n",
+        "tests/test_other_release.py": "OTHER_TEST = 1\n",
+    }
+    for relative, content in tree.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    for relative in (
+        "desktop/tests/harness/tauri_webview_harness.swift",
+        "desktop/tests/harness/package_harness_app.sh",
+        "desktop/tests/harness/future_harness_helper.swift",
+        "scripts/run_tauri_webview_gate.py",
+        "tests/test_tauri_webview_gate_integrity.py",
+    ):
+        assert not rg._release_source_member_included(pathlib.Path(relative)), relative
+
+    before = rg.release_source_digest(tmp_path)
+    mutations = {
+        "desktop/tests/harness/tauri_webview_harness.swift": "// harness v2 mutated\n",
+        "desktop/tests/harness/package_harness_app.sh": "#!/bin/sh\necho v2\n",
+        "desktop/tests/harness/future_harness_helper.swift": "// future file\n",
+        "scripts/run_tauri_webview_gate.py": "GATE_VERSION = 2\n",
+        "tests/test_tauri_webview_gate_integrity.py": "INTEGRITY = 2\n",
+    }
+    for relative, content in mutations.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    assert rg.release_source_digest(tmp_path) == before
+
+    # Control: non-harness sources under the same surfaces must still move the digest.
+    (tmp_path / "desktop/sidecar/host.py").write_text("HOST_VERSION = 2\n", encoding="utf-8")
+    assert rg.release_source_digest(tmp_path) != before
+
+
+def test_kernel_triad_mutations_must_change_release_source_digest(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kernel/triad freeze surfaces must remain digest-binding (isolated tmp tree)."""
+    from js.echo.ledger import release_gates as rg
+
+    monkeypatch.setattr(
+        rg,
+        "_RELEASE_SOURCE_DIGEST_SURFACES",
+        (
+            pathlib.Path("packages/echo-core"),
+            pathlib.Path("packages/orin-proto"),
+            pathlib.Path("packages/orin-guard"),
+        ),
+    )
+    packages = (
+        ("packages/echo-core", "echo_core"),
+        ("packages/orin-proto", "orin_proto"),
+        ("packages/orin-guard", "orin_guard"),
+    )
+    for relative, package_name in packages:
+        pkg = tmp_path / relative / package_name
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(f"{package_name}_version = 1\n", encoding="utf-8")
+
+    baseline = rg.release_source_digest(tmp_path)
+    for relative, package_name in packages:
+        target = tmp_path / relative / package_name / "__init__.py"
+        before = rg.release_source_digest(tmp_path)
+        target.write_text(f"{package_name}_version = 2\n", encoding="utf-8")
+        after = rg.release_source_digest(tmp_path)
+        assert after != before, f"{relative} mutation must change release_source_digest"
+        # Restore so the next package mutation is measured against the same baseline.
+        target.write_text(f"{package_name}_version = 1\n", encoding="utf-8")
+        assert rg.release_source_digest(tmp_path) == baseline
 
 
 def test_echo_slo_rejects_missing_or_stale_source_digest(tmp_path: pathlib.Path) -> None:
