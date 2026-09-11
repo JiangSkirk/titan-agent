@@ -351,6 +351,115 @@ def test_swift_harness_per_scenario_timeout_and_mid_run_flush() -> None:
     )
 
 
+def test_swift_harness_cold_start_timeout_records_host_and_listener_evidence() -> None:
+    """S2 scenario_timeout / waitForSingleListener fail must record dual-host vs none."""
+    source = (
+        Path(__file__).resolve().parents[1] / "desktop/tests/harness/tauri_webview_harness.swift"
+    ).read_text(encoding="utf-8")
+
+    assert "func listenerWaitEvidence" in source
+    assert "func listenerWaitEvidenceFromSnapshot" in source
+    assert "func probeListeners" in source
+    assert "func probeProcessRows" in source
+    assert "host_count=" in source
+    assert "host_pids=" in source
+    assert "listener_count=" in source
+    assert "listeners=" in source
+    assert "tree_pids=" in source
+    assert "stdout_tail=" in source
+    assert "stderr_tail=" in source
+    assert "ps=" in source
+    assert "lsof=" in source
+    # Watchdog detail must append the evidence blob, not only the bare timeout text.
+    assert "scenario hard timeout after \\(Int(timeout))s | \\(evidence)" in source
+    assert "no single loopback listener within" in source
+    assert "rememberListenerWaitEvidence" in source
+    assert "appStdoutLogPath" in source
+    assert "appStderrLogPath" in source
+    # Cold-start must flush target_pid before wait so salvage keeps it on wedge.
+    cold = source.split('scenario(\n    "cold_start_controlled_env"', 1)[1]
+    cold = cold.split('scenario("process_tree_one_app_one_sidecar")', 1)[0]
+    assert "flushResult()" in cold
+    assert cold.index("result.target_pid") < cold.index("try waitForSingleListener")
+    assert cold.index("flushResult()") < cold.index("try waitForSingleListener")
+    assert cold.index("appStdoutLogPath = outLog") < cold.index("try waitForSingleListener")
+
+
+def test_parse_listener_wait_evidence_distinguishes_dual_host_from_never_spawned() -> None:
+    dual = (
+        "scenario hard timeout after 120s | app_running=true "
+        "tree_pids=[25649,25654,25656] host_count=2 host_pids=[25654,25656] "
+        "listener_count=0 listeners=[] ps=ok lsof=ok stdout_tail= stderr_tail="
+    )
+    parsed = gate.parse_listener_wait_evidence(dual)
+    assert parsed["host_count"] == "2"
+    assert parsed["host_pids"] == "[25654,25656]"
+    assert parsed["listener_count"] == "0"
+    assert parsed["listeners"] == "[]"
+    assert parsed["tree_pids"] == "[25649,25654,25656]"
+    assert parsed["ps"] == "ok"
+    assert parsed["lsof"] == "ok"
+
+    none_host = (
+        "no single loopback listener within 100s | app_running=true "
+        "tree_pids=[25649] host_count=0 host_pids=[] "
+        "listener_count=0 listeners=[] ps=ok lsof=ok stdout_tail=x stderr_tail=y"
+    )
+    none_parsed = gate.parse_listener_wait_evidence(none_host)
+    assert none_parsed["host_count"] == "0"
+    assert none_parsed["host_pids"] == "[]"
+    assert none_parsed["listener_count"] == "0"
+
+    hung = (
+        "scenario hard timeout after 120s | app_running=unknown tree_pids=[25649] "
+        "host_count=0 host_pids=[] listener_count=0 listeners=[] "
+        "ps=timeout lsof=skipped stdout_tail= stderr_tail="
+    )
+    hung_parsed = gate.parse_listener_wait_evidence(hung)
+    assert hung_parsed["ps"] == "timeout"
+    assert hung_parsed["lsof"] == "skipped"
+
+
+def test_wrapper_preserves_cold_start_timeout_evidence_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Salvage path must keep enriched S2 detail (host_count / listeners) parseable."""
+
+    detail = (
+        "scenario hard timeout after 120s | app_running=true "
+        "tree_pids=[25649,25654,25656] host_count=2 host_pids=[25654,25656] "
+        "listener_count=0 listeners=[] ps=ok lsof=ok stdout_tail= stderr_tail="
+    )
+
+    def mutate(result: dict[str, object], _cmd: list[str]) -> None:
+        result["ok"] = False
+        result["status"] = "failed"
+        result["target_pid"] = 25649
+        scenarios = result["scenarios"]
+        assert isinstance(scenarios, dict)
+        scenarios["cold_start_controlled_env"] = {
+            "passed": False,
+            "status": "timeout",
+            "detail": detail,
+            "duration_ms": 120098.0,
+            "error_code": "scenario_timeout",
+        }
+
+    rc, evidence, _, _ = _run(monkeypatch, tmp_path, mutate=mutate, returncode=2)
+    assert rc == 1
+    published = evidence / "tauri-webview/result.json"
+    assert published.is_file()
+    payload = json.loads(published.read_text(encoding="utf-8"))
+    cold = payload["scenarios"]["cold_start_controlled_env"]
+    assert cold["error_code"] == "scenario_timeout"
+    parsed = gate.parse_listener_wait_evidence(cold["detail"])
+    assert parsed["host_count"] == "2"
+    assert parsed["host_pids"] == "[25654,25656]"
+    assert parsed["listener_count"] == "0"
+    err = capsys.readouterr().err
+    assert "preserved result.json" in err
+
+
 def test_process_tree_expands_sidecar_leader_group_only() -> None:
     rows = {
         100: (1, 100, "js-agent-ui-test-harness"),

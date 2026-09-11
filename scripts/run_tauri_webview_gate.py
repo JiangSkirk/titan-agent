@@ -246,6 +246,40 @@ def _salvage_partial_result(result_path: Path, published_result: Path) -> bool:
     return True
 
 
+_LISTENER_WAIT_EVIDENCE_KEYS = (
+    "app_running",
+    "tree_pids",
+    "host_count",
+    "host_pids",
+    "listener_count",
+    "listeners",
+    "ps",
+    "lsof",
+    "stdout_tail",
+    "stderr_tail",
+)
+
+
+def parse_listener_wait_evidence(detail: str) -> dict[str, str]:
+    """Extract durable cold-start timeout fields from a scenario detail string.
+
+    Harness appends ``key=value`` tokens after ``|`` so salvaged result.json can
+    distinguish host-never-spawned vs dual-host vs lsof/ps hang without a schema
+    bump. Missing keys are omitted; values keep brackets (e.g. ``[25654,25656]``).
+    """
+    if not isinstance(detail, str) or not detail:
+        return {}
+    payload = detail.split("|", 1)[-1].strip() if "|" in detail else detail.strip()
+    out: dict[str, str] = {}
+    for token in payload.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        if key in _LISTENER_WAIT_EVIDENCE_KEYS:
+            out[key] = value
+    return out
+
+
 def _run_harness(
     cmd: list[str],
     *,
