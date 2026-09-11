@@ -142,6 +142,10 @@ _RELEASE_SOURCE_DIGEST_SURFACES = (
     Path("desktop"),
     Path("js"),
     Path("js_work"),
+    # Kernel triad: Host sidecar freeze stages these for PyInstaller (not Host sdist).
+    Path("packages/echo-core"),
+    Path("packages/orin-guard"),
+    Path("packages/orin-proto"),
     Path("pyproject.toml"),
     Path("resources"),
     Path("scripts"),
@@ -162,13 +166,19 @@ _RELEASE_SOURCE_DIGEST_EXCLUDE = frozenset(
 )
 _RELEASE_SOURCE_ALLOWED_EMPTY_FILES = frozenset({Path("tests/echo/__init__.py")})
 _RELEASE_SOURCE_BINARY_SUFFIXES = frozenset({".icns", ".png", ".ttf", ".woff2"})
-_RELEASE_SOURCE_DESKTOP_GENERATED_PARTS = frozenset(
+# Tool/build caches under any digest surface (including packages/* after triad staging).
+_RELEASE_SOURCE_TOOL_CACHE_PARTS = frozenset(
     {
         ".cache",
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
         "__pycache__",
+    }
+)
+_RELEASE_SOURCE_DESKTOP_GENERATED_PARTS = frozenset(
+    {
+        *_RELEASE_SOURCE_TOOL_CACHE_PARTS,
         "binaries",
         "cache",
         "caches",
@@ -3451,7 +3461,7 @@ def _release_source_member_included(relative: Path) -> bool:
     if relative in _RELEASE_SOURCE_DIGEST_EXCLUDE:
         return False
     if (
-        "__pycache__" in relative.parts
+        any(part in _RELEASE_SOURCE_TOOL_CACHE_PARTS for part in relative.parts)
         or relative.suffix in {".pyc", ".pyo"}
         or relative.name == ".DS_Store"
     ):

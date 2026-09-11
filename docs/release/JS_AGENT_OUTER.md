@@ -14,8 +14,11 @@ republish of kernel triad internals (`echo-core` / `orin-proto` / `orin-guard`).
 | **#3 Outer shell** | Host pip package + desktop/Tauri + release scripts + root `LICENSE` | Proposed: **`js-agent-outer-2026.09`** |
 
 Outer shell **depends on** the kernel triad at install / sidecar freeze time.
-It does **not** vendor or re-license Orin GateKernel sources into the Host
-sdist, and it does not claim Stage B/C product defaults.
+Desktop `build_sidecar` stages `packages/echo-core`, `packages/orin-proto`, and
+`packages/orin-guard` via the release-source digest surfaces and freezes them with
+PyInstaller (`-p` + `--hidden-import` / `--collect-submodules`). It does **not**
+vendor or re-license Orin GateKernel sources into the Host sdist, and it does not
+claim Stage B/C product defaults.
 
 ## What is in the outer shell
 

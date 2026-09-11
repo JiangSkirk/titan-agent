@@ -54,6 +54,14 @@ def _minimal_release_tree(root: Path) -> None:
         (root / dirname).mkdir(parents=True, exist_ok=True)
     (root / "js" / "marker.py").write_text("x = 1\n", encoding="utf-8")
     (root / ".github" / "CODEOWNERS").write_text("* @echo\n", encoding="utf-8")
+    for relative, package_name in (
+        ("packages/echo-core", "echo_core"),
+        ("packages/orin-proto", "orin_proto"),
+        ("packages/orin-guard", "orin_guard"),
+    ):
+        pkg = root / relative / package_name
+        pkg.mkdir(parents=True, exist_ok=True)
+        (pkg / "__init__.py").write_text(f"{package_name} = 1\n", encoding="utf-8")
     for relative in (
         "docs/adr/0001-echo-ledger-boundary.md",
         "docs/echo/ECHO_10_ROUND_AUDIT.md",

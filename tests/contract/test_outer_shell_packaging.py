@@ -70,3 +70,42 @@ def test_version_dual_track_host_vs_desktop() -> None:
 
     license_text = (REPO_ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Copyright (c) 2026 JS Team" in license_text
+
+
+def test_sidecar_freeze_contract_requires_full_kernel_triad() -> None:
+    """Architecture gate: freeze must collect echo_core + orin_proto + orin_guard.
+
+    Freezing only ``echo_core`` (omitting Orin peers) is a reject. Host must
+    not edit ``packages/orin-*`` sources — only consume them in the freeze.
+    """
+    from desktop import build_driver
+
+    assert build_driver.SIDECAR_KERNEL_TRIAD_MODULES == (
+        "echo_core",
+        "orin_proto",
+        "orin_guard",
+    )
+    assert [name for _rel, name in build_driver.SIDECAR_KERNEL_PACKAGE_ROOTS] == [
+        "echo_core",
+        "orin_proto",
+        "orin_guard",
+    ]
+
+    flags = build_driver.sidecar_kernel_pyinstaller_flags()
+    hidden = {
+        flags[i + 1] for i, part in enumerate(flags) if part == "--hidden-import"
+    }
+    collected = {
+        flags[i + 1] for i, part in enumerate(flags) if part == "--collect-submodules"
+    }
+    triad = set(build_driver.SIDECAR_KERNEL_TRIAD_MODULES)
+    assert triad <= hidden, f"hidden-import missing triad peers: {triad - hidden}"
+    assert triad <= collected, f"collect-submodules missing triad peers: {triad - collected}"
+    # echo_core-only freeze must remain a reject.
+    assert {"orin_proto", "orin_guard"} <= hidden
+    assert {"orin_proto", "orin_guard"} <= collected
+    assert "echo_core.primitives" in hidden
+
+    driver_src = (REPO_ROOT / "desktop" / "build_driver.py").read_text(encoding="utf-8")
+    assert "sidecar_kernel_pyinstaller_flags()" in driver_src
+    assert "orin_proto" in driver_src and "orin_guard" in driver_src

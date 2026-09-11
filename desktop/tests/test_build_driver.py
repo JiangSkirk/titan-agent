@@ -4,8 +4,11 @@ import hashlib
 import json
 import os
 import plistlib
+import shutil
 import stat
 import struct
+import subprocess
+import sys
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -19,6 +22,7 @@ from js.echo.ledger.release_gates import release_source_digest
 DIGEST = "ab" * 32
 OTHER_DIGEST = "cd" * 32
 BUILD_NUMBER = "2026081101"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 _BUILD_INPUT_RELATIVES = (
     "desktop/src-tauri/Cargo.lock",
     "desktop/pnpm-lock.yaml",
@@ -100,6 +104,10 @@ def _write_release_inputs(repo_root: Path) -> None:
         "desktop/src-tauri/Cargo.lock": "version = 4\n",
         "desktop/src-tauri/Cargo.toml": "[package]\nname = 'fixture'\n",
         "desktop/src-tauri/src/main.rs": "fn main() {}\n",
+        # Kernel triad stubs — release-source closure + sidecar freeze paths.
+        "packages/echo-core/echo_core/__init__.py": "ECHO_CORE = 1\n",
+        "packages/orin-proto/orin_proto/__init__.py": "ORIN_PROTO = 1\n",
+        "packages/orin-guard/orin_guard/__init__.py": "ORIN_GUARD = 1\n",
     }
     for relative, content in files.items():
         path = repo_root / relative
@@ -264,8 +272,24 @@ def test_stage_and_build_commands_are_source_stable_locked_and_offline(
     assert pnpm_call["env"]["UV_OFFLINE"] == "1"
     assert pyinstaller_call["env"]["PIP_NO_INDEX"] == "1"
     assert pyinstaller_call["env"]["UV_OFFLINE"] == "1"
-    assert pyinstaller_call["env"]["PYTHONPATH"] == str(stage_root)
-    assert str(repo_root / "desktop/.embedded_source_digest") not in pyinstaller_call["cmd"]
+    assert pyinstaller_call["env"]["PYTHONPATH"] == build_driver.sidecar_pythonpath(stage_root)
+    cmd = pyinstaller_call["cmd"]
+    collect_idxs = [i for i, part in enumerate(cmd) if part == "--collect-submodules"]
+    collected = {cmd[i + 1] for i in collect_idxs if i + 1 < len(cmd)}
+    hidden_idxs = [i for i, part in enumerate(cmd) if part == "--hidden-import"]
+    hidden = {cmd[i + 1] for i in hidden_idxs if i + 1 < len(cmd)}
+    for package in build_driver.SIDECAR_KERNEL_TRIAD_MODULES:
+        assert package in collected
+        assert package in hidden
+    assert set(build_driver.SIDECAR_KERNEL_TRIAD_MODULES) == {
+        "echo_core",
+        "orin_proto",
+        "orin_guard",
+    }
+    for relative, package_name in build_driver.SIDECAR_KERNEL_PACKAGE_ROOTS:
+        assert str(stage_root / relative) in cmd
+        assert (stage_root / relative / package_name).is_dir()
+    assert str(repo_root / "desktop/.embedded_source_digest") not in cmd
     assert tauri_call["cmd"] == [
         str(tauri.resolve()),
         "build",
@@ -284,6 +308,69 @@ def test_stage_and_build_commands_are_source_stable_locked_and_offline(
     assert tauri_call["env"]["CARGO_NET_OFFLINE"] == "true"
     assert tauri_call["env"]["PIP_NO_INDEX"] == "1"
     assert tauri_call["env"]["UV_OFFLINE"] == "1"
+
+
+def test_sidecar_freeze_requires_staged_kernel_packages(tmp_path: Path) -> None:
+    """Cold-start Host imports echo_core; freeze must fail closed if unstaged."""
+    stage_root = tmp_path / "stage"
+    (stage_root / "js").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="staged kernel packages missing"):
+        build_driver.sidecar_kernel_import_roots(stage_root)
+
+    for relative, package_name in build_driver.SIDECAR_KERNEL_PACKAGE_ROOTS:
+        pkg = stage_root / relative / package_name
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(f"{package_name} = 1\n", encoding="utf-8")
+    roots = build_driver.sidecar_kernel_import_roots(stage_root)
+    assert [root.relative_to(stage_root).as_posix() for root in roots] == [
+        relative for relative, _ in build_driver.SIDECAR_KERNEL_PACKAGE_ROOTS
+    ]
+    pythonpath = build_driver.sidecar_pythonpath(stage_root)
+    assert pythonpath.split(os.pathsep)[0] == str(stage_root)
+    for root in roots:
+        assert str(root) in pythonpath.split(os.pathsep)
+
+
+def test_staged_kernel_triad_wins_on_sidecar_pythonpath(tmp_path: Path) -> None:
+    """Mirror freeze PYTHONPATH: staged kernel trees must win over ambient installs.
+
+    PyInstaller analysis uses ``sidecar_pythonpath(stage_root)``. Editable
+    workspace installs in site-packages must not be the only way Host finds
+    ``echo_core`` — that gap produced macOS outer-smoke ``ModuleNotFoundError``
+    when the freeze omitted the triad.
+    """
+    stage_root = tmp_path / "stage"
+    for relative, package_name in build_driver.SIDECAR_KERNEL_PACKAGE_ROOTS:
+        src = REPO_ROOT / relative / package_name
+        assert src.is_dir(), f"missing live package tree: {src}"
+        shutil.copytree(src, stage_root / relative / package_name, symlinks=False)
+    pythonpath = build_driver.sidecar_pythonpath(stage_root)
+    marker = stage_root.resolve().as_posix()
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import echo_core, echo_core.primitives, orin_proto, orin_guard, os\n"
+                f"marker = {marker!r}\n"
+                "for mod in (echo_core, orin_proto, orin_guard):\n"
+                "    path = os.path.realpath(mod.__file__)\n"
+                "    assert path.startswith(marker), (mod.__name__, path, marker)\n"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": pythonpath,
+            "PYTHONNOUSERSITE": "1",
+            "LANG": "C",
+            "LC_ALL": "C",
+        },
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_python_build_versions_must_match_exact_offline_pins(tmp_path: Path) -> None:
