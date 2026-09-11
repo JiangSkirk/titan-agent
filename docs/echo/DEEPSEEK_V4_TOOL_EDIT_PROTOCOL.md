@@ -77,7 +77,8 @@ Dual-track (v0.1):
 ### Orin `DENY_*` catalog → Echo short `reason_code` (SoT §2)
 
 `RELATED_ORIN_HOST_REASON_CODES` **must equal** this catalog (no legacy
-js/orind strings):
+js/orind strings). `BANNED_LEGACY_REASON_CODES` gates RELATED membership only —
+Echo short codes such as `consume_before_stamp` remain valid SoT §2 values.
 
 | `orin_reason_code` | Echo short `reason_code` | `next_action` |
 | --- | --- | --- |

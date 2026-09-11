@@ -45,7 +45,10 @@ NEXT_REPORT_DEFECT: Final[str] = "report_defect"
 NEXT_INSPECT_ORIN_DENY_FIELDS: Final[str] = "inspect_orin_deny_fields"
 DEFAULT_NEXT_ACTION: Final[str] = NEXT_INSPECT_ORIN_DENY_FIELDS
 
-# Banned legacy dual-track leftovers (must never re-enter RELATED set).
+# Banned legacy Orin/js dual-track leftovers. Purpose: gate membership of
+# RELATED_ORIN_HOST_REASON_CODES (Orin DENY_* catalog) only — NEVER ban Echo
+# short-code column values from SoT §2 (e.g. ``consume_before_stamp``,
+# ``unwired_deny``, ``mac_mismatch``, ``stamp_timeout``, …).
 BANNED_LEGACY_REASON_CODES: Final[frozenset[str]] = frozenset(
     {
         "local_policy_denied",
@@ -55,14 +58,6 @@ BANNED_LEGACY_REASON_CODES: Final[frozenset[str]] = frozenset(
         "intent_expired",
         "no_state_witness",
         "unregistered_or_invalid_manifest",
-        "bypasses_echo_effect_authority",
-        "chat_only_path_denies_sink_effects",
-        "refuse_ambient_effect",
-        "enabled_without_enforce",
-        "exec_without_stamp",
-        "consume_before_stamp",
-        "echo_exec_tools_required",
-        "echo_tool_surface_exceeds_lite",
     }
 )
 

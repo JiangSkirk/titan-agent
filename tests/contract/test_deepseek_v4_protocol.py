@@ -282,6 +282,9 @@ def test_deny_code_mapping_ssot_complete_and_fail_closed() -> None:
     ):
         assert legacy not in RELATED_ORIN_HOST_REASON_CODES
         assert legacy in BANNED_LEGACY_REASON_CODES
+    # BANNED only gates RELATED membership — Echo short codes stay valid.
+    assert ECHO_SHORT_CONSUME_BEFORE_STAMP not in BANNED_LEGACY_REASON_CODES
+    assert ECHO_SHORT_CONSUME_BEFORE_STAMP == "consume_before_stamp"
 
     short_rows = orin_to_echo_short_rows()
     assert {r.orin_reason_code for r in short_rows} == expected_deny
@@ -320,6 +323,10 @@ def test_deny_code_mapping_ssot_complete_and_fail_closed() -> None:
     for orin_code, (echo_code, next_action) in expected_short.items():
         assert by_orin[orin_code].echo_reason_code == echo_code
         assert by_orin[orin_code].next_action == next_action
+    # Echo short consume_before_stamp remains a valid SoT §2 column value.
+    consume = echo_short_reason_for_orin("DENY_CONSUME_BEFORE_STAMP")
+    assert consume.echo_reason_code == ECHO_SHORT_CONSUME_BEFORE_STAMP
+    assert consume.next_action == NEXT_REPORT_DEFECT
 
     assert passthrough_orin_reason_code("DENY_FREEZE") == "DENY_FREEZE"
     missing = echo_short_reason_for_orin(None, stamp_path=True)

@@ -32,9 +32,12 @@ Fail-closed: missing `orin_reason_code` on the stamp path → Echo short code
 | `DENY_POLICY` |
 
 Echo `RELATED_ORIN_HOST_REASON_CODES` **must equal** this set exactly.
-Legacy js/orind strings (`local_policy_denied`, `freeze_active`,
+Legacy js/orind dual-track leftovers (`local_policy_denied`, `freeze_active`,
 `effect_class_not_granted`, `intent_expired`, `no_state_witness`,
-`unregistered_or_invalid_manifest`, …) are **banned** from the RELATED set.
+`unregistered_or_invalid_manifest`, `budget_exhausted`, …) are **banned from
+RELATED only** — they must never re-enter the Orin `DENY_*` catalog set.
+`BANNED_LEGACY_REASON_CODES` does **not** ban Echo short-code column values
+(e.g. `consume_before_stamp` remains a valid SoT §2 `echo_reason_code`).
 
 ## §2 Orin → Echo short `reason_code` (Echo-owned)
 
