@@ -13,12 +13,16 @@ import hashlib
 import math
 import os
 import plistlib
+import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -31,6 +35,7 @@ _HARNESS_SOURCE = Path("desktop/tests/harness/tauri_webview_harness.swift")
 _HARNESS_MANIFEST_SCHEMA = "JSAgentTauriHarnessProvenanceV1"
 _HARNESS_BUNDLE_IDENTIFIER = "local.js-agent.ui-test-harness"
 _AX_EXIT = 10
+_HARNESS_TIMEOUT_SECONDS = 600
 RESULT_SCHEMA_VERSION = "js-agent-tauri-webview-result-v1"
 EXPECTED_BUNDLE_IDENTIFIER = "com.titan.js-agent"
 REQUIRED_SCENARIOS = frozenset(
@@ -67,6 +72,195 @@ _RESULT_FIELDS = frozenset(
     }
 )
 _SCENARIO_FIELDS = frozenset({"passed", "status", "detail", "duration_ms", "error_code"})
+_PS_ROW = re.compile(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)")
+
+
+def _default_harness_path(evidence_dir: Path) -> Path:
+    return (evidence_dir / "harness" / _HARNESS_APP_NAME).resolve()
+
+
+def _harness_executable(harness_path: Path) -> Path:
+    if harness_path.is_dir() and harness_path.name.endswith(".app"):
+        return harness_path / _HARNESS_EXEC
+    return harness_path
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def process_rows_from_ps(output: str) -> dict[int, tuple[int, int, str]]:
+    """Parse `ps -axo pid=,ppid=,pgid=,command=` into {pid: (ppid, pgid, cmd)}."""
+    rows: dict[int, tuple[int, int, str]] = {}
+    for raw in output.splitlines():
+        match = _PS_ROW.match(raw)
+        if match:
+            rows[int(match.group(1))] = (
+                int(match.group(2)),
+                int(match.group(3)),
+                match.group(4),
+            )
+    return rows
+
+
+def descendants_of(root_pid: int, rows: dict[int, tuple[int, int, str]]) -> set[int]:
+    found: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent, _group, _command) in rows.items():
+            if pid not in found and (parent == root_pid or parent in found):
+                found.add(pid)
+                changed = True
+    return found
+
+
+def expand_sidecar_process_groups(
+    tree: set[int], rows: dict[int, tuple[int, int, str]]
+) -> set[int]:
+    """Include members of process groups whose leaders already sit in *tree*.
+
+    Mirrors the Swift harness ``processTreePids`` contract: Host is launched with
+    ``process_group(0)``, so onefile children may own LISTEN while the ready
+    sentinel reports the leader pid. Never expands the parent's inherited pgid.
+    """
+    found = set(tree)
+    leader_pgids = {
+        pid for pid in found if (row := rows.get(pid)) is not None and row[1] == pid and pid > 0
+    }
+    if not leader_pgids:
+        return found
+    for pid, (_ppid, pgid, _cmd) in rows.items():
+        if pgid in leader_pgids:
+            found.add(pid)
+    return found
+
+
+def owned_process_tree(root_pid: int, rows: dict[int, tuple[int, int, str]]) -> set[int]:
+    return expand_sidecar_process_groups(
+        descendants_of(root_pid, rows) | {root_pid},
+        rows,
+    )
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _signal_pgid(pgid: int, sig: int) -> None:
+    if pgid <= 0:
+        return
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _default_ps_rows() -> dict[int, tuple[int, int, str]]:
+    try:
+        output = subprocess.check_output(
+            ["/bin/ps", "-axo", "pid=,ppid=,pgid=,command="],
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    return process_rows_from_ps(output)
+
+
+def reap_owned_tree(
+    root_pid: int,
+    *,
+    rows_provider: Callable[[], dict[int, tuple[int, int, str]]] | None = None,
+    grace_seconds: float = 2.0,
+    kill_wait_seconds: float = 5.0,
+) -> set[int]:
+    """TERM then KILL the owned harness tree, including sidecar process groups.
+
+    Snapshot the ppid/pgid closure **before** killing the root so desktop+host
+    remain visible as descendants. Returns the set of pids that were targeted.
+    """
+    provider = rows_provider or _default_ps_rows
+    rows = provider()
+    owned = owned_process_tree(root_pid, rows)
+    leader_pgids = {
+        pid for pid in owned if (row := rows.get(pid)) is not None and row[1] == pid and pid > 0
+    }
+
+    for pgid in leader_pgids:
+        _signal_pgid(pgid, signal.SIGTERM)
+    for pid in sorted(owned, reverse=True):
+        _signal_pid(pid, signal.SIGTERM)
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        live_rows = provider()
+        alive = {pid for pid in owned if pid in live_rows}
+        if not alive:
+            return owned
+        time.sleep(0.1)
+
+    live_rows = provider()
+    alive = {pid for pid in owned if pid in live_rows}
+    for pgid in leader_pgids:
+        if any(live_rows.get(pid, (0, -1, ""))[1] == pgid for pid in alive):
+            _signal_pgid(pgid, signal.SIGKILL)
+    for pid in sorted(alive, reverse=True):
+        _signal_pid(pid, signal.SIGKILL)
+
+    kill_deadline = time.monotonic() + kill_wait_seconds
+    while time.monotonic() < kill_deadline:
+        live_rows = provider()
+        if not any(pid in live_rows for pid in owned):
+            break
+        time.sleep(0.1)
+    return owned
+
+
+def _run_harness(
+    cmd: list[str],
+    *,
+    timeout: float = _HARNESS_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """Run the harness; on timeout, reap desktop+sidecar before failing."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # Snapshot+reap while parent relationships are still intact. Plain
+        # kill of the harness alone leaves JS Agent.app + js-agent-host as
+        # ppid=1 orphans that poison later outer-smoke runs.
+        try:
+            reap_owned_tree(proc.pid)
+        finally:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        raise subprocess.TimeoutExpired(
+            cmd=exc.cmd,
+            timeout=exc.timeout,
+            output=exc.output,
+            stderr=exc.stderr,
+        ) from exc
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=proc.returncode if proc.returncode is not None else -1,
+        stdout=stdout or "",
+        stderr=stderr or "",
+    )
 
 
 def _default_harness_path(evidence_dir: Path) -> Path:
@@ -320,15 +514,11 @@ def main(argv: list[str] | None = None) -> int:
 
     invocation_started = datetime.now(tz=UTC)
     try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        completed = _run_harness(cmd, timeout=_HARNESS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         print(
-            "[FAIL] tauri_webview_lifecycle: harness timed out after 600s",
+            f"[FAIL] tauri_webview_lifecycle: harness timed out after "
+            f"{_HARNESS_TIMEOUT_SECONDS}s (owned .app + sidecar reaped)",
             file=sys.stderr,
         )
         print(format_release_result_line(gate="tauri_webview_lifecycle", ok=False))
