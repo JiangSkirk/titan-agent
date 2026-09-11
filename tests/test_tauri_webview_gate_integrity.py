@@ -351,6 +351,50 @@ def test_swift_harness_per_scenario_timeout_and_mid_run_flush() -> None:
     )
 
 
+def test_swift_harness_timeout_dump_keeps_host_count_and_listen_count_distinct() -> None:
+    """Hard timeout / waitForSingleListener failure must dump 0/1/2+ listeners.
+
+    Dual js-agent-host PIDs (PyInstaller onefile parent+child) are NOT proof of
+    dual bind — host_count and listen_count stay separate fields. Pass contract
+    remains exactly one loopback listener (l.count == 1).
+    """
+    source = (
+        Path(__file__).resolve().parents[1] / "desktop/tests/harness/tauri_webview_harness.swift"
+    ).read_text(encoding="utf-8")
+
+    assert "struct ListenerEvidence" in source
+    assert "var host_count: Int" in source
+    assert "var listen_count: Int" in source
+    assert "var process_tree_pids: [Int]" in source
+    assert "var listen_addresses: [String]" in source
+    assert "var app_stdout_tail: String?" in source
+    assert "var app_stderr_tail: String?" in source
+    assert "var listener_evidence: ListenerEvidence?" in source
+    assert "func captureListenerEvidence" in source
+    assert "pendingListenerEvidence" in source
+    # Watchdog and waitForSingleListener failure both persist the dump.
+    assert "timedOut.listener_evidence = evidence" in source
+    assert "failed.listener_evidence = evidence" in source
+    assert "pendingListenerEvidence = evidence" in source
+    # Pass contract unchanged: still require exactly one listener, never host PID count.
+    assert "if l.count == 1, let first = l.first" in source
+    assert "l.count == host_count" not in source
+    assert "listen_count == host_count" not in source
+
+
+def _listener_evidence_two_hosts_one_listen() -> dict[str, object]:
+    """Canonical Cut-A shape: 2 host PIDs + 1 LISTEN (onefile parent+child)."""
+    return {
+        "process_tree_pids": [25649, 25654, 25656],
+        "host_count": 2,
+        "host_pids": [25654, 25656],
+        "listen_count": 1,
+        "listen_addresses": ["127.0.0.1:18432"],
+        "app_stdout_tail": "ready\n",
+        "app_stderr_tail": "",
+    }
+
+
 def test_process_tree_expands_sidecar_leader_group_only() -> None:
     rows = {
         100: (1, 100, "js-agent-ui-test-harness"),
@@ -492,9 +536,14 @@ def test_wrapper_timeout_preserves_partial_result(
                     "webview_shows_content": {
                         "passed": False,
                         "status": "timeout",
-                        "detail": "scenario hard timeout after 90s",
+                        "detail": (
+                            "scenario hard timeout after 90s; "
+                            "host_count=2 listen_count=1 "
+                            "listen_addresses=127.0.0.1:18432"
+                        ),
                         "duration_ms": 90000.0,
                         "error_code": "scenario_timeout",
+                        "listener_evidence": _listener_evidence_two_hosts_one_listen(),
                     },
                 },
                 "app_sha256": _sha256(app / "Contents/MacOS/js-agent-desktop"),
@@ -544,6 +593,11 @@ def test_wrapper_timeout_preserves_partial_result(
     assert "accessibility_probe" in payload["scenarios"]
     assert "cold_start_controlled_env" in payload["scenarios"]
     assert payload["scenarios"]["webview_shows_content"]["error_code"] == "scenario_timeout"
+    dump = payload["scenarios"]["webview_shows_content"]["listener_evidence"]
+    assert dump["host_count"] == 2
+    assert dump["listen_count"] == 1
+    assert dump["host_count"] != dump["listen_count"]
+    assert dump["listen_addresses"] == ["127.0.0.1:18432"]
     # Ephemeral private run dir must be gone; durable evidence stays.
     assert list(evidence.glob("tauri-webview/run-*")) == []
     err = capsys.readouterr().err
@@ -561,12 +615,17 @@ def test_wrapper_scenario_hard_timeout_exit_preserves_result(
         result["status"] = "failed"
         scenarios = result["scenarios"]
         assert isinstance(scenarios, dict)
-        scenarios["webview_shows_content"] = {
+        scenarios["cold_start_controlled_env"] = {
             "passed": False,
             "status": "timeout",
-            "detail": "scenario hard timeout after 90s",
-            "duration_ms": 90000.0,
+            "detail": (
+                "scenario hard timeout after 120s; "
+                "host_count=2 listen_count=1 "
+                "listen_addresses=127.0.0.1:18432"
+            ),
+            "duration_ms": 120000.0,
             "error_code": "scenario_timeout",
+            "listener_evidence": _listener_evidence_two_hosts_one_listen(),
         }
 
     rc, evidence, _, _ = _run(monkeypatch, tmp_path, mutate=mutate, returncode=2)
@@ -574,10 +633,38 @@ def test_wrapper_scenario_hard_timeout_exit_preserves_result(
     published = evidence / "tauri-webview/result.json"
     assert published.is_file()
     payload = json.loads(published.read_text(encoding="utf-8"))
-    assert payload["scenarios"]["webview_shows_content"]["error_code"] == "scenario_timeout"
+    cold = payload["scenarios"]["cold_start_controlled_env"]
+    assert cold["error_code"] == "scenario_timeout"
+    dump = cold["listener_evidence"]
+    assert dump["host_count"] == 2
+    assert dump["listen_count"] == 1
+    assert dump["process_tree_pids"] == [25649, 25654, 25656]
+    assert dump["host_pids"] == [25654, 25656]
     err = capsys.readouterr().err
     assert "preserved result.json" in err
     assert "harness exit=2" in err
+
+
+def test_timeout_dump_shape_distinguishes_zero_one_and_multi_listen() -> None:
+    """result.json listener_evidence must encode 0 vs 1 vs 2+ listens without host conflation."""
+    two_hosts_one = _listener_evidence_two_hosts_one_listen()
+    assert two_hosts_one["host_count"] == 2
+    assert two_hosts_one["listen_count"] == 1
+
+    zero_listen = {
+        **two_hosts_one,
+        "listen_count": 0,
+        "listen_addresses": [],
+    }
+    dual_listen = {
+        **two_hosts_one,
+        "listen_count": 2,
+        "listen_addresses": ["127.0.0.1:18432", "127.0.0.1:18433"],
+    }
+    # Distinct fields: host PID count never stands in for LISTEN count.
+    assert zero_listen["host_count"] == 2 and zero_listen["listen_count"] == 0
+    assert dual_listen["host_count"] == 2 and dual_listen["listen_count"] == 2
+    assert len(dual_listen["listen_addresses"]) == dual_listen["listen_count"]
 
 
 def test_salvage_partial_result_rejects_unreadable(
