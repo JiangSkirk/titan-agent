@@ -27484,7 +27484,7 @@
     "runs": 5,
     "paid_provider_calls": 0,
     "baseline_artifact": "ECHO_BASELINE_65CC545.json",
-    "baseline_artifact_sha256": "639b71f4e4699ce8fc3882fcdf14f32815f6c2cdd3c070e7e6ad9090e56f5767",
+    "baseline_artifact_sha256": "dae135ca171fdd9ab4503a0c1841b99d6cffd0658f743b7a7f769e1e0aec459e",
     "baseline_script_sha256": "6a9ac87fa2e0e4f6639f9a0a2322429da2509d536fc2af3c5da5be504494271a",
     "methodology": "Both revisions use the real /api/chat path, identical 40-message long history and fresh-session short prompts, the same deterministic fake-provider latency proxy, and cl100k_base over the canonical final provider payload.",
     "limitations": "Local single-process evidence only; tokenizer counts are not DeepSeek billing tokens and latency excludes network/provider variance.",

@@ -9,7 +9,7 @@ This is local engineering evidence. It is not external FTO, clean-room, security
 - Internal release ready: `False`
 - Stable release ready: `False`
 - Stable release blockers: `legal_fto_review_pending, clean_room_reviewer_pending, external_security_audit_missing, redteam_report_missing`
-- Benchmark SHA-256: `dcd592d1b56dc5d921b105033bf75a39544e0a003f6b5573e8ef0790dbe25e5f`
+- Benchmark SHA-256: `03a60912749ccb5ba8cc5f957f04f644da57292c56d206d804c37acedbe7b436`
 
 ## Round 1: 架构边界轮
 
