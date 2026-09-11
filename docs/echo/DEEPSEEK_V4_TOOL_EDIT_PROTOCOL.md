@@ -49,38 +49,57 @@ Deny reason codes (`ProtocolDenyCode`) never create allow-on-soft-fail.
 
 ## `ProtocolDenyCode` ↔ Host/Orin `reason_code`
 
-**Single source of truth (code):** `packages/echo-core/echo_core/deny_code_mapping.py`  
-**Docs mirror:** this section (must match `mapping_manifest()` / the module rows).
+**Orin SoT (authoritative):** `/workspace/orin-abcd/ORIN_ECHO_REASON_CODE_MAP_v0.1.md`  
+**Echo citation copy:** [ORIN_ECHO_REASON_CODE_MAP_v0.1.md](./ORIN_ECHO_REASON_CODE_MAP_v0.1.md)  
+**Echo code mirror:** `packages/echo-core/echo_core/deny_code_mapping.py`
 
-This is a **mapping table only** — not a second authority. Orin GateKernel /
-`orin-guard` ownership of MAC / empty-lease / chat_only semantics is unchanged.
-Fail-closed: **unknown mapping = deny, never allow**. A missing Orin
-`reason_code` must never soft-allow an Echo pin denial.
+Dual-track (v0.1):
 
-| Echo `ProtocolDenyCode` | Host/Orin `reason_code` | Plane | Notes |
-| --- | --- | --- | --- |
-| `deepseek_v4.unknown_model` | *(none — Echo-pin-only)* | `echo_pin` | Outside V4 lock; not a GateKernel ticket |
-| `deepseek_v4.competing_default_protocol` | *(none — Echo-pin-only)* | `echo_pin` | Non-`file_edit` default wire format |
-| `deepseek_v4.invalid_tool_schema` | *(none — Echo-pin-only)* | `echo_pin` | OpenAI FC schema shape invalid |
-| `deepseek_v4.invalid_edit_args` | *(none — Echo-pin-only)* | `echo_pin` | `file_edit` path/search/replace invalid |
-| `deepseek_v4.invalid_error_shape` | *(none — Echo-pin-only)* | `echo_pin` | Error envelope must be `success=false` + error |
-| `deepseek_v4.ambient_exec_default` | `echo_exec_tools_required` | `host_advertising` | Correlate with `SecurityConfig.echo_exec_tools=false`; Orin `local_policy_denied` must not soft-allow |
-| `deepseek_v4.thick_default_surface` | `echo_tool_surface_exceeds_lite` | `host_advertising` | Default boot surface >5 / includes meta expand tools |
+1. Orin owns `DENY_*` as `orin_reason_code` — **passthrough; Echo must not rewrite**.
+2. Echo owns the short `reason_code` column (SoT §2).
+3. Echo-pin `ProtocolDenyCode` (`deepseek_v4.*`) stay Echo-only with
+   `host_orin_reason_code=None` — orthogonal to Orin `DENY_*`.
+4. Fail-closed: **unknown mapping = deny, never allow**. Missing
+   `orin_reason_code` on the stamp path → Echo short `stamp_denied`.
 
-### Related Orin/Host tokens (correlation only)
+### Echo-pin `ProtocolDenyCode` rows
 
-These may appear near D1 / GateKernel denials. **None authorize a
-`ProtocolDenyCode`:**
+| Echo `ProtocolDenyCode` | Host/Orin `reason_code` | Plane |
+| --- | --- | --- |
+| `deepseek_v4.unknown_model` | *(none — Echo-pin-only)* | `echo_pin` |
+| `deepseek_v4.competing_default_protocol` | *(none — Echo-pin-only)* | `echo_pin` |
+| `deepseek_v4.invalid_tool_schema` | *(none — Echo-pin-only)* | `echo_pin` |
+| `deepseek_v4.invalid_edit_args` | *(none — Echo-pin-only)* | `echo_pin` |
+| `deepseek_v4.invalid_error_shape` | *(none — Echo-pin-only)* | `echo_pin` |
+| `deepseek_v4.ambient_exec_default` | *(none — Echo-pin-only)* | `echo_pin` |
+| `deepseek_v4.thick_default_surface` | *(none — Echo-pin-only)* | `echo_pin` |
 
-`local_policy_denied`, `freeze_active`, `budget_exhausted`,
-`effect_class_not_granted`, `intent_expired`, `no_state_witness`,
-`unregistered_or_invalid_manifest`, `bypasses_echo_effect_authority`,
-`chat_only_path_denies_sink_effects`, `refuse_ambient_effect`,
-`enabled_without_enforce`, `exec_without_stamp`, `consume_before_stamp`,
-`echo_exec_tools_required`, `echo_tool_surface_exceeds_lite`.
+### Orin `DENY_*` catalog → Echo short `reason_code` (SoT §2)
 
-Lookup API: `lookup_protocol_deny_mapping` / `host_orin_reason_for` /
-`assert_mapping_denies` — unknown codes raise `DenyMappingError`.
+`RELATED_ORIN_HOST_REASON_CODES` **must equal** this catalog (no legacy
+js/orind strings):
+
+| `orin_reason_code` | Echo short `reason_code` | `next_action` |
+| --- | --- | --- |
+| `DENY_UNWIRED_NULL_GUARDIAN` | `unwired_deny` | `inspect_orin_deny_fields` |
+| `DENY_TIMEOUT` | `stamp_timeout` | `inspect_orin_deny_fields` |
+| `DENY_CHAT_ONLY_TOOL_FORBIDDEN` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_MAC_MISMATCH` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_CONSUME_BEFORE_STAMP` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_CONJUNCTION_LETHAL` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_CRED_SPENT_OR_UNKNOWN` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_MCP_PIN_FROZEN` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_MCP_PIN_MISS` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_UNIMPLEMENTED_CELL` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_SHADOW_REWRITE_BANNED` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_ROLE_SCOPE_MISS` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_FREEZE` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_POLICY` | `stamp_denied` | `inspect_orin_deny_fields` |
+| *(missing on stamp path)* | `stamp_denied` | `inspect_orin_deny_fields` |
+
+Lookup API: `passthrough_orin_reason_code`, `echo_short_reason_for_orin`,
+`lookup_protocol_deny_mapping` / `assert_mapping_denies` — unknown codes raise
+`DenyMappingError`.
 
 
 ## Host wiring
@@ -99,3 +118,4 @@ Advertisement is not authority: expanding the advertised schema does not bypass
 - D1 contracts: `tests/contract/test_echo_effect_authority.py`,
   `tests/contract/test_deepseek_v4_protocol.py`
 - Deny-code SSOT: `packages/echo-core/echo_core/deny_code_mapping.py`
+  (cites `ORIN_ECHO_REASON_CODE_MAP_v0.1.md`)

@@ -113,11 +113,12 @@ COMPETING_EDIT_PROTOCOLS: Final[frozenset[EditProtocolId]] = frozenset(
 class ProtocolDenyCode(StrEnum):
     """Fail-closed deny reason codes (never allow-on-soft-fail).
 
-    These are Echo protocol-pin codes. Host/Orin GateKernel ``reason_code``
-    strings are a separate plane. Single source of truth for the correlation
-    table: :mod:`echo_core.deny_code_mapping` (and
-    ``docs/echo/DEEPSEEK_V4_TOOL_EDIT_PROTOCOL.md``). A missing Orin
-    ``reason_code`` must never soft-allow these denials.
+    These are Echo protocol-pin codes, orthogonal to Orin ``DENY_*``.
+    Dual-track mapping SoT: ``/workspace/orin-abcd/ORIN_ECHO_REASON_CODE_MAP_v0.1.md``
+    (Echo citation: ``docs/echo/ORIN_ECHO_REASON_CODE_MAP_v0.1.md``;
+    code: :mod:`echo_core.deny_code_mapping`). Orin ``DENY_*`` is passthrough —
+    Echo must not rewrite it. A missing Orin code on the stamp path fail-closes
+    to Echo short ``stamp_denied``; never soft-allow.
     """
 
     UNKNOWN_MODEL = "deepseek_v4.unknown_model"

@@ -211,42 +211,102 @@ def test_default_edit_protocol_enum_exclusive() -> None:
 
 
 def test_deny_code_mapping_ssot_complete_and_fail_closed() -> None:
-    """ProtocolDenyCode ↔ Host/Orin reason_code: mapping only, unknown ≠ allow."""
+    """Dual-track: Orin DENY_* passthrough + Echo short codes; unknown ≠ allow."""
 
     from echo_core.deny_code_mapping import (
+        BANNED_LEGACY_REASON_CODES,
+        ECHO_SHORT_STAMP_DENIED,
+        ECHO_SHORT_STAMP_TIMEOUT,
+        ECHO_SHORT_UNWIRED_DENY,
         RELATED_ORIN_HOST_REASON_CODES,
         DenyMappingError,
         assert_mapping_denies,
+        echo_short_reason_for_orin,
         host_orin_reason_for,
         lookup_protocol_deny_mapping,
         mapping_manifest,
+        orin_to_echo_short_rows,
+        passthrough_orin_reason_code,
         protocol_deny_code_mapping_rows,
     )
 
     rows = protocol_deny_code_mapping_rows()
     codes = {row.protocol_deny_code for row in rows}
     assert codes == {c.value for c in ProtocolDenyCode}
-    assert mapping_manifest()["second_authority"] is False
-    assert mapping_manifest()["rule"] == "unknown_mapping_is_deny_not_allow"
+    assert all(row.host_orin_reason_code is None for row in rows)
+
+    manifest = mapping_manifest()
+    assert manifest["second_authority"] is False
+    assert manifest["orin_passthrough"] is True
+    assert manifest["rule"] == "unknown_mapping_is_deny_not_allow"
+    assert manifest["orin_sot_path"] == "/workspace/orin-abcd/ORIN_ECHO_REASON_CODE_MAP_v0.1.md"
+
+    expected_deny = frozenset(
+        {
+            "DENY_UNWIRED_NULL_GUARDIAN",
+            "DENY_CHAT_ONLY_TOOL_FORBIDDEN",
+            "DENY_MAC_MISMATCH",
+            "DENY_TIMEOUT",
+            "DENY_CONSUME_BEFORE_STAMP",
+            "DENY_CONJUNCTION_LETHAL",
+            "DENY_CRED_SPENT_OR_UNKNOWN",
+            "DENY_MCP_PIN_FROZEN",
+            "DENY_MCP_PIN_MISS",
+            "DENY_UNIMPLEMENTED_CELL",
+            "DENY_SHADOW_REWRITE_BANNED",
+            "DENY_ROLE_SCOPE_MISS",
+            "DENY_FREEZE",
+            "DENY_POLICY",
+        }
+    )
+    assert expected_deny == RELATED_ORIN_HOST_REASON_CODES
+    assert not (RELATED_ORIN_HOST_REASON_CODES & BANNED_LEGACY_REASON_CODES)
+    # Dual-track old strings must stay red / absent from RELATED.
+    for legacy in (
+        "local_policy_denied",
+        "freeze_active",
+        "effect_class_not_granted",
+        "intent_expired",
+        "no_state_witness",
+        "unregistered_or_invalid_manifest",
+        "budget_exhausted",
+    ):
+        assert legacy not in RELATED_ORIN_HOST_REASON_CODES
+        assert legacy in BANNED_LEGACY_REASON_CODES
+
+    short_rows = orin_to_echo_short_rows()
+    assert {r.orin_reason_code for r in short_rows} == expected_deny
+    by_orin = {r.orin_reason_code: r for r in short_rows}
+    assert by_orin["DENY_UNWIRED_NULL_GUARDIAN"].echo_reason_code == ECHO_SHORT_UNWIRED_DENY
+    assert by_orin["DENY_TIMEOUT"].echo_reason_code == ECHO_SHORT_STAMP_TIMEOUT
+    assert by_orin["DENY_MAC_MISMATCH"].echo_reason_code == ECHO_SHORT_STAMP_DENIED
+    assert by_orin["DENY_POLICY"].echo_reason_code == ECHO_SHORT_STAMP_DENIED
+
+    assert passthrough_orin_reason_code("DENY_FREEZE") == "DENY_FREEZE"
+    missing = echo_short_reason_for_orin(None, stamp_path=True)
+    assert missing.echo_reason_code == ECHO_SHORT_STAMP_DENIED
+    assert echo_short_reason_for_orin("DENY_TIMEOUT").echo_reason_code == ECHO_SHORT_STAMP_TIMEOUT
 
     for code in ProtocolDenyCode:
         row = lookup_protocol_deny_mapping(code)
         assert assert_mapping_denies(code) == row
-        mapped = host_orin_reason_for(code)
-        if mapped is not None:
-            assert mapped in RELATED_ORIN_HOST_REASON_CODES
-        # None mapping is still deny (Echo-pin-only), never allow.
+        assert host_orin_reason_for(code) is None
 
     with pytest.raises(DenyMappingError, match="unknown ProtocolDenyCode"):
         lookup_protocol_deny_mapping("deepseek_v4.not_a_real_code")
     with pytest.raises(DenyMappingError):
-        host_orin_reason_for("deepseek_v4.not_a_real_code")
+        passthrough_orin_reason_code("local_policy_denied")
     with pytest.raises(DenyMappingError):
-        assert_mapping_denies("allow_please")
+        echo_short_reason_for_orin("DENY_NOT_IN_CATALOG")
 
-    # Docs must point at the SSOT module.
     doc = (REPO_ROOT / "docs" / "echo" / "DEEPSEEK_V4_TOOL_EDIT_PROTOCOL.md").read_text(
         encoding="utf-8"
     )
+    assert "ORIN_ECHO_REASON_CODE_MAP_v0.1.md" in doc
     assert "deny_code_mapping.py" in doc
-    assert "unknown mapping = deny" in doc.lower() or "unknown_mapping_is_deny" in doc
+    sot = (REPO_ROOT / "docs" / "echo" / "ORIN_ECHO_REASON_CODE_MAP_v0.1.md").read_text(
+        encoding="utf-8"
+    )
+    assert "/workspace/orin-abcd/ORIN_ECHO_REASON_CODE_MAP_v0.1.md" in sot
+    assert "DENY_UNWIRED_NULL_GUARDIAN" in sot
+    assert "unwired_deny" in sot
