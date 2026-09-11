@@ -813,6 +813,43 @@ def test_release_source_digest_version_and_surfaces_cover_release_inputs() -> No
     assert len(surfaces) == len(set(surfaces))
 
 
+def test_package_tool_caches_are_excluded_from_release_source_integrity(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CI ruff under packages/* must not fail closed as invalid UTF-8 sources."""
+    from js.echo.ledger import release_gates as rg
+
+    monkeypatch.setattr(
+        rg,
+        "_RELEASE_SOURCE_DIGEST_SURFACES",
+        (
+            pathlib.Path("packages/echo-core"),
+            pathlib.Path("packages/orin-proto"),
+            pathlib.Path("packages/orin-guard"),
+        ),
+    )
+    for relative, package_name in (
+        ("packages/echo-core", "echo_core"),
+        ("packages/orin-proto", "orin_proto"),
+        ("packages/orin-guard", "orin_guard"),
+    ):
+        pkg = tmp_path / relative / package_name
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(f"{package_name} = 1\n", encoding="utf-8")
+    cache = tmp_path / "packages/echo-core/.ruff_cache/0.15.15"
+    cache.mkdir(parents=True)
+    (cache / "13773970053544778532").write_bytes(b"\x00\xff\xfe binary-ruff-cache")
+
+    rg.validate_release_source_integrity(tmp_path)
+    before = rg.release_source_digest(tmp_path)
+    (cache / "another").write_bytes(b"\x80\x81 more-cache")
+    assert rg.release_source_digest(tmp_path) == before
+    assert not rg._release_source_member_included(
+        pathlib.Path("packages/echo-core/.ruff_cache/0.15.15/13773970053544778532")
+    )
+
+
 def test_audit_report_updates_do_not_change_runtime_source_digest(
     tmp_path: pathlib.Path,
 ) -> None:
