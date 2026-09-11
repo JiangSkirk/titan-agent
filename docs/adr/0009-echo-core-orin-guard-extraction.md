@@ -34,3 +34,9 @@ and `scripts/`.
   Today: path-install from this monorepo (`uv sync` or `pip install ./packages/...`).
 - Stage C still must not be claimed until the conjunction in
   `js.orin.stage_c` is observed.
+- Outer-shell packaging (Host wheel/sdist, `desktop/` Tauri zip, release
+  scripts, root `LICENSE`) stays on the monorepo Host line and is cut
+  separately from the kernel triad. Proposed outer tag:
+  `js-agent-outer-2026.09` — see [docs/release/JS_AGENT_OUTER.md](../release/JS_AGENT_OUTER.md).
+  Release governance modules continue to import repo-root `desktop/` and
+  `scripts/`; those trees are not package data of `echo-core` / `orin-*`.

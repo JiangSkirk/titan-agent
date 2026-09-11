@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+import sqlite3
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -20,7 +21,7 @@ from fastapi.security import APIKeyHeader
 
 from js.echo import turn_context as _echo_turn_context
 from js.exceptions import AuthRequiredError
-from js.utils.db import db_connection
+from js.utils.db import _is_locked_or_busy, db_connection
 from js.utils.log import get_logger
 
 # Context variable for session owner key hash (set by Web API layer).  The
@@ -950,7 +951,36 @@ class AuthManager:
         This guarantees the site is never left in a keyless state while auth
         is required, which would otherwise lock everyone out of every endpoint
         with no recovery path.
+
+        Concurrent first-start (two Host processes / workers) must converge on
+        a single mint. SQLite lock is released before the optional persist
+        callback so file I/O cannot starve a peer's WAL bootstrap
+        (``busy_timeout=0`` window in ``db_connection``). Locked/busy races
+        retry briefly; if a peer already minted, return ``None``.
         """
+        deadline = time.monotonic() + 10.0
+        attempt = 0
+        while True:
+            try:
+                return self._mint_bootstrap_admin_key_once(persist)
+            except sqlite3.OperationalError as exc:
+                if not _is_locked_or_busy(exc):
+                    raise
+                try:
+                    if self.has_admin():
+                        return None
+                except sqlite3.OperationalError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(0.05 * (2**attempt), 0.25))
+                attempt += 1
+
+    def _mint_bootstrap_admin_key_once(
+        self,
+        persist: Callable[[str], None] | None = None,
+    ) -> str | None:
+        """Single attempt: reserve under IMMEDIATE, then persist after commit."""
         with db_connection(self._db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -968,9 +998,25 @@ class AuthManager:
                 "(key_hash, name, role, created_at, enabled) VALUES (?, ?, ?, ?, 1)",
                 (key_hash, "bootstrap", _ADMIN_ROLE, time.time()),
             )
-            if persist is not None:
-                persist(plaintext)
+            # Commit before persist so concurrent openers are not blocked by
+            # recovery-file fsync while still inside BEGIN IMMEDIATE.
             conn.commit()
+
+        if persist is not None:
+            try:
+                persist(plaintext)
+            except Exception:
+                # Same compensation shape as AppShell shared bootstrap: revoke
+                # the reserved DB row when recovery-file persistence fails.
+                try:
+                    self.revoke_key(key_hash)
+                except Exception:
+                    with db_connection(self._db_path) as conn:
+                        conn.execute(
+                            "DELETE FROM api_keys WHERE key_hash = ?", (key_hash,)
+                        )
+                        conn.commit()
+                raise
         logger.info("Created bootstrap API key with admin role")
         return plaintext
 

@@ -148,6 +148,7 @@ force-include = { "js/security/secrets.py" = "js/security/secrets.py", "resource
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "/.gitignore",
     "/js/**",
     "/js_work/**",
     "/LICENSE",

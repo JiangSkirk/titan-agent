@@ -10,7 +10,9 @@ JS Agent 不是聊天机器人，而是一套**本地个人 Agent Harness**—�
 
 Echo 3.0 / Orin 2.0 已抽成工作区包（`packages/echo-core`、`packages/orin-proto`、
 `packages/orin-guard`）。从本仓库 `uv sync` 安装；**尚未**上 PyPI。清单与红灯见
-[docs/release/ECHO3_ORIN2.md](docs/release/ECHO3_ORIN2.md)。
+[docs/release/ECHO3_ORIN2.md](docs/release/ECHO3_ORIN2.md)。外层 Host / 桌面打包
+（cut #3，拟标签 `js-agent-outer-2026.09`）见
+[docs/release/JS_AGENT_OUTER.md](docs/release/JS_AGENT_OUTER.md)。
 
 ## 核心驾驭能力
 
@@ -266,16 +268,23 @@ python scripts/release_smoke.py --all
 
 ## 构建与发布
 
+Host pip 产物与桌面 `.app` 是两条线；外层边界与 dry-run 见
+[docs/release/JS_AGENT_OUTER.md](docs/release/JS_AGENT_OUTER.md)。
+
 ```bash
 # 安装开发依赖
 pip install -e ".[dev]"
 
-# 构建 wheel + sdist
+# 构建 Host wheel + sdist（干净安装还需同目录共构建 triad wheels）
 python -m build
+uv run python -m build --wheel --outdir dist packages/echo-core
+uv run python -m build --wheel --outdir dist packages/orin-proto
+uv run python -m build --wheel --outdir dist packages/orin-guard
 
 # 产物位于 dist/
 #   js_agent-0.1.5-py3-none-any.whl
 #   js_agent-0.1.5.tar.gz
+#   echo_core / orin_proto / orin_guard wheels（peer，非 PyPI）
 ```
 
 ## 已知限制
