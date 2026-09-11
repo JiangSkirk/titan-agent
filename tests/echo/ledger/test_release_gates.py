@@ -809,7 +809,8 @@ def test_release_source_digest_version_and_surfaces_cover_release_inputs() -> No
     assert "docs/echo/ECHO_10_ROUND_AUDIT.md" in excludes
     assert "docs/echo/ECHO_FINAL_REPLACEMENT_REPORT.md" in excludes
     # Harness / webview-gate / gate-integrity sources are not product digest inputs.
-    assert "desktop/tests/harness" in excludes
+    prefixes = {path.as_posix() for path in rg._RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES}
+    assert "desktop/tests/harness" in prefixes
     assert "scripts/run_tauri_webview_gate.py" in excludes
     assert "tests/test_tauri_webview_gate_integrity.py" in excludes
     # No duplicate nested file listings alongside parent dirs.
