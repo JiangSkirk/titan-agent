@@ -34,7 +34,9 @@ from js.echo.ledger.slo_contract import SLO_CONTRACT
 
 _OLD_BASELINE_COMMIT = "65cc545e3ec893f5bab62d356514643f14456a58"
 _OLD_BASELINE_TREE = "679b1172facba3f13af6b32e70bd6b815138ef13"
-_OLD_BASELINE_SOURCE_DIGEST = "3774de07b6652deeef91535a11730da860bf2d8572a81374c07d0b258b4effe5"
+# Recomputed for commit 65cc545 under ECHO-RELEASE-SOURCE-V2 after repo-root
+# tests/ joined EXCLUDE_PREFIXES (packages/*/tests stay digest-bound).
+_OLD_BASELINE_SOURCE_DIGEST = "bbe3722b9abcfddf48138a2dd227ed08eda896e715977598318476b3d20ea490"
 _OLD_BASELINE_UV_LOCK_SHA256 = "ff448bc032a8bf5dc4dd85ddaf3e1b495a95acd1f9ac9a5a7dae83dd94a0c1c8"
 _OLD_BASELINE_IMPORT_ROOT_SHA256 = (
     "52ca898f824bc6698dce23993fa86adfa9c3a56125f799eeda72ebcb8b5991f0"
@@ -808,15 +810,17 @@ def test_release_source_digest_version_and_surfaces_cover_release_inputs() -> No
     assert "docs/security/ECHO_LIVE_ACCEPTANCE.json" in excludes
     assert "docs/echo/ECHO_10_ROUND_AUDIT.md" in excludes
     assert "docs/echo/ECHO_FINAL_REPLACEMENT_REPORT.md" in excludes
-    # Harness / webview-gate / gate-integrity sources are not product digest inputs.
+    # Harness / webview-gate / repo-root tests/ are not product digest inputs.
     prefixes = {path.as_posix() for path in rg._RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES}
     assert "desktop/tests/harness" in prefixes
+    assert "tests" in prefixes
+    # Repo-root tests/ must be prefix-only — never add Path("tests") to exact EXCLUDE.
+    assert "tests" not in excludes
     assert "scripts/run_tauri_webview_gate.py" in excludes
-    assert "tests/test_tauri_webview_gate_integrity.py" in excludes
     # No duplicate nested file listings alongside parent dirs.
     assert "benchmarks/baseline.json" not in surfaces
     assert len(surfaces) == len(set(surfaces))
-    # Surfaces stay broad; harness exclusion is via EXCLUDE, not surface removal.
+    # Surfaces stay broad; exclusion via EXCLUDE/PREFIXES, not surface removal.
     assert "desktop" in surfaces
     assert "scripts" in surfaces
     assert "tests" in surfaces
@@ -901,7 +905,7 @@ def test_harness_webview_gate_mutations_do_not_change_release_source_digest(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Harness / webview-gate / integrity-test edits must not invalidate product digest."""
+    """Harness / webview-gate / repo-root tests/ edits must not invalidate product digest."""
     from js.echo.ledger import release_gates as rg
 
     monkeypatch.setattr(
@@ -922,6 +926,7 @@ def test_harness_webview_gate_mutations_do_not_change_release_source_digest(
         "scripts/other_release_script.py": "OTHER = 1\n",
         "tests/test_tauri_webview_gate_integrity.py": "INTEGRITY = 1\n",
         "tests/test_other_release.py": "OTHER_TEST = 1\n",
+        "tests/test_cancel_checkpoint.py": "CANCEL = 1\n",
     }
     for relative, content in tree.items():
         path = tmp_path / relative
@@ -934,8 +939,28 @@ def test_harness_webview_gate_mutations_do_not_change_release_source_digest(
         "desktop/tests/harness/future_harness_helper.swift",
         "scripts/run_tauri_webview_gate.py",
         "tests/test_tauri_webview_gate_integrity.py",
+        "tests/test_other_release.py",
+        "tests/test_cancel_checkpoint.py",
+        "tests",
     ):
         assert not rg._release_source_member_included(pathlib.Path(relative)), relative
+
+    # Prefix match is parents-only: packages/*/tests must not match Path("tests").
+    for package_test in (
+        pathlib.Path("packages/orin-guard/tests/test_contract.py"),
+        pathlib.Path("packages/echo-core/tests/test_core.py"),
+        pathlib.Path("packages/orin-proto/tests/test_proto.py"),
+    ):
+        assert package_test != pathlib.Path("tests")
+        assert pathlib.Path("tests") not in package_test.parents
+        assert not any(
+            package_test == prefix or prefix in package_test.parents
+            for prefix in rg._RELEASE_SOURCE_DIGEST_EXCLUDE_PREFIXES
+        )
+
+    # Prefix-excluded surface root still gets integrity preflight (empty markers)
+    # but must not fail closed as an empty directory for digest omission alone.
+    rg.validate_release_source_integrity(tmp_path)
 
     before = rg.release_source_digest(tmp_path)
     mutations = {
@@ -944,6 +969,8 @@ def test_harness_webview_gate_mutations_do_not_change_release_source_digest(
         "desktop/tests/harness/future_harness_helper.swift": "// future file\n",
         "scripts/run_tauri_webview_gate.py": "GATE_VERSION = 2\n",
         "tests/test_tauri_webview_gate_integrity.py": "INTEGRITY = 2\n",
+        "tests/test_other_release.py": "OTHER_TEST = 2\n",
+        "tests/test_cancel_checkpoint.py": "CANCEL = 2\n",
     }
     for relative, content in mutations.items():
         path = tmp_path / relative
@@ -952,9 +979,17 @@ def test_harness_webview_gate_mutations_do_not_change_release_source_digest(
 
     assert rg.release_source_digest(tmp_path) == before
 
-    # Control: non-harness sources under the same surfaces must still move the digest.
+    # Control: product sources under the same surfaces must still move the digest.
     (tmp_path / "desktop/sidecar/host.py").write_text("HOST_VERSION = 2\n", encoding="utf-8")
     assert rg.release_source_digest(tmp_path) != before
+    after_host = rg.release_source_digest(tmp_path)
+    (tmp_path / "scripts/other_release_script.py").write_text("OTHER = 2\n", encoding="utf-8")
+    assert rg.release_source_digest(tmp_path) != after_host
+
+    # build_driver is a product digest input — mutations must move the digest.
+    after_script = rg.release_source_digest(tmp_path)
+    (tmp_path / "desktop/build_driver.py").write_text("DRIVER_VERSION = 2\n", encoding="utf-8")
+    assert rg.release_source_digest(tmp_path) != after_script
 
 
 def test_kernel_triad_mutations_must_change_release_source_digest(
