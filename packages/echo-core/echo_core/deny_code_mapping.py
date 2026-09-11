@@ -30,9 +30,20 @@ ECHO_CITATION_DOC: Final[str] = "docs/echo/ORIN_ECHO_REASON_CODE_MAP_v0.1.md"
 
 # Echo-owned short reason_code values (SoT §2).
 ECHO_SHORT_UNWIRED_DENY: Final[str] = "unwired_deny"
+ECHO_SHORT_CHAT_ONLY_TOOL_REJECTED: Final[str] = "chat_only_tool_rejected"
+ECHO_SHORT_MAC_MISMATCH: Final[str] = "mac_mismatch"
 ECHO_SHORT_STAMP_TIMEOUT: Final[str] = "stamp_timeout"
+ECHO_SHORT_CONSUME_BEFORE_STAMP: Final[str] = "consume_before_stamp"
 ECHO_SHORT_STAMP_DENIED: Final[str] = "stamp_denied"
-DEFAULT_NEXT_ACTION: Final[str] = "inspect_orin_deny_fields"
+
+# Echo-owned next_action values (SoT §2).
+NEXT_ENABLE_WIRED_OR_CHAT_ONLY: Final[str] = "enable_wired_or_chat_only"
+NEXT_DISABLE_CHAT_ONLY_AND_WIRE: Final[str] = "disable_chat_only_and_wire"
+NEXT_INSPECT_GRANTS_ARGS_LEASE: Final[str] = "inspect_grants_args_lease"
+NEXT_RETRY_NOT_SAME_CODE_IN_TURN: Final[str] = "retry_not_same_code_in_turn"
+NEXT_REPORT_DEFECT: Final[str] = "report_defect"
+NEXT_INSPECT_ORIN_DENY_FIELDS: Final[str] = "inspect_orin_deny_fields"
+DEFAULT_NEXT_ACTION: Final[str] = NEXT_INSPECT_ORIN_DENY_FIELDS
 
 # Banned legacy dual-track leftovers (must never re-enter RELATED set).
 BANNED_LEGACY_REASON_CODES: Final[frozenset[str]] = frozenset(
@@ -110,77 +121,77 @@ RELATED_ORIN_HOST_REASON_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 
-# SoT §2 — Orin DENY_* → Echo short reason_code (Echo-owned column).
+# SoT §2 — Orin DENY_* → Echo short reason_code (Echo-owned column; exact 1:1).
 _ORIN_TO_ECHO_SHORT_ROWS: Final[tuple[OrinEchoShortMapping, ...]] = (
     OrinEchoShortMapping(
         "DENY_UNWIRED_NULL_GUARDIAN",
         ECHO_SHORT_UNWIRED_DENY,
-        DEFAULT_NEXT_ACTION,
+        NEXT_ENABLE_WIRED_OR_CHAT_ONLY,
+    ),
+    OrinEchoShortMapping(
+        "DENY_CHAT_ONLY_TOOL_FORBIDDEN",
+        ECHO_SHORT_CHAT_ONLY_TOOL_REJECTED,
+        NEXT_DISABLE_CHAT_ONLY_AND_WIRE,
+    ),
+    OrinEchoShortMapping(
+        "DENY_MAC_MISMATCH",
+        ECHO_SHORT_MAC_MISMATCH,
+        NEXT_INSPECT_GRANTS_ARGS_LEASE,
     ),
     OrinEchoShortMapping(
         "DENY_TIMEOUT",
         ECHO_SHORT_STAMP_TIMEOUT,
-        DEFAULT_NEXT_ACTION,
-    ),
-    OrinEchoShortMapping(
-        "DENY_CHAT_ONLY_TOOL_FORBIDDEN",
-        ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
-    ),
-    OrinEchoShortMapping(
-        "DENY_MAC_MISMATCH",
-        ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_RETRY_NOT_SAME_CODE_IN_TURN,
     ),
     OrinEchoShortMapping(
         "DENY_CONSUME_BEFORE_STAMP",
-        ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        ECHO_SHORT_CONSUME_BEFORE_STAMP,
+        NEXT_REPORT_DEFECT,
     ),
     OrinEchoShortMapping(
         "DENY_CONJUNCTION_LETHAL",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
     OrinEchoShortMapping(
         "DENY_CRED_SPENT_OR_UNKNOWN",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
     OrinEchoShortMapping(
         "DENY_MCP_PIN_FROZEN",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
     OrinEchoShortMapping(
         "DENY_MCP_PIN_MISS",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
     OrinEchoShortMapping(
         "DENY_UNIMPLEMENTED_CELL",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
     OrinEchoShortMapping(
         "DENY_SHADOW_REWRITE_BANNED",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
     OrinEchoShortMapping(
         "DENY_ROLE_SCOPE_MISS",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
     OrinEchoShortMapping(
         "DENY_FREEZE",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
     OrinEchoShortMapping(
         "DENY_POLICY",
         ECHO_SHORT_STAMP_DENIED,
-        DEFAULT_NEXT_ACTION,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
     ),
 )
 
@@ -372,10 +383,19 @@ __all__ = [
     "BANNED_LEGACY_REASON_CODES",
     "DEFAULT_NEXT_ACTION",
     "ECHO_CITATION_DOC",
+    "ECHO_SHORT_CHAT_ONLY_TOOL_REJECTED",
+    "ECHO_SHORT_CONSUME_BEFORE_STAMP",
+    "ECHO_SHORT_MAC_MISMATCH",
     "ECHO_SHORT_STAMP_DENIED",
     "ECHO_SHORT_STAMP_TIMEOUT",
     "ECHO_SHORT_UNWIRED_DENY",
     "MAPPING_VERSION",
+    "NEXT_DISABLE_CHAT_ONLY_AND_WIRE",
+    "NEXT_ENABLE_WIRED_OR_CHAT_ONLY",
+    "NEXT_INSPECT_GRANTS_ARGS_LEASE",
+    "NEXT_INSPECT_ORIN_DENY_FIELDS",
+    "NEXT_REPORT_DEFECT",
+    "NEXT_RETRY_NOT_SAME_CODE_IN_TURN",
     "ORIN_SOT_PATH",
     "RELATED_ORIN_HOST_REASON_CODES",
     "DenyCodeMappingRow",

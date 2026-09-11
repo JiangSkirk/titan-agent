@@ -215,9 +215,18 @@ def test_deny_code_mapping_ssot_complete_and_fail_closed() -> None:
 
     from echo_core.deny_code_mapping import (
         BANNED_LEGACY_REASON_CODES,
+        ECHO_SHORT_CHAT_ONLY_TOOL_REJECTED,
+        ECHO_SHORT_CONSUME_BEFORE_STAMP,
+        ECHO_SHORT_MAC_MISMATCH,
         ECHO_SHORT_STAMP_DENIED,
         ECHO_SHORT_STAMP_TIMEOUT,
         ECHO_SHORT_UNWIRED_DENY,
+        NEXT_DISABLE_CHAT_ONLY_AND_WIRE,
+        NEXT_ENABLE_WIRED_OR_CHAT_ONLY,
+        NEXT_INSPECT_GRANTS_ARGS_LEASE,
+        NEXT_INSPECT_ORIN_DENY_FIELDS,
+        NEXT_REPORT_DEFECT,
+        NEXT_RETRY_NOT_SAME_CODE_IN_TURN,
         RELATED_ORIN_HOST_REASON_CODES,
         DenyMappingError,
         assert_mapping_denies,
@@ -276,16 +285,52 @@ def test_deny_code_mapping_ssot_complete_and_fail_closed() -> None:
 
     short_rows = orin_to_echo_short_rows()
     assert {r.orin_reason_code for r in short_rows} == expected_deny
+    expected_short: dict[str, tuple[str, str]] = {
+        "DENY_UNWIRED_NULL_GUARDIAN": (
+            ECHO_SHORT_UNWIRED_DENY,
+            NEXT_ENABLE_WIRED_OR_CHAT_ONLY,
+        ),
+        "DENY_CHAT_ONLY_TOOL_FORBIDDEN": (
+            ECHO_SHORT_CHAT_ONLY_TOOL_REJECTED,
+            NEXT_DISABLE_CHAT_ONLY_AND_WIRE,
+        ),
+        "DENY_MAC_MISMATCH": (ECHO_SHORT_MAC_MISMATCH, NEXT_INSPECT_GRANTS_ARGS_LEASE),
+        "DENY_TIMEOUT": (ECHO_SHORT_STAMP_TIMEOUT, NEXT_RETRY_NOT_SAME_CODE_IN_TURN),
+        "DENY_CONSUME_BEFORE_STAMP": (
+            ECHO_SHORT_CONSUME_BEFORE_STAMP,
+            NEXT_REPORT_DEFECT,
+        ),
+        "DENY_CONJUNCTION_LETHAL": (ECHO_SHORT_STAMP_DENIED, NEXT_INSPECT_ORIN_DENY_FIELDS),
+        "DENY_CRED_SPENT_OR_UNKNOWN": (
+            ECHO_SHORT_STAMP_DENIED,
+            NEXT_INSPECT_ORIN_DENY_FIELDS,
+        ),
+        "DENY_MCP_PIN_FROZEN": (ECHO_SHORT_STAMP_DENIED, NEXT_INSPECT_ORIN_DENY_FIELDS),
+        "DENY_MCP_PIN_MISS": (ECHO_SHORT_STAMP_DENIED, NEXT_INSPECT_ORIN_DENY_FIELDS),
+        "DENY_UNIMPLEMENTED_CELL": (ECHO_SHORT_STAMP_DENIED, NEXT_INSPECT_ORIN_DENY_FIELDS),
+        "DENY_SHADOW_REWRITE_BANNED": (
+            ECHO_SHORT_STAMP_DENIED,
+            NEXT_INSPECT_ORIN_DENY_FIELDS,
+        ),
+        "DENY_ROLE_SCOPE_MISS": (ECHO_SHORT_STAMP_DENIED, NEXT_INSPECT_ORIN_DENY_FIELDS),
+        "DENY_FREEZE": (ECHO_SHORT_STAMP_DENIED, NEXT_INSPECT_ORIN_DENY_FIELDS),
+        "DENY_POLICY": (ECHO_SHORT_STAMP_DENIED, NEXT_INSPECT_ORIN_DENY_FIELDS),
+    }
     by_orin = {r.orin_reason_code: r for r in short_rows}
-    assert by_orin["DENY_UNWIRED_NULL_GUARDIAN"].echo_reason_code == ECHO_SHORT_UNWIRED_DENY
-    assert by_orin["DENY_TIMEOUT"].echo_reason_code == ECHO_SHORT_STAMP_TIMEOUT
-    assert by_orin["DENY_MAC_MISMATCH"].echo_reason_code == ECHO_SHORT_STAMP_DENIED
-    assert by_orin["DENY_POLICY"].echo_reason_code == ECHO_SHORT_STAMP_DENIED
+    for orin_code, (echo_code, next_action) in expected_short.items():
+        assert by_orin[orin_code].echo_reason_code == echo_code
+        assert by_orin[orin_code].next_action == next_action
 
     assert passthrough_orin_reason_code("DENY_FREEZE") == "DENY_FREEZE"
     missing = echo_short_reason_for_orin(None, stamp_path=True)
     assert missing.echo_reason_code == ECHO_SHORT_STAMP_DENIED
-    assert echo_short_reason_for_orin("DENY_TIMEOUT").echo_reason_code == ECHO_SHORT_STAMP_TIMEOUT
+    assert missing.next_action == NEXT_INSPECT_ORIN_DENY_FIELDS
+    timeout = echo_short_reason_for_orin("DENY_TIMEOUT")
+    assert timeout.echo_reason_code == ECHO_SHORT_STAMP_TIMEOUT
+    assert timeout.next_action == NEXT_RETRY_NOT_SAME_CODE_IN_TURN
+    mac = echo_short_reason_for_orin("DENY_MAC_MISMATCH")
+    assert mac.echo_reason_code == ECHO_SHORT_MAC_MISMATCH
+    assert mac.next_action == NEXT_INSPECT_GRANTS_ARGS_LEASE
 
     for code in ProtocolDenyCode:
         row = lookup_protocol_deny_mapping(code)
@@ -310,3 +355,8 @@ def test_deny_code_mapping_ssot_complete_and_fail_closed() -> None:
     assert "/workspace/orin-abcd/ORIN_ECHO_REASON_CODE_MAP_v0.1.md" in sot
     assert "DENY_UNWIRED_NULL_GUARDIAN" in sot
     assert "unwired_deny" in sot
+    assert "chat_only_tool_rejected" in sot
+    assert "mac_mismatch" in sot
+    assert "consume_before_stamp" in sot
+    assert "enable_wired_or_chat_only" in sot
+    assert "retry_not_same_code_in_turn" in sot

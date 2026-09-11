@@ -40,11 +40,11 @@ Legacy js/orind strings (`local_policy_denied`, `freeze_active`,
 
 | `orin_reason_code` | Echo short `reason_code` | `next_action` |
 | --- | --- | --- |
-| `DENY_UNWIRED_NULL_GUARDIAN` | `unwired_deny` | `inspect_orin_deny_fields` |
-| `DENY_TIMEOUT` | `stamp_timeout` | `inspect_orin_deny_fields` |
-| `DENY_CHAT_ONLY_TOOL_FORBIDDEN` | `stamp_denied` | `inspect_orin_deny_fields` |
-| `DENY_MAC_MISMATCH` | `stamp_denied` | `inspect_orin_deny_fields` |
-| `DENY_CONSUME_BEFORE_STAMP` | `stamp_denied` | `inspect_orin_deny_fields` |
+| `DENY_UNWIRED_NULL_GUARDIAN` | `unwired_deny` | `enable_wired_or_chat_only` |
+| `DENY_CHAT_ONLY_TOOL_FORBIDDEN` | `chat_only_tool_rejected` | `disable_chat_only_and_wire` |
+| `DENY_MAC_MISMATCH` | `mac_mismatch` | `inspect_grants_args_lease` |
+| `DENY_TIMEOUT` | `stamp_timeout` | `retry_not_same_code_in_turn` |
+| `DENY_CONSUME_BEFORE_STAMP` | `consume_before_stamp` | `report_defect` |
 | `DENY_CONJUNCTION_LETHAL` | `stamp_denied` | `inspect_orin_deny_fields` |
 | `DENY_CRED_SPENT_OR_UNKNOWN` | `stamp_denied` | `inspect_orin_deny_fields` |
 | `DENY_MCP_PIN_FROZEN` | `stamp_denied` | `inspect_orin_deny_fields` |
