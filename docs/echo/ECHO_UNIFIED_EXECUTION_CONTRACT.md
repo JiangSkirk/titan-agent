@@ -47,3 +47,16 @@ they are not described as rolled back and are not retried blindly.
 - Cancellation and disconnect must produce a non-success terminal outcome.
 - Replay must reconstruct leases, outbox, receipts, and manual-review state.
 - New entry points must reuse this contract rather than create another loop.
+
+## D1 single boundary (architecture lock)
+
+Effect classes Model / Tool / Connector / AppShell must walk the same
+admit → stamp → durable consume → exec path through `EffectAuthority` and
+`EffectInterpreter`. There is no `TurnExecutor` and no ambient
+`_execute_tool_call` bypass. `CapabilityLease` remains the sole public ticket;
+`FileEchoLedger` remains the sole durable journal writer. Wiring priority is
+`CHAT_ONLY ≻ UNWIRED` with fail-closed defaults.
+
+DeepSeek V4 tool/edit wire format is pinned separately in
+[DEEPSEEK_V4_TOOL_EDIT_PROTOCOL.md](./DEEPSEEK_V4_TOOL_EDIT_PROTOCOL.md)
+(`echo_core.deepseek_v4_protocol`); advertisement never substitutes for D1.

@@ -4,20 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
-_ECHO_CORE_TOOL_NAMES = {
-    "file_read",
-    "file_write",
-    "file_list",
-    "file_search",
-    "file_edit",
-    "file_view",
-    "code_search",
-    "web_search",
-}
+from echo_core.deepseek_v4_protocol import (
+    DEFAULT_CORE_TOOL_NAMES,
+    EXPAND_ON_DEMAND_EXEC_TOOL_NAMES,
+)
+
+# Pinned by echo_core.deepseek_v4_protocol (DeepSeek V4 same-model lock).
+_ECHO_CORE_TOOL_NAMES = set(DEFAULT_CORE_TOOL_NAMES)
 # F-14: execution tools are NOT part of the always-on core subset.  They are
 # only advertised when the operator opts in via
 # ``SecurityConfig.echo_exec_tools`` (or the query explicitly needs them).
-_ECHO_EXEC_TOOL_NAMES = {"shell", "python"}
+_ECHO_EXEC_TOOL_NAMES = set(EXPAND_ON_DEMAND_EXEC_TOOL_NAMES)
 _ECHO_DELETE_TERMS = ("delete", "remove", "rm ", "unlink", "删除", "删掉", "移除")
 _ECHO_WEB_TERMS = (
     "http://",
