@@ -142,6 +142,10 @@ _RELEASE_SOURCE_DIGEST_SURFACES = (
     Path("desktop"),
     Path("js"),
     Path("js_work"),
+    # Kernel triad: Host sidecar freeze stages these for PyInstaller (not Host sdist).
+    Path("packages/echo-core"),
+    Path("packages/orin-guard"),
+    Path("packages/orin-proto"),
     Path("pyproject.toml"),
     Path("resources"),
     Path("scripts"),

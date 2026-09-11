@@ -67,6 +67,14 @@ _BUILD_INPUT_PATHS = {
     "python_build_reqs": "desktop/requirements-build.txt",
     "build_driver": "desktop/build_driver.py",
 }
+# Workspace kernel packages consumed by Host at import time. Staged under
+# release-source closure; PyInstaller needs their parent dirs on sys.path
+# (``packages/echo-core`` not ``packages``) plus explicit collect flags.
+SIDECAR_KERNEL_PACKAGE_ROOTS: tuple[tuple[str, str], ...] = (
+    ("packages/echo-core", "echo_core"),
+    ("packages/orin-proto", "orin_proto"),
+    ("packages/orin-guard", "orin_guard"),
+)
 _ENVIRONMENT_FILE_KEYS = ("python", "pnpm", "cargo", "node", "ditto")
 _ENVIRONMENT_TREE_KEYS = ("cargo_home", "pnpm_store")
 _CARGO_MUTABLE_CACHE_NAMES = (
@@ -827,6 +835,30 @@ def _cleanup_pnpm_store_project_links(store: Path) -> None:
             child.unlink()
 
 
+def sidecar_kernel_import_roots(stage_root: Path) -> list[Path]:
+    """Return staged kernel package parents required on PYTHONPATH / ``-p``."""
+    roots: list[Path] = []
+    missing: list[str] = []
+    for relative, package_name in SIDECAR_KERNEL_PACKAGE_ROOTS:
+        root = stage_root / relative
+        if not (root / package_name).is_dir():
+            missing.append(f"{relative}/{package_name}")
+            continue
+        roots.append(root)
+    if missing:
+        raise RuntimeError(
+            "staged kernel packages missing for sidecar freeze: " + ", ".join(missing)
+        )
+    return roots
+
+
+def sidecar_pythonpath(stage_root: Path) -> str:
+    """PYTHONPATH for PyInstaller analysis: Host tree + kernel package roots."""
+    return os.pathsep.join(
+        [str(stage_root), *(str(root) for root in sidecar_kernel_import_roots(stage_root))]
+    )
+
+
 def build_sidecar(
     source_digest: str,
     *,
@@ -850,6 +882,7 @@ def build_sidecar(
     work_dir = run.root / "stage/pyinstaller-work"
     spec_dir = run.root / "stage/pyinstaller-spec"
     python = _resolved_executable(Path(sys.executable).resolve(strict=True), "Python")
+    kernel_roots = sidecar_kernel_import_roots(stage_root)
     command = [
         str(python),
         "-m",
@@ -912,12 +945,30 @@ def build_sidecar(
         "tiktoken",
         "--collect-submodules",
         "tiktoken_ext",
+        # Kernel triad: js.echo imports echo_core at package import time; Orin
+        # guard/proto follow. Ambient site-packages must not be required.
+        "--hidden-import",
+        "echo_core",
+        "--hidden-import",
+        "echo_core.primitives",
+        "--hidden-import",
+        "orin_proto",
+        "--hidden-import",
+        "orin_guard",
+        "--collect-submodules",
+        "echo_core",
+        "--collect-submodules",
+        "orin_proto",
+        "--collect-submodules",
+        "orin_guard",
         "-p",
         str(stage_root),
-        str(stage_root / "desktop/sidecar/host.py"),
     ]
+    for root in kernel_roots:
+        command.extend(["-p", str(root)])
+    command.append(str(stage_root / "desktop/sidecar/host.py"))
     env = controlled_build_environment(run, offline_inputs)
-    env["PYTHONPATH"] = str(stage_root)
+    env["PYTHONPATH"] = sidecar_pythonpath(stage_root)
     code, _stdout, stderr = runner(command, cwd=stage_root, env=env, timeout=900)
     if code != 0:
         raise RuntimeError(f"PyInstaller failed: {stderr}")
