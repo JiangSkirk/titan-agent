@@ -49937,8 +49937,8 @@
   "source_digest": "1ffac7579d327ee6bc5b8b2a9b6e7d2f813283f28d3ee31f46451faf36f88081",
   "source_integrity": {
     "chain_binding": "echo-live-resource-samples-v1",
-    "chain_root": "164b37995cce4ad061aa174d88883fd6b16bc21d6139ecde036d59b3130d4b62",
-    "chain_root_signature_b64": "Fvq9qngc+taBV+QfRQuhtkzBZUPxpA+ld22dPhULjyR+pHu2MTCFsHL0JQgAuIL4Gifjh+HxsPSa5KG/16zhDw==",
+    "chain_root": "bbfb61fbfaf50e7d3b060517886a72adec4f630a3b97ecb73df04994024253d5",
+    "chain_root_signature_b64": "QeYHcAC2Qh65F4xwIOC1L4egs4kQzp3K3wg3Gt9K7znL4v9Ar6fCIN2TdFT7LIYNI2IS2QV4p0dc2c+AOeRbBg==",
     "check_count": 721,
     "checks": [
       {
@@ -54999,7 +54999,7 @@
     "pubkey_fingerprint": "b419f25911eead67f0239c7d9d436fb6071b8f74255ed5f1f1c31ec56dc2da4d",
     "resource_sample_count": 721,
     "resource_sample_root": "7476939dcbde10f2c9e3f3c0e7cc90e7f69a883bb113e6f6ba417fc33a88cf9d",
-    "source_check_chain_root": "28ea1e4ed8866503d6f500d2565d0b2a578772c61e2fe5388a0ac557c9c85343",
+    "source_check_chain_root": "1897774e47dcb50c8893fff4de9c2ec07aa14c7e36d9b7d34167c25e98198d78",
     "storage_sample_count": 721,
     "storage_sample_root": "7476939dcbde10f2c9e3f3c0e7cc90e7f69a883bb113e6f6ba417fc33a88cf9d"
   },
