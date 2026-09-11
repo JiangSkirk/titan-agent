@@ -302,12 +302,13 @@ class TestCancelAPI:
 
         assert len(agent._cancel_tokens) == 2
         assert agent.request_cancel(session_id, owner_key_hash="owner-a") is True
-        state_a = await asyncio.wait_for(owner_a, timeout=0.5)
+        # Durable cancel (lane + D1/model cleanup) can exceed 0.5s under full CI load.
+        state_a = await asyncio.wait_for(owner_a, timeout=5.0)
         assert state_a.status == "cancelled"
         assert not owner_b.done()
 
         assert agent.request_cancel(session_id, owner_key_hash="owner-b") is True
-        state_b = await asyncio.wait_for(owner_b, timeout=0.5)
+        state_b = await asyncio.wait_for(owner_b, timeout=5.0)
         assert state_b.status == "cancelled"
 
     @pytest.mark.asyncio
@@ -426,16 +427,19 @@ class TestCancelAPI:
 
         session_id = "cancel-inflight"
         run_task = asyncio.create_task(agent.run("wait", session_id=session_id))
-        for _ in range(50):
-            if (
-                runtime_partition_key("js-agent", None, session_id)
-                in agent._cancel_tokens
-            ):
+        partition = runtime_partition_key("js-agent", None, session_id)
+        for _ in range(200):
+            if partition in agent._cancel_tokens:
                 break
             await asyncio.sleep(0.01)
+        else:
+            pytest.fail("cancel token never registered")
 
         assert agent.request_cancel(session_id) is True
-        state = await asyncio.wait_for(run_task, timeout=0.5)
+        # Interrupt is proven by mock_provider.delay=10s vs this short wait.
+        # Under coverage-instrumented CI the post-cancel lane/finalizer cleanup
+        # routinely exceeds 0.5s (PR Density run 34618657888 TimeoutError).
+        state = await asyncio.wait_for(run_task, timeout=5.0)
 
         assert state.status == "cancelled"
         assert state.error_message == "Run cancelled by user request"
@@ -499,12 +503,13 @@ class TestCancelAPI:
         agent._finalize_run = paused_finalize  # type: ignore[method-assign]
         session_id = "cancel-before-finalizer-commit"
         run_task = asyncio.create_task(agent.run("finish", session_id=session_id))
-        await asyncio.wait_for(finalizer_entered.wait(), timeout=1)
+        # Reach finalizer under full-suite / coverage load can exceed 1s.
+        await asyncio.wait_for(finalizer_entered.wait(), timeout=5)
 
         assert agent.request_cancel(session_id) is True
         assert agent.request_cancel(session_id) is True
         release_finalizer.set()
-        state = await asyncio.wait_for(run_task, timeout=1)
+        state = await asyncio.wait_for(run_task, timeout=5)
 
         assert state.status == "cancelled"
         assert cleanup_finished.is_set()
@@ -551,11 +556,12 @@ class TestCancelAPI:
         agent.memory.store_messages = paused_store_messages  # type: ignore[method-assign]
         session_id = "cancel-after-finalizer-commit"
         run_task = asyncio.create_task(agent.run("finish", session_id=session_id))
-        assert await asyncio.to_thread(cleanup_started.wait, 1)
+        # Terminal cleanup barrier under full-suite load can exceed 1s.
+        assert await asyncio.to_thread(cleanup_started.wait, 5)
 
         assert agent.request_cancel(session_id) is False
         release_cleanup.set()
-        state = await asyncio.wait_for(run_task, timeout=1)
+        state = await asyncio.wait_for(run_task, timeout=5)
 
         assert state.status == "completed"
         lifecycle = agent.lifecycle_store.get(session_id, "local-user")
@@ -757,7 +763,9 @@ class TestGracefulShutdown:
         run_task = asyncio.create_task(agent.run("finish", session_id=session_id))
         close_task: asyncio.Task[None] | None = None
         try:
-            assert await asyncio.to_thread(episode_started.wait, 1)
+            # Finalizer store_episode can take >1s under full-suite load
+            # (test (3.12) run 34623620565: wait,1 returned False before barrier).
+            assert await asyncio.to_thread(episode_started.wait, 5)
             close_task = asyncio.create_task(agent.close())
             await asyncio.sleep(0.05)
 
