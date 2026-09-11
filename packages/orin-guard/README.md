@@ -64,7 +64,6 @@ from orin_guard import (
     CredBrokerDenied,
     MCPGate,
     MCPGateDenied,
-    EffectTicket,
     TicketDenied,
     KernelUnavailable,
     grants_digest,
@@ -72,12 +71,17 @@ from orin_guard import (
 )
 ```
 
+The public capability ticket is Echo **`CapabilityLease`**. GateKernel's
+internal stamp object (`EffectTicket`) is **not** part of this public API
+and must not be imported by third parties (`orin_guard.kernel.gate` is not
+a supported public import — dual-ticket narrative is forbidden).
+
 | Surface | Contract |
 | --- | --- |
-| `GateKernel.issue` | MAC binds `grants_digest` + `args_hash` + `lease_id` |
+| `GateKernel.issue` / `consume` | stamp/consume surface; returns opaque stamp handle |
+| MAC | binds `grants_digest` + `args_hash` + `lease_id` |
 | tool / connector | empty `lease_id` → deny |
 | `chat_only:{lease_id}` | ticket id pinned exactly to that string |
-| `GateKernel.consume` | single-use; fail-closed on MAC / expiry / order |
 | `CredBroker.exchange` | pop (single-use); replay → deny |
 | `MCPGate` | definition pin by hash; no `--force` bypass |
 | conjunction | lethal triad always deny |

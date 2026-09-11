@@ -13,6 +13,8 @@
 - Openable README/API surface for third-party hosts (no JS Agent / desktop
   private paths). Stage B product-default flip remains Host debt
   (2026-10-01); Stage C cells stay `not_implemented`.
+- Public ticket is Echo `CapabilityLease` only; `EffectTicket` is
+  GateKernel-internal and is not exported from `orin_guard`.
 - Standalone package `LICENSE` (MIT) + `THIRD_PARTY_NOTICES.md` for
   independent publish. Hard peers: `echo-core` + `orin-proto` (no taint stub);
   see `docs/orin-oss-boundary.md`.

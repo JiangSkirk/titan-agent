@@ -2,6 +2,9 @@
 
 GateKernel is an Echo sidecar stamp authority — not a runtime, ledger
 writer, or orchestrator. See package README for the openable API.
+
+``EffectTicket`` is GateKernel-internal only and is **not** exported here.
+The public capability ticket is Echo ``CapabilityLease``.
 """
 
 from __future__ import annotations
@@ -15,7 +18,6 @@ from orin_guard.kernel.conjunction import (
 from orin_guard.kernel.dual import PolicyPlane
 from orin_guard.kernel.gate import (
     CHAT_ONLY_TICKET_PREFIX,
-    EffectTicket,
     GateKernel,
     KernelUnavailable,
     TicketDenied,
@@ -28,7 +30,6 @@ __all__ = [
     "ConjunctionDenied",
     "CredBroker",
     "CredBrokerDenied",
-    "EffectTicket",
     "GateKernel",
     "KernelUnavailable",
     "MCPGate",

@@ -269,6 +269,15 @@ def test_open_packages_ship_standalone_mit_license() -> None:
         assert "Permission is hereby granted" in text
 
 
+def test_no_public_effect_ticket_symbol() -> None:
+    """Frozen: EffectTicket stays GateKernel-internal; no dual-ticket public API."""
+
+    import orin_guard
+
+    assert "EffectTicket" not in orin_guard.__all__
+    assert not hasattr(orin_guard, "EffectTicket")
+
+
 def test_orin_guard_declares_echo_core_hard_dependency() -> None:
     """No stub: echo-core remains a required peer of orin-guard."""
 

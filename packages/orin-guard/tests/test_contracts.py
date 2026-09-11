@@ -209,6 +209,15 @@ def test_package_ships_standalone_mit_license() -> None:
     assert "echo-core" in notices.read_text(encoding="utf-8")
 
 
+def test_no_public_effect_ticket_symbol() -> None:
+    """EffectTicket is GateKernel-internal; CapabilityLease is the public ticket."""
+
+    import orin_guard
+
+    assert "EffectTicket" not in orin_guard.__all__
+    assert not hasattr(orin_guard, "EffectTicket")
+
+
 def test_frozen_kernel_denies_when_enforce() -> None:
     from orin_guard.kernel.gate import KernelUnavailable
 
