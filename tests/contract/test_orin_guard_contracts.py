@@ -253,3 +253,36 @@ def test_tool_effect_empty_lease_id_denied() -> None:
             PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1),
             lease_id="",
         )
+
+
+def test_connector_effect_empty_lease_id_denied() -> None:
+    kernel = GateKernel(b"k" * 32)
+    with pytest.raises(TicketDenied, match="lease_id"):
+        kernel.issue(
+            PolicyPlane("o", "s", "r", "connector", frozenset({"private.read"}), 1),
+            lease_id="",
+        )
+
+
+def test_mac_lease_id_mismatch_denied() -> None:
+    import dataclasses
+
+    kernel = GateKernel(b"k" * 32)
+    plane = PolicyPlane("o", "s", "r", "tool", frozenset({"private.read"}), 1)
+    ticket = kernel.issue(plane, lease_id="lease-ml", args_hash="args-1")
+    bad = dataclasses.replace(ticket, lease_id="lease-forged")
+    with pytest.raises(TicketDenied, match="MAC mismatch"):
+        kernel.consume(bad, owner="o", run="r")
+
+
+def test_chat_only_ticket_id_pinned_by_gatekernel() -> None:
+    from orin_guard.kernel.gate import CHAT_ONLY_TICKET_PREFIX
+
+    kernel = GateKernel(b"k" * 32)
+    lease = f"{CHAT_ONLY_TICKET_PREFIX}chat-contract-1"
+    ticket = kernel.issue(
+        PolicyPlane("o", "s", "r", "model", frozenset({"private.read"}), 1),
+        lease_id=lease,
+    )
+    assert ticket.ticket_id == lease
+    assert ticket.lease_id == lease
