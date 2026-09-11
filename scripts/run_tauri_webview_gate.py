@@ -72,6 +72,18 @@ _RESULT_FIELDS = frozenset(
     }
 )
 _SCENARIO_FIELDS = frozenset({"passed", "status", "detail", "duration_ms", "error_code"})
+# Optional Cut-A dump: allowed on any scenario, never required for a green pass.
+_SCENARIO_OPTIONAL_FIELDS = frozenset({"listener_evidence"})
+_LISTENER_EVIDENCE_REQUIRED = frozenset(
+    {
+        "process_tree_pids",
+        "host_count",
+        "host_pids",
+        "listen_count",
+        "listen_addresses",
+    }
+)
+_LISTENER_EVIDENCE_OPTIONAL = frozenset({"app_stdout_tail", "app_stderr_tail"})
 _PS_ROW = re.compile(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)")
 
 
@@ -388,11 +400,59 @@ def _manifest_bindings(
     }
 
 
+def _valid_listener_evidence(value: object) -> bool:
+    """Optional timeout dump: host_count and listen_count stay distinct ints."""
+    if not isinstance(value, dict):
+        return False
+    keys = set(value)
+    if not _LISTENER_EVIDENCE_REQUIRED.issubset(keys):
+        return False
+    if not keys.issubset(_LISTENER_EVIDENCE_REQUIRED | _LISTENER_EVIDENCE_OPTIONAL):
+        return False
+    host_count = value.get("host_count")
+    listen_count = value.get("listen_count")
+    if not isinstance(host_count, int) or isinstance(host_count, bool) or host_count < 0:
+        return False
+    if not isinstance(listen_count, int) or isinstance(listen_count, bool) or listen_count < 0:
+        return False
+    tree = value.get("process_tree_pids")
+    hosts = value.get("host_pids")
+    addrs = value.get("listen_addresses")
+    if not isinstance(tree, list) or not all(isinstance(p, int) and not isinstance(p, bool) for p in tree):
+        return False
+    if not isinstance(hosts, list) or not all(isinstance(p, int) and not isinstance(p, bool) for p in hosts):
+        return False
+    if len(hosts) != host_count:
+        return False
+    if not isinstance(addrs, list) or not all(isinstance(a, str) for a in addrs):
+        return False
+    if len(addrs) != listen_count:
+        return False
+    for optional_key in _LISTENER_EVIDENCE_OPTIONAL:
+        if (
+            optional_key in value
+            and value[optional_key] is not None
+            and not isinstance(value[optional_key], str)
+        ):
+            return False
+    return True
+
+
 def _valid_scenarios(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != REQUIRED_SCENARIOS:
         return False
     for scenario in value.values():
-        if not isinstance(scenario, dict) or set(scenario) != _SCENARIO_FIELDS:
+        if not isinstance(scenario, dict):
+            return False
+        keys = set(scenario)
+        # Required keys must be present; optional listener_evidence may appear.
+        if not _SCENARIO_FIELDS.issubset(keys):
+            return False
+        if not keys.issubset(_SCENARIO_FIELDS | _SCENARIO_OPTIONAL_FIELDS):
+            return False
+        if "listener_evidence" in scenario and not _valid_listener_evidence(
+            scenario["listener_evidence"]
+        ):
             return False
         duration = scenario.get("duration_ms")
         if (

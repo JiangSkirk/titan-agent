@@ -66,7 +66,29 @@ struct ScenarioResult: Codable {
     var duration_ms: Double
     var error_code: String?
     /// Present on scenario hard timeout and waitForSingleListener failure paths.
+    /// Encoded only when non-nil — never emit `listener_evidence: null` on pass.
     var listener_evidence: ListenerEvidence? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case passed, status, detail, duration_ms, error_code, listener_evidence
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(passed, forKey: .passed)
+        try container.encode(status, forKey: .status)
+        try container.encode(detail, forKey: .detail)
+        try container.encode(duration_ms, forKey: .duration_ms)
+        // Gate requires the error_code key on every scenario (null on pass).
+        if let error_code {
+            try container.encode(error_code, forKey: .error_code)
+        } else {
+            try container.encodeNil(forKey: .error_code)
+        }
+        // encodeIfPresent: omit when nil so a green result keeps the exact
+        // required scenario key set (no listener_evidence: null).
+        try container.encodeIfPresent(listener_evidence, forKey: .listener_evidence)
+    }
 }
 
 struct HarnessResult: Codable {

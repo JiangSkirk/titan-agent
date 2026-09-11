@@ -376,6 +376,9 @@ def test_swift_harness_timeout_dump_keeps_host_count_and_listen_count_distinct()
     assert "timedOut.listener_evidence = evidence" in source
     assert "failed.listener_evidence = evidence" in source
     assert "pendingListenerEvidence = evidence" in source
+    # Never emit listener_evidence: null on pass — encodeIfPresent + encodeNil for error_code.
+    assert "encodeIfPresent(listener_evidence" in source
+    assert "encodeNil(forKey: .error_code)" in source
     # Pass contract unchanged: still require exactly one listener, never host PID count.
     assert "if l.count == 1, let first = l.first" in source
     assert "l.count == host_count" not in source
@@ -665,6 +668,41 @@ def test_timeout_dump_shape_distinguishes_zero_one_and_multi_listen() -> None:
     assert zero_listen["host_count"] == 2 and zero_listen["listen_count"] == 0
     assert dual_listen["host_count"] == 2 and dual_listen["listen_count"] == 2
     assert len(dual_listen["listen_addresses"]) == dual_listen["listen_count"]
+
+
+def _passed_scenarios(**extra: object) -> dict[str, dict[str, object]]:
+    base = {
+        "passed": True,
+        "status": "passed",
+        "detail": "ok",
+        "duration_ms": 1.0,
+        "error_code": None,
+    }
+    base.update(extra)
+    return {name: dict(base) for name in gate.REQUIRED_SCENARIOS}
+
+
+def test_valid_scenarios_allows_optional_listener_evidence_without_requiring_it() -> None:
+    """Green pass: exact required keys OK; optional listener_evidence (2 hosts/1 listen) OK."""
+    assert gate._valid_scenarios(_passed_scenarios()) is True
+
+    with_dump = _passed_scenarios(listener_evidence=_listener_evidence_two_hosts_one_listen())
+    assert gate._valid_scenarios(with_dump) is True
+    sample = next(iter(with_dump.values()))["listener_evidence"]
+    assert isinstance(sample, dict)
+    assert sample["host_count"] == 2
+    assert sample["listen_count"] == 1
+    assert sample["host_count"] != sample["listen_count"]
+
+
+def test_valid_scenarios_rejects_null_or_unknown_extra_listener_evidence() -> None:
+    """listener_evidence: null / malformed / unknown scenario keys still fail closed."""
+    assert gate._valid_scenarios(_passed_scenarios(listener_evidence=None)) is False
+    assert gate._valid_scenarios(_passed_scenarios(listener_evidence={"host_count": 2})) is False
+    assert gate._valid_scenarios(_passed_scenarios(unexpected_field=True)) is False
+    bad_counts = _listener_evidence_two_hosts_one_listen()
+    bad_counts["host_count"] = 99  # disagrees with host_pids length
+    assert gate._valid_scenarios(_passed_scenarios(listener_evidence=bad_counts)) is False
 
 
 def test_salvage_partial_result_rejects_unreadable(
