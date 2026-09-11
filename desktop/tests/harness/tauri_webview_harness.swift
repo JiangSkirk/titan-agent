@@ -201,9 +201,21 @@ func runShell(_ cmd: String, _ args: [String], timeout: TimeInterval = 30) -> (I
     return (Int(task.terminationStatus), out, err)
 }
 
-func processRows() -> [Int: (Int, Int, String)] {
-    let (code, out, _) = runShell("/bin/ps", ["-axo", "pid=,ppid=,pgid=,command="])
-    guard code == 0 else { return [:] }
+func processRows(timeout: TimeInterval = 30) -> [Int: (Int, Int, String)] {
+    let (status, rows) = probeProcessRows(timeout: timeout)
+    _ = status
+    return rows
+}
+
+/// Bounded ps probe that surfaces hang/empty/error distinctly from "no pids".
+func probeProcessRows(timeout: TimeInterval = 30) -> (String, [Int: (Int, Int, String)]) {
+    let (code, out, err) = runShell(
+        "/bin/ps", ["-axo", "pid=,ppid=,pgid=,command="], timeout: timeout
+    )
+    if code == -9 || err == "timeout" {
+        return ("timeout", [:])
+    }
+    guard code == 0 else { return ("error", [:]) }
     var rows: [Int: (Int, Int, String)] = [:]
     for line in out.split(separator: "\n") {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -216,7 +228,10 @@ func processRows() -> [Int: (Int, Int, String)] {
             rows[pid] = (ppid, pgid, cmd)
         }
     }
-    return rows
+    if rows.isEmpty {
+        return ("empty", rows)
+    }
+    return ("ok", rows)
 }
 
 func descendants(of rootPid: Int, rows: [Int: (Int, Int, String)]? = nil) -> Set<Int> {
@@ -243,7 +258,10 @@ func descendants(of rootPid: Int, rows: [Int: (Int, Int, String)]? = nil) -> Set
 /// that group and may be the LISTEN owner while the ready sentinel reports the
 /// leader pid. Fail-closed: processes outside this closure are never claimed.
 func processTreePids(of rootPid: Int) -> Set<Int> {
-    let rows = processRows()
+    processTreePids(of: rootPid, rows: processRows())
+}
+
+func processTreePids(of rootPid: Int, rows: [Int: (Int, Int, String)]) -> Set<Int> {
     var found = descendants(of: rootPid, rows: rows).union([rootPid])
     let leaderPgids = found.filter { pid in
         guard let (_, pgid, _) = rows[pid] else { return false }
@@ -263,10 +281,35 @@ struct ListenerInfo: Hashable {
     let port: Int
 }
 
-func listeners(pids: Set<Int>) -> Set<ListenerInfo> {
-    if pids.isEmpty { return [] }
+// Cold-start app log paths — set during launch so timeout/fail detail can tail them.
+var appStdoutLogPath = ""
+var appStderrLogPath = ""
+// Last successful listener-wait probe; watchdog can flush this if a live probe hangs.
+var lastListenerWaitEvidence = ""
+let listenerEvidenceLock = NSLock()
+
+func listeners(pids: Set<Int>, timeout: TimeInterval = 30) -> Set<ListenerInfo> {
+    let (status, found) = probeListeners(pids: pids, timeout: timeout)
+    _ = status
+    return found
+}
+
+/// Bounded lsof probe that surfaces hang distinctly from "zero listeners".
+func probeListeners(
+    pids: Set<Int>,
+    timeout: TimeInterval = 30
+) -> (String, Set<ListenerInfo>) {
+    if pids.isEmpty { return ("skipped_empty_pids", []) }
     let pidStr = pids.sorted().map { String($0) }.joined(separator: ",")
-    let (_, out, _) = runShell("/usr/sbin/lsof", ["-nP", "-a", "-p", pidStr, "-iTCP", "-sTCP:LISTEN"])
+    let (code, out, err) = runShell(
+        "/usr/sbin/lsof",
+        ["-nP", "-a", "-p", pidStr, "-iTCP", "-sTCP:LISTEN"],
+        timeout: timeout
+    )
+    if code == -9 || err == "timeout" {
+        return ("timeout", [])
+    }
+    guard code == 0 || code == 1 else { return ("error", []) }
     var result = Set<ListenerInfo>()
     for line in out.split(separator: "\n").dropFirst() {
         if let r = line.range(of: #"\bTCP\s+([^: ]+):(\d+)\s+\(LISTEN\)"#, options: .regularExpression) {
@@ -279,7 +322,116 @@ func listeners(pids: Set<Int>) -> Set<ListenerInfo> {
             }
         }
     }
-    return result
+    return ("ok", result)
+}
+
+func fileTail(_ path: String, maxChars: Int = 400) -> String {
+    guard !path.isEmpty,
+          let data = FileManager.default.contents(atPath: path),
+          !data.isEmpty
+    else { return "" }
+    let text = String(data: data, encoding: .utf8) ?? ""
+    let clipped = text.count > maxChars ? String(text.suffix(maxChars)) : text
+    return clipped
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\r", with: "\\r")
+        .replacingOccurrences(of: "|", with: "/")
+}
+
+func rememberListenerWaitEvidence(_ evidence: String) {
+    listenerEvidenceLock.lock()
+    lastListenerWaitEvidence = evidence
+    listenerEvidenceLock.unlock()
+}
+
+func recalledListenerWaitEvidence() -> String {
+    listenerEvidenceLock.lock()
+    defer { listenerEvidenceLock.unlock() }
+    return lastListenerWaitEvidence
+}
+
+/// Durable cold-start / listener-wait evidence for result.json detail.
+///
+/// `host_count` / `host_pids` are **process** counts (cmd contains js-agent-host).
+/// PyInstaller onefile often shows parent+child (host_count=2) with a **single**
+/// LISTEN — that is not a double-open. `listener_count` / `listeners` come only
+/// from lsof TCP LISTEN and are recorded separately:
+/// - listener_count=0 → sidecar not Ready (or no bind yet)
+/// - listener_count=1 → unique loopback listener (success path)
+/// - listener_count=2+ → real double-open
+/// Also distinguishes host-never-spawned (host_count=0) and ps/lsof hung.
+/// Short probe timeouts so a wedged lsof cannot block the watchdog flush path.
+func listenerWaitEvidenceFromSnapshot(
+    rootPid: Int,
+    psStatus: String,
+    rows: [Int: (Int, Int, String)],
+    lsofStatus: String,
+    listeners found: Set<ListenerInfo>
+) -> String {
+    let appRunning: String
+    if psStatus == "timeout" || psStatus == "error" || psStatus == "no_target_pid" {
+        appRunning = "unknown"
+    } else {
+        appRunning = rows[rootPid] != nil ? "true" : "false"
+    }
+    let tree: Set<Int>
+    if psStatus == "ok" {
+        tree = processTreePids(of: rootPid, rows: rows)
+    } else if rootPid > 0 {
+        tree = [rootPid]
+    } else {
+        tree = []
+    }
+    // Process inventory only — never treat host_count as listener_count.
+    let hostPids = tree.filter { pid in
+        guard let (_, _, cmd) = rows[pid] else { return false }
+        return cmd.contains("js-agent-host")
+    }.sorted()
+    // LISTEN inventory only — independent of how many js-agent-host PIDs exist.
+    let listenerAddrs = found
+        .map { "\($0.host):\($0.port)" }
+        .sorted()
+        .joined(separator: ",")
+    let treeList = tree.sorted().map(String.init).joined(separator: ",")
+    let hostList = hostPids.map(String.init).joined(separator: ",")
+    return "app_running=\(appRunning) tree_pids=[\(treeList)] "
+        + "host_count=\(hostPids.count) host_pids=[\(hostList)] "
+        + "listener_count=\(found.count) listeners=[\(listenerAddrs)] "
+        + "ps=\(psStatus) lsof=\(lsofStatus) "
+        + "stdout_tail=\(fileTail(appStdoutLogPath)) "
+        + "stderr_tail=\(fileTail(appStderrLogPath))"
+}
+
+func listenerWaitEvidence(rootPid: Int?, probeTimeout: TimeInterval = 2.0) -> String {
+    guard let rootPid, rootPid > 0 else {
+        return listenerWaitEvidenceFromSnapshot(
+            rootPid: 0,
+            psStatus: "no_target_pid",
+            rows: [:],
+            lsofStatus: "skipped",
+            listeners: []
+        )
+    }
+    let (psStatus, rows) = probeProcessRows(timeout: probeTimeout)
+    if psStatus != "ok" {
+        return listenerWaitEvidenceFromSnapshot(
+            rootPid: rootPid,
+            psStatus: psStatus,
+            rows: rows,
+            lsofStatus: "skipped",
+            listeners: []
+        )
+    }
+    let tree = processTreePids(of: rootPid, rows: rows)
+    let (lsofStatus, found) = probeListeners(pids: tree, timeout: probeTimeout)
+    return listenerWaitEvidenceFromSnapshot(
+        rootPid: rootPid,
+        psStatus: psStatus,
+        rows: rows,
+        lsofStatus: lsofStatus,
+        listeners: found
+    )
 }
 
 /// Bound every AX IPC call. Without this, WKWebView walks can block forever
@@ -695,16 +847,28 @@ func scenario(
         gate.unlock()
         guard !alreadyDone else { return }
         let duration = Date().timeIntervalSince(start) * 1000
+        // Prefer a fresh short-timeout probe; fall back to last mid-wait snapshot
+        // if ps/lsof is wedged (so dual-host vs never-spawned stays durable).
+        let liveEvidence = listenerWaitEvidence(rootPid: result.target_pid, probeTimeout: 2.0)
+        let cached = recalledListenerWaitEvidence()
+        let evidence: String
+        if liveEvidence.contains("ps=timeout") || liveEvidence.contains("lsof=timeout"),
+           !cached.isEmpty {
+            evidence = cached + " live_probe_hung=true"
+        } else {
+            evidence = liveEvidence
+        }
+        let detail = "scenario hard timeout after \(Int(timeout))s | \(evidence)"
         result.scenarios[name] = ScenarioResult(
             passed: false,
             status: "timeout",
-            detail: "scenario hard timeout after \(Int(timeout))s",
+            detail: detail,
             duration_ms: duration,
             error_code: "scenario_timeout"
         )
         result.ok = false
         result.status = "failed"
-        print("[TIMEOUT] \(name): hard timeout after \(Int(timeout))s")
+        print("[TIMEOUT] \(name): hard timeout after \(Int(timeout))s | \(evidence)")
         // Flush BEFORE exit so the Python wrapper can salvage evidence even if
         // the wedged AX thread never returns and the outer gate must reap us.
         flushResult(markFinished: true)
@@ -759,25 +923,89 @@ func requireApp() throws -> Process {
 }
 
 func waitForSingleListener(proc: Process, timeout: TimeInterval) throws -> ListenerInfo {
+    let rootPid = Int(proc.processIdentifier)
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if !proc.isRunning {
-            throw NSError(domain: "harness", code: EXIT_LAUNCH_FAILED, userInfo: [NSLocalizedDescriptionKey: "app exited before listener"])
+            let evidence = listenerWaitEvidence(rootPid: rootPid, probeTimeout: 2.0)
+            rememberListenerWaitEvidence(evidence)
+            throw NSError(
+                domain: "harness",
+                code: EXIT_LAUNCH_FAILED,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "app exited before listener | \(evidence)",
+                ]
+            )
         }
-        let tree = processTreePids(of: Int(proc.processIdentifier))
-        let l = listeners(pids: tree)
-        if l.count == 1, let first = l.first {
+        // Short-bounded probes: hang surfaces as ps=/lsof=timeout in durable detail
+        // instead of burning the 100s wait inside a single 30s runShell call.
+        let (psStatus, rows) = probeProcessRows(timeout: 2.0)
+        if psStatus == "timeout" || psStatus == "error" {
+            let evidence = listenerWaitEvidenceFromSnapshot(
+                rootPid: rootPid,
+                psStatus: psStatus,
+                rows: rows,
+                lsofStatus: "skipped",
+                listeners: []
+            )
+            rememberListenerWaitEvidence(evidence)
+            Thread.sleep(forTimeInterval: 0.25)
+            continue
+        }
+        let tree = processTreePids(of: rootPid, rows: rows)
+        let (lsofStatus, found) = probeListeners(pids: tree, timeout: 2.0)
+        let evidence = listenerWaitEvidenceFromSnapshot(
+            rootPid: rootPid,
+            psStatus: psStatus,
+            rows: rows,
+            lsofStatus: lsofStatus,
+            listeners: found
+        )
+        rememberListenerWaitEvidence(evidence)
+        if lsofStatus == "timeout" || lsofStatus == "error" {
+            Thread.sleep(forTimeInterval: 0.25)
+            continue
+        }
+        // Gate on LISTEN count only. host_count=2 (onefile parent+child) with a
+        // single LISTEN is success; never treat two host PIDs as two listeners.
+        if found.count == 1, let first = found.first {
             if first.port == 8765 {
-                throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "listener on forbidden port 8765"])
+                throw NSError(
+                    domain: "harness",
+                    code: EXIT_ASSERT,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "listener on forbidden port 8765 | \(evidence)",
+                    ]
+                )
             }
             if first.host != "127.0.0.1" && first.host != "localhost" {
-                throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "non-loopback listener \(first.host)"])
+                throw NSError(
+                    domain: "harness",
+                    code: EXIT_ASSERT,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "non-loopback listener \(first.host) | \(evidence)",
+                    ]
+                )
             }
             return first
         }
         Thread.sleep(forTimeInterval: 0.25)
     }
-    throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "no single loopback listener within \(Int(timeout))s"])
+    let evidence = recalledListenerWaitEvidence()
+    let finalEvidence = evidence.isEmpty
+        ? listenerWaitEvidence(rootPid: rootPid, probeTimeout: 2.0)
+        : evidence
+    throw NSError(
+        domain: "harness",
+        code: EXIT_ASSERT,
+        userInfo: [
+            NSLocalizedDescriptionKey:
+                "no single loopback listener within \(Int(timeout))s | \(finalEvidence)",
+        ]
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -814,6 +1042,8 @@ scenario(
     let errLog = tmpDir + "/app.stderr"
     FileManager.default.createFile(atPath: outLog, contents: nil)
     FileManager.default.createFile(atPath: errLog, contents: nil)
+    appStdoutLogPath = outLog
+    appStderrLogPath = errLog
     proc.standardOutput = FileHandle(forWritingAtPath: outLog)
     proc.standardError = FileHandle(forWritingAtPath: errLog)
     do {
@@ -823,6 +1053,9 @@ scenario(
     }
     appProcess = proc
     result.target_pid = Int(proc.processIdentifier)
+    // Mid-run flush so outer TimeoutExpired salvage keeps target_pid even if
+    // waitForSingleListener later wedges before scenario_timeout fires.
+    flushResult()
     let listener = try waitForSingleListener(proc: proc, timeout: 100)
     return "pid=\(proc.processIdentifier) listener=\(listener.host):\(listener.port)"
 }
