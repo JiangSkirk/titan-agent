@@ -219,8 +219,8 @@ func processRows() -> [Int: (Int, Int, String)] {
     return rows
 }
 
-func descendants(of rootPid: Int) -> Set<Int> {
-    let rows = processRows()
+func descendants(of rootPid: Int, rows: [Int: (Int, Int, String)]? = nil) -> Set<Int> {
+    let rows = rows ?? processRows()
     var found = Set<Int>()
     var changed = true
     while changed {
@@ -230,6 +230,29 @@ func descendants(of rootPid: Int) -> Set<Int> {
                 found.insert(pid)
                 changed = true
             }
+        }
+    }
+    return found
+}
+
+/// Owned tree for listener / sidecar probes.
+///
+/// Starts from the ppid descendant closure, then expands by process groups whose
+/// leaders already sit in that tree. The Host sidecar is spawned with
+/// `process_group(0)` (leader pgid == pid); PyInstaller onefile children stay in
+/// that group and may be the LISTEN owner while the ready sentinel reports the
+/// leader pid. Fail-closed: processes outside this closure are never claimed.
+func processTreePids(of rootPid: Int) -> Set<Int> {
+    let rows = processRows()
+    var found = descendants(of: rootPid, rows: rows).union([rootPid])
+    let leaderPgids = found.filter { pid in
+        guard let (_, pgid, _) = rows[pid] else { return false }
+        return pgid == pid && pgid > 0
+    }
+    guard !leaderPgids.isEmpty else { return found }
+    for (pid, (_, pgid, _)) in rows {
+        if leaderPgids.contains(pgid) {
+            found.insert(pid)
         }
     }
     return found
@@ -259,6 +282,16 @@ func listeners(pids: Set<Int>) -> Set<ListenerInfo> {
     return result
 }
 
+/// Bound every AX IPC call. Without this, WKWebView walks can block forever
+/// inside AXUIElementCopyAttributeValue and stall the entire outer smoke gate.
+let AX_MESSAGING_TIMEOUT_SECONDS: Float = 2.0
+let AX_TREE_MAX_DEPTH = 6
+let AX_TREE_MAX_NODES = 400
+
+func configureAxTimeout(_ element: AXUIElement) {
+    AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS)
+}
+
 func getAxAttribute(_ element: AXUIElement, _ attr: String) -> String? {
     var ref: CFTypeRef?
     let result = AXUIElementCopyAttributeValue(element, attr as CFString, &ref)
@@ -266,34 +299,76 @@ func getAxAttribute(_ element: AXUIElement, _ attr: String) -> String? {
     return value
 }
 
-func collectAxTree(_ element: AXUIElement, depth: Int = 0, maxDepth: Int = 8) -> [(String, String, AXUIElement)] {
+struct AxWalkBudget {
+    let deadline: Date
+    let maxDepth: Int
+    let maxNodes: Int
+    var nodes: Int = 0
+    var truncated: Bool = false
+
+    var expired: Bool { Date() >= deadline || nodes >= maxNodes || truncated }
+
+    mutating func consume() -> Bool {
+        if expired {
+            truncated = true
+            return false
+        }
+        nodes += 1
+        return true
+    }
+}
+
+func collectAxTree(
+    _ element: AXUIElement,
+    depth: Int = 0,
+    budget: inout AxWalkBudget
+) -> [(String, String, AXUIElement)] {
     var items: [(String, String, AXUIElement)] = []
+    guard budget.consume() else { return items }
     let role = getAxAttribute(element, kAXRoleAttribute as String) ?? ""
     let title = getAxAttribute(element, kAXTitleAttribute as String)
         ?? getAxAttribute(element, kAXDescriptionAttribute as String)
         ?? getAxAttribute(element, kAXValueAttribute as String)
         ?? ""
     items.append((role, title, element))
-    if depth >= maxDepth { return items }
+    if depth >= budget.maxDepth || budget.expired { return items }
     var childrenRef: CFTypeRef?
     let r = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef)
     if r == .success, let children = childrenRef as? [AXUIElement] {
         for child in children {
-            items.append(contentsOf: collectAxTree(child, depth: depth + 1, maxDepth: maxDepth))
+            if budget.expired { break }
+            items.append(contentsOf: collectAxTree(child, depth: depth + 1, budget: &budget))
         }
     }
     return items
 }
 
+func collectAxTreeBounded(
+    _ element: AXUIElement,
+    timeout: TimeInterval = 8,
+    maxDepth: Int = AX_TREE_MAX_DEPTH,
+    maxNodes: Int = AX_TREE_MAX_NODES
+) -> [(String, String, AXUIElement)] {
+    configureAxTimeout(element)
+    var budget = AxWalkBudget(
+        deadline: Date().addingTimeInterval(timeout),
+        maxDepth: maxDepth,
+        maxNodes: maxNodes
+    )
+    return collectAxTree(element, budget: &budget)
+}
+
 func pressAxButton(appPid: pid_t, matching predicates: [String]) -> Bool {
     let appElement = AXUIElementCreateApplication(appPid)
-    let tree = collectAxTree(appElement)
+    configureAxTimeout(appElement)
+    let tree = collectAxTreeBounded(appElement, timeout: 8)
     for (role, title, element) in tree {
         let lowered = title.lowercased()
         let roleOk = role == "AXButton" || role == "AXRadioButton" || role == "AXCheckBox" || role == "AXMenuItem" || role == "AXPopUpButton" || role == "AXTab"
         if !roleOk { continue }
         for p in predicates {
             if lowered.contains(p.lowercased()) {
+                configureAxTimeout(element)
                 let err = AXUIElementPerformAction(element, kAXPressAction as CFString)
                 if err == .success { return true }
             }
@@ -391,7 +466,7 @@ func gracefulTerminationSurvivors(_ proc: Process, observed: Set<Int>) -> Set<In
 
 func terminateOwned(_ proc: Process, extraPids: Set<Int> = []) {
     let root = Int(proc.processIdentifier)
-    var owned = descendants(of: root).union([root]).union(extraPids)
+    var owned = processTreePids(of: root).union(extraPids)
     if proc.isRunning {
         proc.terminate()
     }
@@ -604,8 +679,8 @@ func waitForSingleListener(proc: Process, timeout: TimeInterval) throws -> Liste
         if !proc.isRunning {
             throw NSError(domain: "harness", code: EXIT_LAUNCH_FAILED, userInfo: [NSLocalizedDescriptionKey: "app exited before listener"])
         }
-        let desc = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
-        let l = listeners(pids: desc)
+        let tree = processTreePids(of: Int(proc.processIdentifier))
+        let l = listeners(pids: tree)
         if l.count == 1, let first = l.first {
             if first.port == 8765 {
                 throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "listener on forbidden port 8765"])
@@ -665,9 +740,10 @@ scenario("cold_start_controlled_env", errorCode: "launch_failed") {
 
 scenario("process_tree_one_app_one_sidecar") {
     let proc = try requireApp()
-    let desc = descendants(of: Int(proc.processIdentifier))
+    let tree = processTreePids(of: Int(proc.processIdentifier))
     let rows = processRows()
-    let sidecars = desc.filter { pid in
+    let sidecars = tree.filter { pid in
+        guard pid != Int(proc.processIdentifier) else { return false }
         guard let (_, _, cmd) = rows[pid] else { return false }
         return cmd.contains("js-agent-host")
     }
@@ -678,17 +754,20 @@ scenario("process_tree_one_app_one_sidecar") {
     if sidecars.count > 2 {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "too many sidecar processes: \(sidecars.count)"])
     }
-    let tree = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
     let l = listeners(pids: tree)
     if l.count != 1 {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "expected 1 listener, got \(l.count)"])
     }
-    return "sidecars=\(sidecars.count) listeners=\(l.count)"
+    // Align with Host ready-sentinel process-group model: LISTEN owner must be
+    // inside the owned tree (ppid closure + sidecar leader groups). Fail closed
+    // if a loopback listener exists only outside that tree.
+    return "sidecars=\(sidecars.count) listeners=\(l.count) tree=\(tree.count)"
 }
 
 scenario("webview_shows_content", errorCode: "window_not_found") {
     let proc = try requireApp()
     let appElement = AXUIElementCreateApplication(proc.processIdentifier)
+    configureAxTimeout(appElement)
 
     var window: AXUIElement?
     let deadline = Date().addingTimeInterval(45)
@@ -704,12 +783,16 @@ scenario("webview_shows_content", errorCode: "window_not_found") {
     guard let win = window else {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "no window for target pid \(proc.processIdentifier)"])
     }
+    configureAxTimeout(win)
 
     var urlValue: String?
     var title = getAxAttribute(win, kAXTitleAttribute as String) ?? ""
     let urlDeadline = Date().addingTimeInterval(30)
     while Date() < urlDeadline {
-        let tree = collectAxTree(win)
+        // Each walk is independently budgeted; never let one AX crawl dominate
+        // the remaining scenario window.
+        let perWalk = min(8.0, max(1.0, urlDeadline.timeIntervalSinceNow))
+        let tree = collectAxTreeBounded(win, timeout: perWalk)
         for (role, _, el) in tree {
             if role == "AXWebArea" || role == "AXBrowser" {
                 if let url = getAxAttribute(el, "AXURL") {
@@ -744,6 +827,7 @@ scenario("webview_shows_content", errorCode: "window_not_found") {
 scenario("bootstrap_fragment_cleared") {
     let proc = try requireApp()
     let appElement = AXUIElementCreateApplication(proc.processIdentifier)
+    configureAxTimeout(appElement)
     // Wait briefly for bootstrap redirect to clear fragment.
     Thread.sleep(forTimeInterval: 2)
     var sawBootstrap = false
@@ -751,7 +835,9 @@ scenario("bootstrap_fragment_cleared") {
     let deadline = Date().addingTimeInterval(20)
     while Date() < deadline {
         if let win = findFirstWindow(app: appElement) {
-            for (role, _, el) in collectAxTree(win) {
+            configureAxTimeout(win)
+            let perWalk = min(8.0, max(1.0, deadline.timeIntervalSinceNow))
+            for (role, _, el) in collectAxTreeBounded(win, timeout: perWalk) {
                 if role == "AXWebArea" || role == "AXBrowser" {
                     if let url = getAxAttribute(el, "AXURL") {
                         finalUrl = url
@@ -771,7 +857,7 @@ scenario("bootstrap_fragment_cleared") {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "bootstrap fragment still present: \(url)"])
     }
     // Also ensure process environment does not leak fragment.
-    let desc = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
+    let desc = processTreePids(of: Int(proc.processIdentifier))
     let pidStr = desc.sorted().map { String($0) }.joined(separator: ",")
     let (_, out, _) = runShell("/bin/ps", ["-E", "-ww", "-p", pidStr, "-o", "command="])
     if out.contains("#bootstrap=") {
@@ -797,7 +883,7 @@ func findFirstWindow(app: AXUIElement) -> AXUIElement? {
 
 scenario("http_api_status") {
     let proc = try requireApp()
-    let tree = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
+    let tree = processTreePids(of: Int(proc.processIdentifier))
     let l = listeners(pids: tree)
     guard let listener = l.first else {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "no listener"])
@@ -815,7 +901,7 @@ scenario("http_api_status") {
 
 scenario("bootstrap_token_single_use") {
     let proc = try requireApp()
-    let tree = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
+    let tree = processTreePids(of: Int(proc.processIdentifier))
     guard let listener = listeners(pids: tree).first else {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "no listener"])
     }
@@ -853,11 +939,12 @@ scenario("ui_mode_switch_personal_work_personal") {
     let proc = try requireApp()
     // Require both real Accessibility button presses and protected mode/epoch readback.
     let appElement = AXUIElementCreateApplication(proc.processIdentifier)
+    configureAxTimeout(appElement)
     guard findFirstWindow(app: appElement) != nil else {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "window missing before mode switch"])
     }
 
-    let treePids = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
+    let treePids = processTreePids(of: Int(proc.processIdentifier))
     guard let listener = listeners(pids: treePids).first else {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "no listener"])
     }
@@ -913,7 +1000,7 @@ scenario("ui_mode_switch_personal_work_personal") {
     }
 
     // Confirm still single window + single port (no second product host).
-    let treeAfter = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
+    let treeAfter = processTreePids(of: Int(proc.processIdentifier))
     let lAfter = listeners(pids: treeAfter)
     if lAfter.count != 1 {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "port count changed during mode switch: \(lAfter.count)"])
@@ -930,8 +1017,9 @@ scenario("ui_mode_switch_personal_work_personal") {
 scenario("sidecar_crash_recovery") {
     let proc = try requireApp()
     let rowsBefore = processRows()
-    let desc = descendants(of: Int(proc.processIdentifier))
+    let desc = processTreePids(of: Int(proc.processIdentifier))
     let sidecars = desc.filter { pid in
+        guard pid != Int(proc.processIdentifier) else { return false }
         guard let (_, _, cmd) = rowsBefore[pid] else { return false }
         return cmd.contains("js-agent-host")
     }
@@ -951,12 +1039,13 @@ scenario("sidecar_crash_recovery") {
             throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "app died after sidecar kill"])
         }
         let rows = processRows()
-        let d = descendants(of: Int(proc.processIdentifier))
+        let d = processTreePids(of: Int(proc.processIdentifier))
         let liveSidecars = d.filter { pid in
+            guard pid != Int(proc.processIdentifier) else { return false }
             guard let (_, _, cmd) = rows[pid] else { return false }
             return cmd.contains("js-agent-host") && pid != victim
         }
-        let l = listeners(pids: d.union([Int(proc.processIdentifier)]))
+        let l = listeners(pids: d)
         if !liveSidecars.isEmpty, l.count == 1, let first = l.first {
             recovered = true
             newListener = first
@@ -968,7 +1057,7 @@ scenario("sidecar_crash_recovery") {
         throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "sidecar did not recover"])
     }
     // Bootstrap token must not be reused from environment.
-    let tree = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
+    let tree = processTreePids(of: Int(proc.processIdentifier))
     let pidStr = tree.sorted().map { String($0) }.joined(separator: ",")
     let (_, cmdOut, _) = runShell("/bin/ps", ["-E", "-ww", "-p", pidStr, "-o", "command="])
     if cmdOut.contains("#bootstrap=") {
@@ -979,7 +1068,7 @@ scenario("sidecar_crash_recovery") {
 
 scenario("clean_quit_no_orphans", errorCode: "cleanup_failed") {
     let proc = try requireApp()
-    let observed = descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)])
+    let observed = processTreePids(of: Int(proc.processIdentifier))
     // The assertion path sends TERM only. If graceful cleanup fails, appProcess
     // remains set and the final defer-style cleanup below may use KILL only
     // after this scenario has recorded the failure.
@@ -1026,7 +1115,7 @@ if result.scenarios["clean_quit_no_orphans"]?.passed == true {
         Thread.sleep(forTimeInterval: 0.5)
         _ = pressAxButton(appPid: proc.processIdentifier, matching: ["personal", "个人"])
         Thread.sleep(forTimeInterval: 0.5)
-        let l2 = listeners(pids: descendants(of: Int(proc.processIdentifier)).union([Int(proc.processIdentifier)]))
+        let l2 = listeners(pids: processTreePids(of: Int(proc.processIdentifier)))
         if l2.count != 1 {
             throw NSError(domain: "harness", code: EXIT_ASSERT, userInfo: [NSLocalizedDescriptionKey: "restart flow listener count \(l2.count)"])
         }

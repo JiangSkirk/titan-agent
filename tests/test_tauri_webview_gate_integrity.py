@@ -4,6 +4,7 @@ import hashlib
 import json
 import plistlib
 import shutil
+import signal
 import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -187,7 +188,7 @@ def _run(
         result_path.write_text(json.dumps(payload), encoding="utf-8")
         return SimpleNamespace(returncode=returncode, stdout="", stderr="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(gate, "_run_harness", fake_run)
     rc = gate.main(
         [
             "--evidence-dir",
@@ -308,6 +309,123 @@ def test_swift_harness_contract_has_real_replay_mode_readback_and_term_first() -
     clean_block = source[clean_quit:restart]
     assert "SIGKILL" not in clean_block
     assert "terminateOwned" not in clean_block
+
+
+def test_swift_harness_ax_walks_are_bounded() -> None:
+    """Regression: unbounded WKWebView AX walks hung the 600s outer smoke gate."""
+    source = (
+        Path(__file__).resolve().parents[1] / "desktop/tests/harness/tauri_webview_harness.swift"
+    ).read_text(encoding="utf-8")
+
+    assert "AXUIElementSetMessagingTimeout" in source
+    assert "AX_TREE_MAX_NODES" in source
+    assert "collectAxTreeBounded" in source
+    assert "AxWalkBudget" in source
+    assert "processTreePids" in source
+    # Scenario paths must use the bounded helper, not an open-ended walk.
+    assert "collectAxTree(win)" not in source
+    assert "collectAxTree(appElement)" not in source
+    assert "maxDepth: Int = 8" not in source
+    assert "budget.expired" in source
+    assert "AX_MESSAGING_TIMEOUT_SECONDS" in source
+
+
+def test_process_tree_expands_sidecar_leader_group_only() -> None:
+    rows = {
+        100: (1, 100, "js-agent-ui-test-harness"),
+        200: (100, 100, "JS Agent"),
+        300: (200, 300, "js-agent-host"),  # process_group(0) leader
+        301: (300, 300, "js-agent-host"),  # onefile child / LISTEN owner
+        999: (1, 999, "unrelated"),
+        400: (1, 100, "sibling-same-inherited-pgid"),
+    }
+    tree = gate.owned_process_tree(200, rows)
+    assert tree == {200, 300, 301}
+    assert 100 not in tree
+    assert 400 not in tree
+    assert 999 not in tree
+
+
+def test_reap_owned_tree_signals_sidecar_group_before_root_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout cleanup must target desktop+host while ppid links still exist."""
+    live = {
+        100: (1, 100, "harness"),
+        200: (100, 100, "JS Agent"),
+        300: (200, 300, "js-agent-host"),
+        301: (300, 300, "js-agent-host"),
+    }
+    signals: list[tuple[str, int, int]] = []
+
+    def provider() -> dict[int, tuple[int, int, str]]:
+        return dict(live)
+
+    def fake_kill(pid: int, sig: int) -> None:
+        signals.append(("pid", pid, sig))
+        live.pop(pid, None)
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        signals.append(("pgid", pgid, sig))
+        for pid, (_ppid, group, _cmd) in list(live.items()):
+            if group == pgid:
+                live.pop(pid, None)
+
+    monkeypatch.setattr(gate.os, "kill", fake_kill)
+    monkeypatch.setattr(gate.os, "killpg", fake_killpg)
+
+    targeted = gate.reap_owned_tree(
+        100,
+        rows_provider=provider,
+        grace_seconds=0.0,
+        kill_wait_seconds=0.0,
+    )
+    assert targeted == {100, 200, 300, 301}
+    assert ("pgid", 100, signal.SIGTERM) in signals or ("pgid", 300, signal.SIGTERM) in signals
+    assert ("pgid", 300, signal.SIGTERM) in signals
+    assert live == {}
+
+
+def test_wrapper_timeout_reaps_owned_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    evidence, app, harness_bundle, _manifest = _fixture(tmp_path)
+    monkeypatch.setattr("desktop.build_driver.verify_manifest", lambda *_a, **_kw: [])
+    reaped: list[int] = []
+
+    class FakePopen:
+        def __init__(self, *_a: object, **_kw: object) -> None:
+            self.pid = 4242
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            raise subprocess.TimeoutExpired(cmd=["harness"], timeout=timeout or 1)
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            return -9
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+    def fake_reap(root_pid: int, **_kwargs: object) -> set[int]:
+        reaped.append(root_pid)
+        return {root_pid}
+
+    monkeypatch.setattr(gate, "reap_owned_tree", fake_reap)
+
+    rc = gate.main(
+        [
+            "--evidence-dir",
+            str(evidence),
+            "--app-path",
+            str(app),
+            "--harness-path",
+            str(harness_bundle),
+        ]
+    )
+    assert rc == 1
+    assert reaped == [4242]
 
 
 def _artifact_bindings(
