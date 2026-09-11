@@ -4,13 +4,26 @@ from __future__ import annotations
 
 import os
 import secrets
+import sqlite3
 import stat
+import time
 from pathlib import Path
 
 from js.config import JSSettings
+from js.utils.db import _is_locked_or_busy
 from js.utils.log import get_logger
 
 logger = get_logger("js.web")
+
+
+def _peer_has_admin(state_dir: Path) -> bool:
+    """Best-effort check that another process already minted an admin key."""
+    from js.web.auth import AuthManager
+
+    try:
+        return AuthManager(state_dir).has_admin()
+    except Exception:
+        return False
 
 
 def _provision_bootstrap_admin_key(settings: JSSettings) -> str | None:
@@ -21,43 +34,62 @@ def _provision_bootstrap_admin_key(settings: JSSettings) -> str | None:
     key exists, one is minted and written to a 0600 file so a headless operator
     can recover it. The plaintext credential is never written to logs. Returns
     ``None`` when nothing was minted.
+
+    Concurrent first-start is idempotent: if a peer already minted an admin
+    after a SQLite lock race, return ``None`` instead of aborting startup.
     """
     if not settings.security.api_key_required:
         return None
     from js.web.auth import AuthManager
 
     key_file = settings.state_dir / "bootstrap_admin_key.txt"
-    persisted = False
+    deadline = time.monotonic() + 10.0
+    attempt = 0
 
-    def persist(plaintext: str) -> None:
-        nonlocal persisted
-        # Look up through js.web.server so existing monkeypatches on the
-        # facade path still wrap the write used by first-run provisioning.
-        from js.web import server as web_server
+    while True:
+        persisted = False
 
-        persist_fn = getattr(
-            web_server, "_persist_bootstrap_admin_key", _persist_bootstrap_admin_key
-        )
-        persist_fn(key_file, plaintext)
-        persisted = True
+        def persist(plaintext: str) -> None:
+            nonlocal persisted
+            # Look up through js.web.server so existing monkeypatches on the
+            # facade path still wrap the write used by first-run provisioning.
+            from js.web import server as web_server
 
-    try:
-        key = AuthManager(settings.state_dir).ensure_bootstrap_admin_key(persist)
-    except Exception as exc:
-        if persisted:
-            try:
-                key_file.unlink()
-            except FileNotFoundError:
-                pass
-        logger.warning(
-            "Could not persist bootstrap admin key; refusing to start with an unrecoverable key",
-            error_type=type(exc).__name__,
-        )
-        raise RuntimeError("Could not persist bootstrap admin key; startup aborted") from None
-    if not key:
-        return None
-    logger.warning("Bootstrap admin key created for first run; saved to %s", key_file)
-    return key
+            persist_fn = getattr(
+                web_server, "_persist_bootstrap_admin_key", _persist_bootstrap_admin_key
+            )
+            persist_fn(key_file, plaintext)
+            persisted = True
+
+        try:
+            key = AuthManager(settings.state_dir).ensure_bootstrap_admin_key(persist)
+        except Exception as exc:
+            if persisted:
+                try:
+                    key_file.unlink()
+                except FileNotFoundError:
+                    pass
+            # Peer won the mint race (or finished while we retried).
+            if _peer_has_admin(settings.state_dir):
+                return None
+            locked = isinstance(exc, sqlite3.OperationalError) and _is_locked_or_busy(exc)
+            if not locked or time.monotonic() >= deadline:
+                logger.warning(
+                    "Could not persist bootstrap admin key; refusing to start "
+                    "with an unrecoverable key",
+                    error_type=type(exc).__name__,
+                )
+                raise RuntimeError(
+                    "Could not persist bootstrap admin key; startup aborted"
+                ) from None
+            time.sleep(min(0.05 * (2**attempt), 0.25))
+            attempt += 1
+            continue
+
+        if not key:
+            return None
+        logger.warning("Bootstrap admin key created for first run; saved to %s", key_file)
+        return key
 
 
 def _persist_bootstrap_admin_key(path: Path, key: str) -> None:
