@@ -1,9 +1,9 @@
 {
-  "source_digest": "029e8c003ad961f00f54c11bd17fcad8c9bbbdcb2e269bf54b1d00dda3eea916",
+  "source_digest": "1ffac7579d327ee6bc5b8b2a9b6e7d2f813283f28d3ee31f46451faf36f88081",
   "metadata": {
     "iterations": 50,
     "warmup": 10,
-    "source_digest": "029e8c003ad961f00f54c11bd17fcad8c9bbbdcb2e269bf54b1d00dda3eea916",
+    "source_digest": "1ffac7579d327ee6bc5b8b2a9b6e7d2f813283f28d3ee31f46451faf36f88081",
     "slo_contract": {
       "version": "js-agent-slo-v2",
       "full_request_p95_ms": 45.0,

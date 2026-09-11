@@ -6,7 +6,7 @@
 - The old off/shadow architecture modes have been removed from the normal JS Agent configuration surface.
 - Local engineering gates support running the JS Agent on Echo-only default.
 - GitHub stable release remains blocked until external approvals are signed.
-- Benchmark SHA-256: `03a60912749ccb5ba8cc5f957f04f644da57292c56d206d804c37acedbe7b436`
+- Benchmark SHA-256: `211c52613cfa681f1f8f06010f8aa9ccd0af6fcb03e3e091fd998788bfd9a430`
 
 ## Safety
 
