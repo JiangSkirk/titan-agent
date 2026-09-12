@@ -207,15 +207,7 @@ func processRows(timeout: TimeInterval = 30) -> [Int: (Int, Int, String)] {
     return rows
 }
 
-/// Bounded ps probe that surfaces hang/empty/error distinctly from "no pids".
-func probeProcessRows(timeout: TimeInterval = 30) -> (String, [Int: (Int, Int, String)]) {
-    let (code, out, err) = runShell(
-        "/bin/ps", ["-axo", "pid=,ppid=,pgid=,command="], timeout: timeout
-    )
-    if code == -9 || err == "timeout" {
-        return ("timeout", [:])
-    }
-    guard code == 0 else { return ("error", [:]) }
+func parsePsRows(_ out: String) -> [Int: (Int, Int, String)] {
     var rows: [Int: (Int, Int, String)] = [:]
     for line in out.split(separator: "\n") {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -228,10 +220,90 @@ func probeProcessRows(timeout: TimeInterval = 30) -> (String, [Int: (Int, Int, S
             rows[pid] = (ppid, pgid, cmd)
         }
     }
+    return rows
+}
+
+/// Bounded ps probe that surfaces hang/empty/error distinctly from "no pids".
+func probeProcessRows(timeout: TimeInterval = 30) -> (String, [Int: (Int, Int, String)]) {
+    let (code, out, err) = runShell(
+        "/bin/ps", ["-axo", "pid=,ppid=,pgid=,command="], timeout: timeout
+    )
+    if code == -9 || err == "timeout" {
+        return ("timeout", [:])
+    }
+    guard code == 0 else { return ("error", [:]) }
+    let rows = parsePsRows(out)
     if rows.isEmpty {
         return ("empty", rows)
     }
     return ("ok", rows)
+}
+
+/// Pid-narrowed ps against the known desktop pid and its process group.
+/// Used as a recovery probe when a short full-table `ps -axo` times out.
+func probeProcessRowsNarrowed(
+    rootPid: Int,
+    timeout: TimeInterval
+) -> (String, [Int: (Int, Int, String)]) {
+    guard rootPid > 0 else { return ("error", [:]) }
+    let (code, out, err) = runShell(
+        "/bin/ps",
+        ["-p", String(rootPid), "-o", "pid=,ppid=,pgid=,command="],
+        timeout: timeout
+    )
+    if code == -9 || err == "timeout" {
+        return ("timeout", [:])
+    }
+    // macOS ps returns 1 when the pid is gone; treat as measured empty.
+    guard code == 0 || code == 1 else { return ("error", [:]) }
+    var rows = parsePsRows(out)
+    if let (_, pgid, _) = rows[rootPid], pgid > 0 {
+        let (gCode, gOut, gErr) = runShell(
+            "/bin/ps",
+            ["-g", String(pgid), "-o", "pid=,ppid=,pgid=,command="],
+            timeout: timeout
+        )
+        if !(gCode == -9 || gErr == "timeout"), gCode == 0 || gCode == 1 {
+            for (pid, info) in parsePsRows(gOut) {
+                rows[pid] = info
+            }
+        }
+    }
+    if rows.isEmpty {
+        return ("empty", rows)
+    }
+    return ("ok", rows)
+}
+
+/// One recovery attempt after a short ps probe fails: longer full-table first
+/// (2s -axo is the suspected timeout culprit), then pid-narrowed desktop/pgid.
+func probeProcessRowsRecover(
+    rootPid: Int,
+    timeout: TimeInterval
+) -> (String, [Int: (Int, Int, String)]) {
+    let (fullStatus, fullRows) = probeProcessRows(timeout: timeout)
+    if fullStatus == "ok" || fullStatus == "empty" {
+        return (fullStatus, fullRows)
+    }
+    return probeProcessRowsNarrowed(rootPid: rootPid, timeout: timeout)
+}
+
+/// Measured inventory may be empty (honest 0). Timeout/error/skipped are not.
+func psInventoryReliable(_ status: String) -> Bool {
+    status == "ok" || status == "empty"
+}
+
+func lsofInventoryReliable(_ status: String, psReliable: Bool) -> Bool {
+    switch status {
+    case "ok":
+        return true
+    case "skipped_empty_pids":
+        // No pids to probe after a measured empty tree → honest zero listeners.
+        return psReliable
+    default:
+        // timeout / error / skipped (because ps failed) → not a measured set.
+        return false
+    }
 }
 
 func descendants(of rootPid: Int, rows: [Int: (Int, Int, String)]? = nil) -> Set<Int> {
@@ -357,10 +429,12 @@ func recalledListenerWaitEvidence() -> String {
 /// PyInstaller onefile often shows parent+child (host_count=2) with a **single**
 /// LISTEN — that is not a double-open. `listener_count` / `listeners` come only
 /// from lsof TCP LISTEN and are recorded separately:
-/// - listener_count=0 → sidecar not Ready (or no bind yet)
+/// - listener_count=0 → measured empty LISTEN set (sidecar not Ready / no bind yet)
 /// - listener_count=1 → unique loopback listener (success path)
 /// - listener_count=2+ → real double-open
-/// Also distinguishes host-never-spawned (host_count=0) and ps/lsof hung.
+/// - host_count=unknown / listener_count=unknown → ps/lsof timed out or skipped;
+///   never print =0 / =[] as if the probe collected an empty set.
+/// Measured host_count=0 still means host-never-spawned (ps actually ran).
 /// Short probe timeouts so a wedged lsof cannot block the watchdog flush path.
 func listenerWaitEvidenceFromSnapshot(
     rootPid: Int,
@@ -369,14 +443,16 @@ func listenerWaitEvidenceFromSnapshot(
     lsofStatus: String,
     listeners found: Set<ListenerInfo>
 ) -> String {
+    let psReliable = psInventoryReliable(psStatus)
+    let lsofReliable = lsofInventoryReliable(lsofStatus, psReliable: psReliable)
     let appRunning: String
-    if psStatus == "timeout" || psStatus == "error" || psStatus == "no_target_pid" {
+    if !psReliable || psStatus == "no_target_pid" {
         appRunning = "unknown"
     } else {
         appRunning = rows[rootPid] != nil ? "true" : "false"
     }
     let tree: Set<Int>
-    if psStatus == "ok" {
+    if psStatus == "ok" || psStatus == "empty" {
         tree = processTreePids(of: rootPid, rows: rows)
     } else if rootPid > 0 {
         tree = [rootPid]
@@ -395,9 +471,15 @@ func listenerWaitEvidenceFromSnapshot(
         .joined(separator: ",")
     let treeList = tree.sorted().map(String.init).joined(separator: ",")
     let hostList = hostPids.map(String.init).joined(separator: ",")
+    let hostCountToken = psReliable ? "host_count=\(hostPids.count)" : "host_count=unknown"
+    let hostPidsToken = psReliable ? "host_pids=[\(hostList)]" : "host_pids=unknown"
+    let listenerCountToken = lsofReliable
+        ? "listener_count=\(found.count)" : "listener_count=unknown"
+    let listenersToken = lsofReliable
+        ? "listeners=[\(listenerAddrs)]" : "listeners=unknown"
     return "app_running=\(appRunning) tree_pids=[\(treeList)] "
-        + "host_count=\(hostPids.count) host_pids=[\(hostList)] "
-        + "listener_count=\(found.count) listeners=[\(listenerAddrs)] "
+        + "\(hostCountToken) \(hostPidsToken) "
+        + "\(listenerCountToken) \(listenersToken) "
         + "ps=\(psStatus) lsof=\(lsofStatus) "
         + "stdout_tail=\(fileTail(appStdoutLogPath)) "
         + "stderr_tail=\(fileTail(appStderrLogPath))"
@@ -413,8 +495,16 @@ func listenerWaitEvidence(rootPid: Int?, probeTimeout: TimeInterval = 2.0) -> St
             listeners: []
         )
     }
-    let (psStatus, rows) = probeProcessRows(timeout: probeTimeout)
-    if psStatus != "ok" {
+    var (psStatus, rows) = probeProcessRows(timeout: probeTimeout)
+    // On short-ps failure, one longer + pid-narrowed recovery so the durable
+    // dump is more likely a real inventory. Pass contract unchanged.
+    if !psInventoryReliable(psStatus) {
+        let recoverTimeout = max(probeTimeout * 4.0, 8.0)
+        let recovered = probeProcessRowsRecover(rootPid: rootPid, timeout: recoverTimeout)
+        psStatus = recovered.0
+        rows = recovered.1
+    }
+    if !psInventoryReliable(psStatus) {
         return listenerWaitEvidenceFromSnapshot(
             rootPid: rootPid,
             psStatus: psStatus,
