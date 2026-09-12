@@ -266,9 +266,11 @@ def parse_listener_wait_evidence(detail: str) -> dict[str, str]:
     Harness appends ``key=value`` tokens after ``|``. ``host_count`` /
     ``host_pids`` are js-agent-host **process** inventory (PyInstaller onefile
     often yields parent+child = 2). ``listener_count`` / ``listeners`` are
-    independent lsof TCP LISTEN inventory: 0 = not Ready, 1 = unique bind,
-    2+ = real double-open. Never treat host_count as listener_count. Missing
-    keys are omitted; values keep brackets (e.g. ``[25654,25656]``).
+    independent lsof TCP LISTEN inventory: measured ``0`` = not Ready, ``1`` =
+    unique bind, ``2+`` = real double-open. When ``ps``/``lsof`` timed out or
+    was skipped, counts are ``unknown`` (never a fake measured ``0``/``[]``).
+    Never treat host_count as listener_count. Missing keys are omitted; values
+    keep brackets (e.g. ``[25654,25656]``).
     """
     if not isinstance(detail, str) or not detail:
         return {}

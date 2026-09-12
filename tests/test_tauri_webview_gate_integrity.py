@@ -361,6 +361,8 @@ def test_swift_harness_cold_start_timeout_records_host_and_listener_evidence() -
     assert "func listenerWaitEvidenceFromSnapshot" in source
     assert "func probeListeners" in source
     assert "func probeProcessRows" in source
+    assert "func probeProcessRowsRecover" in source
+    assert "func probeProcessRowsNarrowed" in source
     assert "host_count=" in source
     assert "host_pids=" in source
     assert "listener_count=" in source
@@ -370,6 +372,11 @@ def test_swift_harness_cold_start_timeout_records_host_and_listener_evidence() -
     assert "stderr_tail=" in source
     assert "ps=" in source
     assert "lsof=" in source
+    # Probe failure must not lie with measured zeros.
+    assert 'host_count=unknown' in source
+    assert 'listener_count=unknown' in source
+    assert "psInventoryReliable" in source
+    assert "lsofInventoryReliable" in source
     # Host PIDs must not be treated as listeners (onefile parent+child).
     assert "never treat host_count as listener_count" in source
     assert "Gate on LISTEN count only" in source
@@ -428,6 +435,7 @@ def test_parse_listener_wait_evidence_keeps_host_pids_separate_from_listens() ->
     assert double_parsed["listener_count"] == "2"
     assert double_parsed["listeners"] == "[127.0.0.1:4001,127.0.0.1:4002]"
 
+    # Successful empty probe may still report measured zeros.
     none_host = (
         "no single loopback listener within 100s | app_running=true "
         "tree_pids=[25649] host_count=0 host_pids=[] "
@@ -437,15 +445,57 @@ def test_parse_listener_wait_evidence_keeps_host_pids_separate_from_listens() ->
     assert none_parsed["host_count"] == "0"
     assert none_parsed["host_pids"] == "[]"
     assert none_parsed["listener_count"] == "0"
+    assert none_parsed["listeners"] == "[]"
 
+    # Official post-#16 lie shape: ps timed out / lsof skipped → unknown, not 0.
     hung = (
         "scenario hard timeout after 120s | app_running=unknown tree_pids=[25649] "
-        "host_count=0 host_pids=[] listener_count=0 listeners=[] "
+        "host_count=unknown host_pids=unknown listener_count=unknown listeners=unknown "
         "ps=timeout lsof=skipped stdout_tail= stderr_tail="
     )
     hung_parsed = gate.parse_listener_wait_evidence(hung)
     assert hung_parsed["ps"] == "timeout"
     assert hung_parsed["lsof"] == "skipped"
+    assert hung_parsed["host_count"] == "unknown"
+    assert hung_parsed["host_pids"] == "unknown"
+    assert hung_parsed["listener_count"] == "unknown"
+    assert hung_parsed["listeners"] == "unknown"
+    assert hung_parsed["host_count"] != "0"
+    assert hung_parsed["listener_count"] != "0"
+
+    # lsof timeout with measured hosts → host counts stay numeric; listeners unknown.
+    lsof_hung = (
+        "scenario hard timeout after 120s | app_running=true "
+        "tree_pids=[25649,25654,25656] host_count=2 host_pids=[25654,25656] "
+        "listener_count=unknown listeners=unknown ps=ok lsof=timeout "
+        "stdout_tail= stderr_tail="
+    )
+    lsof_parsed = gate.parse_listener_wait_evidence(lsof_hung)
+    assert lsof_parsed["host_count"] == "2"
+    assert lsof_parsed["listener_count"] == "unknown"
+    assert lsof_parsed["listeners"] == "unknown"
+    assert lsof_parsed["lsof"] == "timeout"
+
+
+def test_probe_timeout_detail_must_not_claim_measured_zero() -> None:
+    """Contract: timeout/skipped probes emit unknown; measured empty may be 0."""
+    source = (
+        Path(__file__).resolve().parents[1] / "desktop/tests/harness/tauri_webview_harness.swift"
+    ).read_text(encoding="utf-8")
+    # Formatting path must gate counts on reliability helpers.
+    assert 'host_count=unknown' in source
+    assert 'listener_count=unknown' in source
+    assert 'host_pids=unknown' in source
+    assert 'listeners=unknown' in source
+    assert "psReliable ?" in source
+    assert "lsofReliable" in source
+    assert "probeProcessRowsRecover" in source
+    assert "probeProcessRowsNarrowed" in source
+    # Pass still requires exactly one loopback LISTEN — do not relax.
+    wait = source.split("func waitForSingleListener", 1)[1].split("// Scenarios", 1)[0]
+    assert "found.count == 1" in wait
+    # 120s scenario watchdog constant must remain the launch timeout.
+    assert "SCENARIO_LAUNCH_TIMEOUT_SECONDS: TimeInterval = 120" in source
 
 
 def test_wrapper_preserves_cold_start_timeout_evidence_fields(
